@@ -1,0 +1,20 @@
+[package]
+name = "foamrs"
+version = "0.1.0"
+edition = "2021"
+description = "Fast OpenFOAM field reading for OpenFOAM Studio"
+publish = false
+
+[lib]
+name = "foamrs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"] }
+numpy = "0.30"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

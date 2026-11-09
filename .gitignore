@@ -1,0 +1,38 @@
+# Allow list: this repository holds only the program.
+# Git ignores all files, except the files that are named below.
+# Do not add documents, notes, settings, cases, models or tests.
+
+/*
+
+!/.gitignore
+!/LICENSE
+
+# Program (Python)
+!/foam_studio.py
+!/fs_*.py
+!/requirements.txt
+!/OpenFOAM Studio.bat
+
+# Rust modules: only the source and the build files
+!/rust/
+/rust/*/*
+!/rust/*/src/
+!/rust/*/Cargo.toml
+!/rust/*/Cargo.lock
+!/rust/*/.cargo/
+
+# Build script for the Rust modules
+!/tools/
+/tools/*
+!/tools/build_rust.ps1
+
+# Always ignore build output, caches and local settings
+target/
+__pycache__/
+*.pyc
+*.pyd
+*.pyd.old-*
+.venv/
+session.json
+session/
+.telegram.json
