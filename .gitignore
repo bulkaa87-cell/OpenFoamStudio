@@ -1,11 +1,27 @@
-# Allow list: this repository holds only the program.
+# Allow list: this repository holds only the program and the community files.
 # Git ignores all files, except the files that are named below.
-# Do not add documents, notes, settings, cases, models or tests.
+# The community files are README, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT
+# and the GitHub templates in .github/.
+# Do not add other documents, notes, settings, cases, models or tests.
 
 /*
 
 !/.gitignore
 !/LICENSE
+
+# Community files
+!/README.md
+!/CODE_OF_CONDUCT.md
+!/CONTRIBUTING.md
+!/SECURITY.md
+!/.github/
+/.github/*
+!/.github/pull_request_template.md
+!/.github/ISSUE_TEMPLATE/
+/.github/ISSUE_TEMPLATE/*
+!/.github/ISSUE_TEMPLATE/bug_report.yml
+!/.github/ISSUE_TEMPLATE/feature_request.yml
+!/.github/ISSUE_TEMPLATE/config.yml
 
 # Program (Python)
 !/foam_studio.py

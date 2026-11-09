@@ -1,0 +1,46 @@
+name: Feature request
+description: Propose a new function or a change.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Tell what you want to do, and why the program does not let you do it now.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Tell how the program must work after the change.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other solutions that you examined.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Geometry and repair
+        - Domain and mesh
+        - Flow and solver
+        - Run (WSL, ssh server, Docker, blueCFD-Core)
+        - Distributed run (experimental)
+        - Results and 3D view
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: help
+    attributes:
+      label: Can you help?
+      options:
+        - I can make a pull request
+        - I can test a change
+        - "No"

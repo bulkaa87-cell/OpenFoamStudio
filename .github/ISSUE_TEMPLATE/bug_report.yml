@@ -1,0 +1,86 @@
+name: Bug report
+description: Report a problem in OpenFOAM Studio.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. Do not report a security problem here. Obey SECURITY.md.
+        Remove host names, user names, IP addresses and paths that you do not want to show.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: Tell what the program does, and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: Give the steps that cause the problem.
+      placeholder: |
+        1. Open an STL file (units: mm)
+        2. Click "Створити кейс"
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 23H2
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: Important for problems in the "3D" tab.
+      placeholder: GPU model, driver version
+  - type: input
+    id: openfoam
+    attributes:
+      label: OpenFOAM version
+      placeholder: v2512
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Where OpenFOAM runs
+      options:
+        - WSL
+        - Linux server over ssh
+        - Distributed run on several machines (experimental)
+        - Docker
+        - blueCFD-Core
+        - Not related to OpenFOAM
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Program version
+      description: The commit hash of the program (git rev-parse --short HEAD).
+  - type: dropdown
+    id: rust
+    attributes:
+      label: Rust modules
+      description: Did you build the Rust modules with tools/build_rust.ps1?
+      options:
+        - "Yes"
+        - "No"
+        - I do not know
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Paste the text of the "Журнал" (Log) tab, or the error text.
+      render: text
+  - type: textarea
+    id: more
+    attributes:
+      label: More data
+      description: Screenshots, a small STL file that shows the problem, or other data.
