@@ -352,6 +352,7 @@ fn probe(hosts: &[String], user: &str, key: &Path, keys: &BTreeMap<String, PathB
         "echo hostname=$(hostname); echo cores=$(lscpu -p=core,socket 2>/dev/null | grep -v '^#' | sort -u | wc -l); \
          echo threads=$(nproc); echo load=$(cut -d' ' -f1 /proc/loadavg); \
          echo mem_gb=$(awk '/MemAvailable/{{printf \"%.1f\", $2/1048576}}' /proc/meminfo); \
+         echo mem_total_gb=$(awk '/MemTotal/{{printf \"%.1f\", $2/1048576}}' /proc/meminfo); \
          if podman image exists {image} 2>/dev/null; then echo image=yes; \
          elif docker image inspect {image} >/dev/null 2>&1; then echo image=yes; \
          else echo image=no; fi; \

@@ -38,6 +38,7 @@ import fs_backend as be
 import fs_case as fc
 import fs_geometry as geo
 import fs_library as lib
+import fs_memfit as memfit
 import fs_meshfix as meshfix
 import fs_panels as panels
 import fs_physics as phys
@@ -45,6 +46,7 @@ import fs_post as post
 import fs_slicebar as slicebar
 import fs_views as fv
 import fs_winfix as winfix
+import fs_yplus as fy
 
 APP_DIR = Path(__file__).resolve().parent
 # Рядок журналу: почалося повернення результатів (індикатор «не вимикайте»).
@@ -116,6 +118,26 @@ _LAYER_STYLE = {
     "degen": dict(color=COL_DEGEN, point_size=13,
                   render_points_as_spheres=True),
 }
+
+
+def _drop_progress(box) -> None:
+    """Прибрати вікно поступу НАЗАВЖДИ, а не лише сховати.
+
+    QProgressDialog ще в конструкторі заводить таймер «показатись через 4 с»
+    (setMinimumDuration при діапазоні 0..0 його не переставляє). Зупиняє
+    таймер лише cancel(); close() доходить до нього через closeEvent →
+    canceled → cancel. Але відколи у вікні є рідне вікно foamview
+    (WA_NativeWindow, 4f680f8), Qt дає діалогу свій QWindow ще до показу, і
+    close() схованого діалогу йде в QWindow::close() без closeEvent. Таймер
+    живе, і через 4 с після початку читання вискакує вже закрите модальне
+    «Читаю… Перевіряю геометрію…» — і висить, бо закривати його вже нікому
+    (2026-11-09: будь-яке читання коротше 4 с; з VTK такого не було).
+    """
+    if box is None:
+        return
+    box.cancel()
+    box.close()
+    box.deleteLater()
 
 
 def _mesh_key(mesh):
@@ -534,6 +556,9 @@ class Viewport(QtWidgets.QWidget):
     # «До моделі» тут лише ПРОСЯТЬ. Камеру ставить вікно: вʼюпортів два
     # (3D і результати), а команда одна — на обидва.
     to_model_requested = QtCore.Signal()
+    # Хто малює «3D» (текст для рядка стану, причина вибору) — і коли
+    # віджет сам перейшов на запасний рівень під час роботи.
+    level_changed = QtCore.Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -610,28 +635,45 @@ class Viewport(QtWidgets.QWidget):
         lay.addWidget(bar_box)
 
     def _make_plotter(self):
-        """Хто малює вкладку «3D»: foamview (Rust, GPU) або, запасним, VTK.
+        """Хто малює вкладку «3D» — ланцюжок fs_view3d.select_level():
+        foamview на GPU → foamview на програмному адаптері → VTK → foamview
+        на CPU. Вкладка ЗАВЖДИ показує картинку; повільніше — можна.
 
-        Решта класу однакова для обох: новий рушій (fs_view3d.Plotter)
-        розуміє ті самі виклики pyvista, що й QtInteractor. VTK — якщо
-        foamview не зібрано, GPU не відповів або FS_3D=vtk.
+        Решта класу однакова для всіх: fs_view3d.Plotter розуміє ті самі
+        виклики pyvista, що й QtInteractor. FS_3D=gpu|soft|vtk|cpu — примусово.
         """
         self.backend = "vtk"
         self.backend_note = ""
-        if os.environ.get("FS_3D", "").lower() != "vtk":
-            try:
-                import fs_view3d
-                # Пробний кадр, а не лише «модуль є»: адаптера чи пристрою
-                # може не бути, а WARP віддає чорний кадр без помилки.
-                ok, note = fs_view3d.probe()
-                self.backend_note = note
-                if ok:
-                    pl = fs_view3d.Plotter(self)
-                    self.backend = "foamview"
-                    return pl
-            except Exception as exc:                      # noqa: BLE001
-                self.backend_note = str(exc)
+        self.level = None
+        try:
+            import fs_view3d
+            lv = fs_view3d.select_level()
+            if lv.level in ("gpu", "soft"):
+                # Кеш каже «цей адаптер малює» — перевірка в ЦЬОМУ процесі
+                # (драйвер могли оновити без зміни версії). Не так — кеш
+                # геть, VTK зараз, повний перебір — на наступному старті.
+                ok, note = fs_view3d.probe(lv)
+                if not ok:
+                    fs_view3d.forget_level()
+                    lv = fs_view3d.Level("vtk", note=f"{lv.text()}: {note}")
+            if lv.foamview:
+                pl = fs_view3d.Plotter(self, lv, on_level=self._level_changed)
+                self.backend = "foamview"
+                self._set_level(lv)
+                return pl
+            self._set_level(lv)
+        except Exception as exc:                          # noqa: BLE001
+            self.backend_note = str(exc)
         return QtInteractor(self)
+
+    def _set_level(self, lv):
+        self.level = lv
+        self.backend_note = lv.note
+        self.level_changed.emit(lv.text(), lv.note)
+
+    def _level_changed(self, lv):
+        """Віджет сам перейшов на CPU (GPU відмовив під час роботи)."""
+        self._set_level(lv)
 
     # --- керування акторами ---------------------------------------------
 
@@ -1370,6 +1412,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # зробити. Доки словника не було на цьому місці, будь-яке вікно
         # падало на AttributeError одразу при запуску.
         self._res_cache: dict[str, tuple[int, int, float]] = {}
+        # Чи візьме прогін збережену сітку (тоді snappyHexMesh не буде) —
+        # для перевірки памʼяті. Кеш хешів усередині.
+        self._saved_mesh = memfit.SavedMesh(
+            fc.mesh_dicts, be.mesh_key, be.local_mesh_dir, be.MESH_INPUTS,
+            lib.project_mesh_source)
         self.worker: RunWorker | None = None
         self._load_thread: QtCore.QThread | None = None
         self._loader: GeometryLoader | None = None
@@ -1723,6 +1770,23 @@ class MainWindow(QtWidgets.QMainWindow):
             "підтягнуться.")
         self.lbl_detached.setVisible(False)
         self.statusBar().addPermanentWidget(self.lbl_detached)
+        # Хто малює «3D»: щоб було видно, коли працює повільний запасний
+        # шлях (програмний GPU, CPU), а не «програма гальмує».
+        self.lbl_3d = QtWidgets.QLabel("")
+        self.statusBar().addPermanentWidget(self.lbl_3d)
+        self.viewport.level_changed.connect(self._show_3d_level)
+        lv = getattr(self.viewport, "level", None)
+        if lv is not None:
+            self._show_3d_level(lv.text(), lv.note)
+
+    def _show_3d_level(self, text: str, note: str):
+        self.lbl_3d.setText(text)
+        slow = not text.startswith(("3D: GPU", "3D: VTK"))
+        self.lbl_3d.setStyleSheet("color:#f0b429; font-weight:600;" if slow else "")
+        self.lbl_3d.setToolTip(
+            "Хто малює вкладку «3D». Порядок: GPU → програмний GPU → VTK → CPU; "
+            "вибір запамʼятовується для цього компʼютера. Примусово: змінна "
+            "середовища FS_3D=gpu|soft|vtk|cpu." + (f"\n\n{note}" if note else ""))
 
     def _build_results_tab(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
@@ -1807,6 +1871,16 @@ class MainWindow(QtWidgets.QMainWindow):
         for p in (self.panel_geo, self.panel_dom, self.panel_mesh,
                   self.panel_flow, self.panel_solve):
             p.changed.connect(self.refresh_all)
+        # Auto y+: a new pick after each change that can affect it. The
+        # timer collects a burst of changes (typing a number, a project
+        # load) into one pick; fs_yplus.signature says if a pick is needed.
+        self._yplus_sig = None
+        self._yplus_timer = QtCore.QTimer(self)
+        self._yplus_timer.setSingleShot(True)
+        self._yplus_timer.setInterval(400)
+        self._yplus_timer.timeout.connect(self._auto_yplus)
+        self.panel_mesh.model_fix_requested.connect(self._set_turbulence)
+        self.panel_mesh.treatment_fix_requested.connect(self._set_treatment)
 
         self.panel_adv.compute_requested.connect(self.compute_advice)
         self.panel_adv.apply_requested.connect(self.apply_advice)
@@ -1854,7 +1928,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_run.fix_layers_requested.connect(self.fix_layers)
         self.panel_run.cmb_backend.currentIndexChanged.connect(
             lambda _: (self.panel_run.update_backend_label(),
-                       self._show_resources()))
+                       self._show_resources(), self.update_status()))
+        # Перевірка памʼяті залежить і від розподілу, і від «перебудувати».
+        pr.box_dist.toggled.connect(lambda _: self.update_status())
+        pr.dist_machines_changed.connect(self.update_status)
+        pr.chk_remesh.toggled.connect(lambda _: self.update_status())
         self.panel_flow.btn_auto.clicked.connect(self.auto_reference)
         self.panel_flow.btn_rot_fit.clicked.connect(self.fit_rotor_zone)
 
@@ -2441,7 +2519,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _end_load(self):
         if self._progress is not None:
-            self._progress.close()
+            _drop_progress(self._progress)
             self._progress = None
         if self._load_thread is not None:
             self._load_thread.quit()
@@ -3194,8 +3272,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             loop.exec()
         finally:
-            box.close()
-            box.deleteLater()
+            _drop_progress(box)
             thread.quit()
             thread.wait()
             self._busy_depth -= 1
@@ -3775,7 +3852,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _end_repair(self):
         self.panel_geo.setEnabled(True)
         if self._fix_progress is not None:
-            self._fix_progress.close()
+            _drop_progress(self._fix_progress)
             self._fix_progress = None
         if self._fix_thread is not None:
             self._fix_thread.quit()
@@ -3987,10 +4064,10 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             self._plan = adv.advise(
-                self.cfg, self.diag,
-                ram_gb=getattr(self, "_ram_gb", 8.0),
-                cores=getattr(self, "_cores", os.cpu_count() or 6),
-                target_yplus=self.panel_adv.yplus.value())
+                self.cfg, self.diag, cores=self._backend_cores(),
+                target_yplus=(None if self.cfg.mesh.yplus_auto
+                              else self.panel_adv.yplus.value()),
+                layer_fit=self._layers_fit, mem=self._mem_fit)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
         self.panel_adv.show_plan(self._plan)
@@ -4126,6 +4203,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_mesh.refresh()
         self.panel_flow.refresh()
         self.panel_solve.refresh()
+        if getattr(self, "_yplus_timer", None) is not None:
+            self._yplus_timer.start()
 
         if self.diag is not None:
             extra = []
@@ -4142,6 +4221,51 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.update_status()
 
+    # --- y+ under the turbulence model ----------------------------------
+
+    def _layer_cap(self) -> int:
+        return adv.auto_layer_cap(self.diag)
+
+    def _layers_fit(self, trial) -> str:
+        """"" if the trial mesh fits maxGlobalCells and memory, else why."""
+        est = trial.estimate()
+        if est.total > trial.mesh.max_global_cells:
+            return (f"оцінка {phys.fmt_cells(est.total)} комірок більша за "
+                    f"maxGlobalCells "
+                    f"{phys.fmt_cells(trial.mesh.max_global_cells)}")
+        try:
+            fit = self._mem_fit(trial)
+        except Exception:                                  # noqa: BLE001
+            return ""
+        return fit.warning() if fit.verdict == "over" else ""
+
+    def _auto_yplus(self, force: bool = False) -> None:
+        """Pick the y+ and the layers for the model, if «Авто» is on."""
+        if not self.cfg.mesh.yplus_auto or self.mesh is None:
+            return
+        cap = self._layer_cap()
+        sig = fy.signature(self.cfg, cap)
+        if sig == self._yplus_sig and not force:
+            return
+        pick = fy.auto_pick(self.cfg, fits=self._layers_fit, layer_cap=cap)
+        self.panel_mesh.apply_auto(pick)
+        # After the write: an expansion that the pick raised is an input too,
+        # and it must not cause one more pick.
+        self._yplus_sig = fy.signature(self.cfg, cap)
+
+    def _set_turbulence(self, model: str) -> None:
+        """Fix button of the y+ check: another turbulence model."""
+        self.panel_flow.cmb_turb.setCurrentText(model)
+        self.statusBar().showMessage(f"Модель турбулентності: {model}.", 6000)
+
+    def _set_treatment(self, key: str) -> None:
+        """Fix button of the y+ check: another wall treatment."""
+        i = self.panel_flow.cmb_wall.findData(key)
+        if i >= 0:
+            self.panel_flow.cmb_wall.setCurrentIndex(i)
+            self.statusBar().showMessage(
+                "Обробка стінки: " + fy.TREATMENT_LABELS[key] + ".", 6000)
+
     def update_status(self):
         s = fc.summary(self.cfg)
         est = self.cfg.estimate()
@@ -4156,9 +4280,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.setText("   |   ".join(parts))
 
         warn = []
-        ram = getattr(self, "_ram_gb", 8.0)
-        if est.snappy_peak_gb > ram * 0.85:
-            warn.append(f"⚠ сітка не влізе в {ram:.0f} ГБ")
+        fit = self._mem_fit()
+        if fit.warning():
+            warn.append(fit.warning())
+        tip = fit.details()
+        self.status.setToolTip(tip)
+        self.lbl_warn.setToolTip(tip)
         if est.total > self.cfg.mesh.max_global_cells:
             warn.append("⚠ оцінка перевищує maxGlobalCells")
         if self.diag is not None and not self.diag.closed:
@@ -4169,8 +4296,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if f.farfield_mode == "tunnel" and (abs(f.aoa_deg) > 0.01
                                             or abs(f.aos_deg) > 0.01):
             warn.append("⚠ slip зріже кут атаки")
+        yc = fy.case_check(self.cfg)
+        if not yc.ok:
+            warn.append("⚠ " + yc.short)
         self.lbl_warn.setText("   ".join(warn))
-        self.lbl_warn.setStyleSheet("color:#c0392b; font-weight:bold;")
+        # Лише «ℹ» (памʼять ще невідома) — не тривога: сірим, не червоним.
+        alarm = any("⚠" in t for t in warn)
+        self.lbl_warn.setStyleSheet("color:#c0392b; font-weight:bold;" if alarm
+                                    else "color:#7f8c8d;")
 
     def refresh_plots(self):
         if not (self.worker and self.worker.runner):
@@ -4192,6 +4325,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.backends = be.detect_all(ssh_hosts=self._ssh_hosts())
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
+        # Хто не відповів минулого разу, тепер може бути готовий: питаємо
+        # знову. Відповіді, що вже є, лишаються.
+        self._res_cache = {k: v for k, v in self._res_cache.items()
+                           if v[0] > 0 and v[2] > 0}
         _, script = be.install_command()
         self.panel_run.set_backends(self.backends, script)
         # Пошук може завершитися і після відновлення сесії — тоді вибір
@@ -4211,7 +4348,7 @@ class MainWindow(QtWidgets.QMainWindow):
         b = self.panel_run.current_backend()
         if b is None:
             return
-        key = f"{b.kind}:{b.host or b.distro}"
+        key = self._res_key(b)
         if key not in self._res_cache:
             # Питаємо раз на бекенд: кожен запит — це ssh чи запуск WSL,
             # а список гортають туди-сюди.
@@ -4219,20 +4356,83 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._res_cache[key] = be.wsl_resources(b)
             elif b.kind == "ssh" and b.ready:
                 self._res_cache[key] = be.ssh_resources(b)
-            else:
-                self._res_cache[key] = (0, 0, 0.0)
-        cores, threads, ram = self._res_cache[key]
+            elif b.kind in ("docker", "bluecfd", "native"):
+                n = os.cpu_count() or 4
+                self._res_cache[key] = (max(1, n // 2), n, be.local_ram_gb())
+            # Сервер ще не готовий — НЕ кешуємо нулі: інакше, коли він стане
+            # готовим, його памʼять так і лишилася б невідомою (а раніше
+            # бралися 8 ГБ чи памʼять попереднього бекенда). Спитаємо при
+            # наступному пошуку бекендів.
+        where = b.host if b.kind == "ssh" else "цьому компʼютері"
+        cores, threads, ram = self._res_cache.get(key, (0, 0, 0.0))
         if cores <= 0:
+            self.panel_solve.lbl_res.setText(
+                f"Ядра й памʼять на {where} ще невідомі"
+                + (" — сервер ще не відповів." if b.kind == "ssh" else "."))
             return
-        self._ram_gb = ram
-        self._cores = cores
-        self.panel_solve.set_resources(
-            cores, ram, threads=threads,
-            where=(b.host if b.kind == "ssh" else "цьому компʼютері"))
+        self.panel_solve.set_resources(cores, ram, threads=threads, where=where)
         # Число процесів пересуваємо лише при першому пошуку: інакше
         # перемикання бекенда мовчки правило б те, що людина задала руками.
         if clamp and self.cfg.solver.n_procs > cores:
             self.panel_solve.procs.setValue(max(1, cores - 2))
+
+    @staticmethod
+    def _res_key(b) -> str:
+        return f"{b.kind}:{b.host or b.distro}"
+
+    def _backend_resources(self, b=None) -> "tuple[int, int, float]":
+        """(ядер, потоків, ГБ) ВИБРАНОГО бекенда; нулі — ще невідомо.
+
+        Завжди з кешу саме цього бекенда, а не з того, що лишилось від
+        попереднього вибору."""
+        b = b if b is not None else self.panel_run.current_backend()
+        if b is None:
+            return (0, 0, 0.0)
+        return self._res_cache.get(self._res_key(b), (0, 0, 0.0))
+
+    def _backend_cores(self) -> int:
+        return self._backend_resources()[0] or os.cpu_count() or 6
+
+    def _mem_fit(self, cfg=None) -> "memfit.MemFit":
+        """Чи влізе задача в памʼять — для рядка стану, помічника й запуску.
+
+        Сітку будує вибраний бекенд (і в розподіленому прогоні теж: сервер
+        будує її сам на всі процеси); розвʼязувач іде або там же, або по
+        машинах розподілу — кожна своєю часткою проти своєї памʼяті.
+        Збережена сітка, що підходить до цих налаштувань, — snappyHexMesh
+        не буде, а комірок рівно стільки, скільки в ній.
+        """
+        cfg = cfg or self.cfg
+        pr = self.panel_run
+        b = pr.current_backend()
+        ram = self._backend_resources(b)[2]
+        if b is None:
+            name, kind = "бекенді", "ssh"
+        elif b.kind == "ssh":
+            name, kind = b.host, "ssh"
+        else:
+            name = "цьому компʼютері" + (" (WSL)" if b.kind == "wsl" else "")
+            kind = b.kind
+        mesher = memfit.MemHost(name, ram, memfit.headroom_for(kind),
+                                ranks=max(1, cfg.solver.n_procs))
+        solvers = None
+        if b is not None and b.kind == "ssh" and pr.box_dist.isChecked():
+            machines, why = be.check_machines(pr.machines())
+            if machines and not why:
+                mesher.ranks = sum(m.procs for m in machines)
+                solvers = memfit.dist_hosts(machines, cfg.solver.proc_weights,
+                                            head_ram_gb=ram)
+        cells = 0
+        if (b is not None and be.mesh_cache_supported(b)
+                and not pr.chk_remesh.isChecked()):
+            try:
+                _, cells = self._saved_mesh.find(
+                    cfg, self.case_dir or "",
+                    getattr(self, "_project_path", "") or "")
+            except Exception:                              # noqa: BLE001
+                cells = 0
+        return memfit.memory_fit(cfg.estimate(), mesher, solvers,
+                                 saved_cells=cells)
 
     def install_openfoam(self):
         b = self.panel_run.current_backend()
@@ -4288,6 +4488,7 @@ class MainWindow(QtWidgets.QMainWindow):
                   + self.cfg.guard_zone_vs_shell()
                   + self.cfg.guard_adapt()
                   + self.cfg.guard_turbulence()
+                  + self.cfg.guard_yplus()
                   + self.cfg.guard_regime())
         blocking = [text for level, text in checks if level == "bad"]
         warnings = [text for level, text in checks if level == "warn"]
@@ -6078,7 +6279,8 @@ class MainWindow(QtWidgets.QMainWindow):
         hosts = be.check_machines(pr.machines())[0]   # назви з hostname
         pr.lbl_dist.setText(self._dist_report(hosts, got) + "\n"
                             + self._plan_report(plan, hosts)
-                            + (f"\n{why}" if why else ""))
+                            + (f"\n{why}" if why else "")
+                            + "\n" + self._mem_fit().details())
 
     @staticmethod
     def _plan_report(plan: dict, hosts=()) -> str:
@@ -6113,6 +6315,9 @@ class MainWindow(QtWidgets.QMainWindow):
             cores = int(g.get("cores", 0) or 0)
             bits = [f"{cores} ядер", f"навантаження {g.get('load')}",
                     "образ є" if g.get("image") == "yes" else "ОБРАЗУ НЕМАЄ"]
+            ram = be.probe_ram_gb(g)
+            if ram > 0:
+                bits.insert(1, f"{memfit.fmt_gb(ram)} ГБ памʼяті")
             if n > cores > 0:
                 bits.append(f"процесів {n} > ядер {cores}")
             if g.get("head") == "yes":
@@ -6181,6 +6386,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.create_case(report=False) is None:
             return False
 
+        # Памʼять — до того, як «перебудувати» скинеться: від нього залежить,
+        # чи буде snappyHexMesh.
+        mem_fit = self._mem_fit()
         if not self._series_quiet() and not self._memory_gate():
             return False
 
@@ -6265,6 +6473,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if mkey:
             self.log.push(f"Ключ сітки: {mkey}"
                           + (" (перебудувати)" if remesh else ""))
+        self.log.push(mem_fit.details())
+        if mem_fit.verdict == "unknown":
+            # Памʼяті не знаємо — запуску не заважаємо здогадкою, але кажемо.
+            self.log.push(mem_fit.warning().lstrip("ℹ ") + ".")
         if dist_hosts:
             self.log.push("Розподіл між машинами (експериментально): "
                           + ", ".join(f"{m.label()} × {m.procs}"
@@ -6323,22 +6535,31 @@ class MainWindow(QtWidgets.QMainWindow):
         якому задача влізе, і даємо кнопку, що це робить.
         """
         est = self.cfg.estimate()
-        ram = getattr(self, "_ram_gb", 8.0)
-        budget = ram * adv.RAM_HEADROOM
-        if est.snappy_peak_gb <= budget:
+        fit = self._mem_fit()
+        # Памʼяті не знаємо ("unknown") — запуску не заважаємо здогадкою;
+        # про це скаже журнал прогону.
+        if fit.verdict != "over":
             return True
+        w = fit.worst
+        budget = w.host.budget_gb
 
         why, level = phys.memory_breakdown(
-            est, self.cfg.mesh.surface_level_max, budget)
+            est, self.cfg.mesh.surface_level_max, budget, need_gb=w.need_gb)
 
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Warning)
         box.setWindowTitle("Сітка не влізе в памʼять")
+        what = ("snappyHexMesh (будує сітку)" if w.stage == "snappy"
+                else f"розвʼязувач ({w.host.ranks} проц.)")
         box.setText(
-            f"Оцінка: {phys.fmt_cells(est.total)} комірок, "
-            f"це близько {est.snappy_peak_gb:.0f} ГБ.\n"
-            f"Доступно {ram:.1f} ГБ, з них під сітку {budget:.1f} ГБ.")
-        detail = why + "\n\n"
+            f"{what} на {w.host.name}: {phys.fmt_cells(w.cells)} комірок, "
+            f"це близько {w.need_gb:.1f} ГБ.\n"
+            f"Памʼяті там {memfit.fmt_gb(w.host.ram_gb)} ГБ, з них під "
+            f"задачу {memfit.fmt_gb(budget)} ГБ.")
+        detail = fit.details() + "\n\n" + why + "\n\n"
+        if fit.saved:
+            detail += ("Сітка вже збережена, але розвʼязувачу на ній тісно: "
+                       "допоможе лише менша сітка (її доведеться будувати). ")
         if level < self.cfg.mesh.surface_level_max:
             detail += (f"Щоб влізти, рівень рефайнменту поверхні має бути "
                        f"{level} або нижче (зараз "
@@ -6365,9 +6586,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.diag is not None:
             adv.apply_plan(self.cfg, adv.advise(
-                self.cfg, self.diag, ram_gb=ram,
-                cores=getattr(self, "_cores", os.cpu_count() or 6)))
-        while (self.cfg.estimate().snappy_peak_gb > budget
+                self.cfg, self.diag, cores=self._backend_cores(),
+                target_yplus=(None if self.cfg.mesh.yplus_auto
+                              else adv.TARGET_YPLUS),
+                layer_fit=self._layers_fit, mem=self._mem_fit))
+        while (self._mem_fit().verdict == "over"
                and self.cfg.mesh.surface_level_max > 1):
             self.cfg.mesh.surface_level_max -= 1
             self.cfg.mesh.surface_level_min = max(
@@ -6377,11 +6600,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_all()
 
         new_est = self.cfg.estimate()
+        peak = max((r.need_gb for r in self._mem_fit().rows), default=0.0)
         QtWidgets.QMessageBox.information(
             self, "Підібрано",
             f"Рівень поверхні {self.cfg.mesh.surface_level_max}, "
             f"комірок {phys.fmt_cells(new_est.total)}, "
-            f"памʼять {new_est.snappy_peak_gb:.1f} ГБ.\n\n"
+            f"памʼять до {peak:.1f} ГБ на машину.\n\n"
             f"Натисніть «Запустити» ще раз.")
         return False
 
@@ -6521,6 +6745,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if diagnosis is None or not diagnosis.fixable:
             return
         adv.apply_layer_fix(self.cfg, diagnosis)
+        # A layer fix from the last run is a hand choice: auto y+ must not
+        # undo it on the next change.
+        self.cfg.mesh.yplus_auto = False
         self.reload_panels()
         self.refresh_all()
         self.panel_run.show_layer_fix(None)
@@ -6890,7 +7117,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "P", palette=Image.Palette.ADAPTIVE, colors=255))
             progress.setValue(i + 1)
             QtWidgets.QApplication.processEvents()
-        progress.close()
+        _drop_progress(progress)
         delay = int(1000 / self.anim_bar.spin_fps.value())
         shots[0].save(path, save_all=True, append_images=shots[1:],
                       duration=delay, loop=0, optimize=False)

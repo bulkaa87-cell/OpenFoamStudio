@@ -1145,6 +1145,12 @@ class MeshCfg:
     expansion: float = 1.2
     final_layer_rel: float = 0.5
     min_thickness_rel: float = 0.05
+    # y+ target of the layers. With yplus_auto the program picks it from the
+    # turbulence model and Re (fs_yplus.auto_pick) and fits the layer count.
+    # A y+ typed by hand, the «Підібрати шари» button or a typed layer count
+    # turns auto off. Old projects have no such keys: auto is on for them.
+    yplus_auto: bool = True
+    target_yplus: float = 0.0     # 0 = not set yet
     # ПЕРЕВІРЕНО A/B на plane5 (494 тис. комірок, 10 шарів):
     #   featureAngle 60,  medialRatio 0.3, згладжування 1/3 -> покриття 36.7%
     #   featureAngle 130, medialRatio 0.6, згладжування 3/5 -> покриття 36.4%
@@ -1170,6 +1176,9 @@ class FlowCfg:
     nu: float = phys.AIR_NU_15C
     rho: float = phys.AIR_RHO_15C
     turbulence: str = "kOmegaSST"
+    # Wall treatment, see fs_yplus (spalding / wallfn / lowre). Spalding is
+    # valid for every model and every y+; old projects have no key -> it.
+    wall_treatment: str = "spalding"
     regime: str = "incompressible"
     # Мають значення лише у стисливому режимі. Там саме з них і виходять
     # rho та nu — див. apply_thermo().
@@ -2658,6 +2667,11 @@ class CaseCfg:
                 f"тобто перетвориться на дорогий RANS. Для LES і DES треба "
                 f"хоча б удвічі дрібніше, ніж для RANS.")))
         return out
+
+    def guard_yplus(self) -> list[tuple[str, str]]:
+        """Does the first-cell y+ suit the turbulence model? See fs_yplus."""
+        import fs_yplus
+        return fs_yplus.guard(self)
 
     def guard_refine_zones(self) -> list[tuple[str, str]]:
         """Чи не згущує зона саму СТІНКУ нерівномірно.
@@ -4603,10 +4617,22 @@ def field_alphat(cfg: CaseCfg) -> str:
     return _field("volScalarField", "alphat", "[1 -1 -1 0 0 0 0]", "0", bcs)
 
 
+def _wall_treatment(cfg: CaseCfg) -> str:
+    """spalding / wallfn / lowre — what the walls get (see fs_yplus)."""
+    import fs_yplus
+    return fs_yplus.cfg_treatment(cfg)
+
+
 def field_k(cfg: CaseCfg) -> str:
     k = f"{cfg.turbulence_inlet().k:.6g}"
     bcs = _outer(cfg, "scalar", k)
-    wall = _bc("type            kqRWallFunction;", f"value           uniform {k};")
+    if _wall_treatment(cfg) == "lowre":
+        # The layer is resolved to the wall: k goes to zero there. A very
+        # small value instead of 0 keeps k/omega and log(k) finite.
+        wall = _bc("type            fixedValue;", "value           uniform 1e-10;")
+    else:
+        wall = _bc("type            kqRWallFunction;",
+                   f"value           uniform {k};")
     if cfg.domain.ground:
         bcs["ground"] = wall
     for _b in cfg.body_patches:
@@ -4685,8 +4711,12 @@ def field_nut(cfg: CaseCfg) -> str:
     calc = _bc("type            calculated;", "value           uniform 0;")
     bcs = {"inlet": calc, "outlet": calc, "farfield": calc}
     # nutUSpalding працює в усьому діапазоні y+ (від ~1 до ~300), тому це
-    # найбезпечніший вибір, поки реальний y+ невідомий.
-    wall = _bc("type            nutUSpaldingWallFunction;",
+    # найбезпечніший вибір, поки реальний y+ невідомий. The other two come
+    # from the «Обробка стінки» list (fs_yplus.TREATMENT_LABELS).
+    wall_type = {"spalding": "nutUSpaldingWallFunction",
+                 "wallfn": "nutkWallFunction",
+                 "lowre": "nutLowReWallFunction"}[_wall_treatment(cfg)]
+    wall = _bc(f"type            {wall_type};",
                "value           uniform 0;")
     if cfg.domain.ground:
         bcs["ground"] = wall
@@ -6271,6 +6301,19 @@ def build_case(cfg: CaseCfg) -> dict[str, str]:
     if cfg.solver.two_stage or cfg.warm_start:
         files.update(_stage_files(cfg))
     return files
+
+
+def mesh_dicts(cfg: CaseCfg) -> dict[str, str]:
+    """Лише словники, з яких складається ключ збереженої сітки
+    (`fs_backend.MESH_INPUTS`), — без решти кейсу. Ті самі тексти, що й у
+    build_case(): з ними порівнюють записаний кейс, щоб знати, чи підійде
+    збережена сітка до ТЕПЕРІШНІХ налаштувань."""
+    return {
+        "system/blockMeshDict": block_mesh_dict(cfg),
+        "system/snappyHexMeshDict": snappy_dict(cfg),
+        "system/surfaceFeatureExtractDict": surface_features_dict(cfg),
+        "system/meshQualityDict": mesh_quality_dict(cfg),
+    }
 
 
 # Шляхи, які build_case() пише ТІЛЬКИ ЗА УМОВИ — тобто саме ті, що можуть

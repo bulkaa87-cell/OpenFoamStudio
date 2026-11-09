@@ -63,36 +63,308 @@ def window_kind() -> str | None:
     return None
 
 
-_PROBE: tuple[bool, str] | None = None
+# --------------------------------------------------------------------------
+# Хто малює вкладку «3D»: ланцюжок запасних шляхів
+# --------------------------------------------------------------------------
+#
+# Вимога: вкладка «3D» ЗАВЖДИ показує картинку; повільніше — можна.
+# Рівні по черзі:
+#   gpu  — foamview на апаратному GPU (DX12 / Vulkan / Metal);
+#   soft — foamview на програмному адаптері (WARP, lavapipe, llvmpipe);
+#   vtk  — старий шлях (потребує OpenGL);
+#   cpu  — foamview.CpuRenderer: без GPU і без OpenGL, повільно.
+# FS_3D=gpu|soft|vtk|cpu — примусово один рівень (без перебору).
+#
+# ПРОБА В ОКРЕМОМУ ПРОЦЕСІ. Драйвер може впасти чи зависнути на пробі, а GL
+# у тому ж процесі ламає VTK. Тому кожен кандидат пробується дочірнім
+# Python з тайм-аутом, а вибір кешується на машину (ключ — список адаптерів
+# і драйверів + версія foamview): наступні старти не чекають.
+# GL у перебір не входить: де не працює VTK (OpenGL), там не запрацює і GL
+# wgpu, а там, де VTK працює, GL wgpu його ламає. Примусово — WGPU_BACKEND=gl.
+
+LEVELS = ("gpu", "soft", "vtk", "cpu")
+LEVEL_TEXT = {
+    "gpu": "3D: GPU",
+    "soft": "3D: програмний GPU — повільніше",
+    "vtk": "3D: VTK (OpenGL)",
+    "cpu": "3D: CPU без GPU — повільно",
+}
+PROBE_VERSION = 1          # змінити, коли міняється сама проба: кеш стане старим
+PROBE_TIMEOUT = 25.0       # с на одного кандидата
+_HW_RANK = {"DiscreteGpu": 0, "IntegratedGpu": 1, "VirtualGpu": 2, "Other": 3}
 
 
-def probe() -> tuple[bool, str]:
-    """Чи справді малює GPU: один кадр 32×24 без вікна, тло відоме.
+class Level:
+    """Вибраний рівень: хто малює і на якому адаптері."""
 
-    Модуль може бути, а адаптера чи пристрою — ні; а WARP (програмний DX12)
-    віддає чорний кадр без жодної помилки. Тоді вкладка «3D» бере VTK, а не
-    показує «3D недоступне». Результат памʼятається на весь запуск.
+    def __init__(self, level: str, backend: str | None = None,
+                 adapter: str | None = None, note: str = ""):
+        self.level = level
+        self.backend = backend
+        self.adapter = adapter
+        self.note = note
+
+    @property
+    def foamview(self) -> bool:
+        return self.level in ("gpu", "soft", "cpu")
+
+    def text(self) -> str:
+        t = LEVEL_TEXT.get(self.level, self.level)
+        if self.level in ("gpu", "soft") and self.adapter:
+            t += f" ({self.adapter}, {self.backend})" if self.backend else f" ({self.adapter})"
+        return t
+
+    def as_dict(self) -> dict:
+        return {"level": self.level, "backend": self.backend, "adapter": self.adapter,
+                "note": self.note}
+
+    def __repr__(self):
+        return f"Level({self.as_dict()})"
+
+
+def make_renderer(level: Level, hwnd, w: int, h: int, font, kind: str = "win32"):
+    """foamview.Renderer на вибраному адаптері або CpuRenderer."""
+    if level.level == "cpu":
+        return _fv.CpuRenderer(None, w, h, font)
+    return _fv.Renderer(hwnd, w, h, font, kind=kind,
+                        backend=level.backend, adapter=level.adapter)
+
+
+_EYE = [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
+_BG = (204, 51, 25)
+_FG = (26, 179, 77)
+
+
+def check_frame(r) -> tuple[bool, str]:
+    """Пробний кадр 64×48: відоме тло + квадрат у центрі кольором ШАРУ.
+
+    Квадрат ловить і помилки uniform-буферів: на WARP колись усі шари
+    читали буфер останнього створеного шару — тло було чорним без жодної
+    помилки wgpu.
     """
-    global _PROBE
-    if _PROBE is not None:
-        return _PROBE
-    if _fv is None:
-        _PROBE = (False, "foamview не зібрано")
-        return _PROBE
+    r.set_background((0.8, 0.2, 0.1), (0.8, 0.2, 0.1))
+    pts = np.array([[-.5, -.5, .5], [.5, -.5, .5], [.5, .5, .5], [-.5, .5, .5]], np.float32)
+    r.set_triangles("probe", pts, np.array([[0, 1, 2], [0, 2, 3]], np.uint32),
+                    (0.1, 0.7, 0.3, 1.0), lighting=False)
+    img = np.asarray(r.screenshot(_EYE, _EYE, False, None))
+    r.remove("probe")
+    h, w = img.shape[:2]
+    bg = img[2, 2, :3].astype(int)
+    fg = img[h // 2, w // 2, :3].astype(int)
+    ok = (np.abs(bg - _BG).max() < 12) and (np.abs(fg - _FG).max() < 12)
+    return bool(ok), "" if ok else f"кадр не той: тло {bg.tolist()}, центр {fg.tolist()}"
+
+
+def _probe_foamview(level: Level) -> tuple[bool, str]:
+    """У ЦЬОМУ процесі: адаптер є, пристрій є, кадр правильний?"""
     try:
-        r = _fv.Renderer(None, 32, 24, None)
-        r.set_background((0.8, 0.2, 0.1), (0.8, 0.2, 0.1))
-        eye = [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
-        img = r.screenshot(eye, eye, True, None)
-        px = np.asarray(img)[12, 16, :3].astype(int)
-        ok = abs(px[0] - 204) < 12 and abs(px[1] - 51) < 12 and abs(px[2] - 25) < 12
-        _PROBE = (bool(ok), f"{r.adapter}" if ok else
-                  f"{r.adapter}: кадр не той ({px.tolist()} замість [204, 51, 25])")
+        r = make_renderer(level, None, 64, 48, None)
+        ok, why = check_frame(r)
+        return ok, r.adapter if ok else f"{r.adapter}: {why}"
     except BaseException as exc:                          # noqa: BLE001
         if not gpu_failed(exc):
             raise
-        _PROBE = (False, f"GPU: {exc}")
-    return _PROBE
+        return False, f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+
+
+def _probe_vtk() -> tuple[bool, str]:
+    """У ЦЬОМУ процесі: VTK малює (OpenGL є і дає правильний кадр)?"""
+    try:
+        import pyvista as pv
+        pl = pv.Plotter(off_screen=True, window_size=(64, 48))
+        pl.set_background([c / 255 for c in _BG])
+        pl.add_mesh(pv.Plane(i_size=4, j_size=4), color=[c / 255 for c in _FG],
+                    lighting=False)
+        pl.view_xy()
+        img = np.asarray(pl.screenshot(return_img=True))
+        pl.close()
+        h, w = img.shape[:2]
+        fg = img[h // 2, w // 2, :3].astype(int)
+        ok = np.abs(fg - _FG).max() < 20
+        return bool(ok), "OpenGL" if ok else f"кадр не той: центр {fg.tolist()}"
+    except Exception as exc:                              # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+
+
+def _cache_path() -> Path:
+    if os.environ.get("FS_3D_CACHE"):                     # тести, gpucheck
+        return Path(os.environ["FS_3D_CACHE"])
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(base) / "OpenFOAM Studio" / "view3d.json"
+
+
+def _adapters() -> list[dict]:
+    if _fv is None or not hasattr(_fv, "adapters"):
+        return []
+    try:
+        return list(_fv.adapters())
+    except BaseException as exc:                          # noqa: BLE001
+        if not gpu_failed(exc):
+            raise
+        return []
+
+
+def candidates(adapters: list[dict]) -> list[Level]:
+    """Апаратні адаптери (дискретний → вбудований → …), далі програмні."""
+    hw = [a for a in adapters if a.get("device_type") in _HW_RANK]
+    hw.sort(key=lambda a: _HW_RANK[a["device_type"]])         # стабільне: порядок wgpu
+    sw = [a for a in adapters if a.get("device_type") == "Cpu"]
+    return ([Level("gpu", a["backend"], a["name"]) for a in hw]
+            + [Level("soft", a["backend"], a["name"]) for a in sw])
+
+
+def _cache_key(adapters: list[dict]) -> str:
+    import json
+    import sys
+    ver = getattr(_fv, "__version__", "?") if _fv is not None else "-"
+    rows = sorted((a.get("name", ""), a.get("backend", ""), a.get("device_type", ""),
+                   a.get("driver", ""), a.get("driver_info", "")) for a in adapters)
+    return json.dumps([PROBE_VERSION, ver, sys.platform, rows], ensure_ascii=False)
+
+
+def _run_probe(args: list[str]) -> tuple[bool, str]:
+    """Проба в дочірньому процесі: падіння чи зависання драйвера не валить
+    програму, а GL / OpenGL не чіпає контекст VTK цього процесу."""
+    import json
+    import subprocess
+    import sys
+    exe = sys.executable
+    if exe.lower().endswith("pythonw.exe"):
+        alt = exe[:-len("pythonw.exe")] + "python.exe"
+        if os.path.isfile(alt):
+            exe = alt
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # Той самий foamview, що й у цьому процесі (gpucheck тестує збірку з
+    # іншої теки), а не перший-ліпший поруч зі скриптом.
+    env = dict(os.environ)
+    if _fv is not None and getattr(_fv, "__file__", None):
+        env["PYTHONPATH"] = os.pathsep.join(
+            [os.path.dirname(os.path.abspath(_fv.__file__))]
+            + [p for p in [env.get("PYTHONPATH")] if p])
+    try:
+        cp = subprocess.run([exe, "-X", "utf8", os.path.abspath(__file__), "--probe", *args],
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=PROBE_TIMEOUT, creationflags=flags,
+                            env=env)
+    except subprocess.TimeoutExpired:
+        return False, f"проба зависла (> {PROBE_TIMEOUT:.0f} с)"
+    except OSError as exc:
+        return False, f"проба не запустилась: {exc}"
+    lines = [s for s in cp.stdout.splitlines() if s.startswith("{")]
+    if not lines:
+        tail = (cp.stderr.strip().splitlines() or ["?"])[-1][:200]
+        return False, f"проба впала (код {cp.returncode}): {tail}"
+    res = json.loads(lines[-1])
+    return bool(res.get("ok")), str(res.get("note", ""))
+
+
+def _probe_main(argv: list[str]) -> int:
+    """`python fs_view3d.py --probe foamview <level> <backend> <adapter>`
+    або `--probe vtk`: один JSON-рядок з результатом."""
+    import json
+    if argv[:1] == ["vtk"]:
+        ok, note = _probe_vtk()
+    else:
+        _, lv, be, ad = (argv + ["", "", "", ""])[:4]
+        if _fv is None:
+            ok, note = False, "foamview не зібрано"
+        else:
+            ok, note = _probe_foamview(Level(lv, be or None, ad or None))
+    print(json.dumps({"ok": ok, "note": note}, ensure_ascii=False), flush=True)
+    return 0
+
+
+_LEVEL: Level | None = None
+
+
+def select_level(refresh: bool = False, log=None) -> Level:
+    """Хто малює вкладку «3D» на цій машині (див. коментар над LEVELS).
+
+    Перший старт на машині (чи після зміни GPU / драйвера) — перебір
+    кандидатів дочірніми процесами, ~1 с на кандидата; далі — з кешу.
+    """
+    import json
+    import time
+    global _LEVEL
+    if _LEVEL is not None and not refresh:
+        return _LEVEL
+    say = log or (lambda s: None)
+    forced = os.environ.get("FS_3D", "").strip().lower()
+    if forced in LEVELS:
+        if forced in ("gpu", "soft") and _fv is not None:
+            # Примусово — без перебору: адаптер вибирає wgpu (або
+            # WGPU_BACKEND / WGPU_ADAPTER_NAME).
+            pick = [c for c in candidates(_adapters()) if c.level == forced]
+            lv = pick[0] if (forced == "soft" and pick) else Level(forced)
+        else:
+            lv = Level(forced if (forced == "vtk" or _fv is not None) else "vtk")
+        lv.note = f"FS_3D={forced}"
+        _LEVEL = lv
+        return lv
+    if _fv is None:
+        _LEVEL = Level("vtk", note="foamview не зібрано")
+        return _LEVEL
+    adapters = _adapters()
+    key = _cache_key(adapters)
+    path = _cache_path()
+    if not refresh:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("key") == key and data.get("level") in LEVELS:
+                _LEVEL = Level(data["level"], data.get("backend"), data.get("adapter"),
+                               data.get("note", ""))
+                return _LEVEL
+        except (OSError, ValueError):
+            pass
+    notes = []
+    chosen = None
+    for c in candidates(adapters):
+        say(f"3D: пробую {c.adapter} ({c.backend})…")
+        ok, note = _run_probe(["foamview", c.level, c.backend or "", c.adapter or ""])
+        notes.append(f"{c.adapter} ({c.backend}): {'ок' if ok else note}")
+        if ok:
+            chosen = Level(c.level, c.backend, c.adapter)
+            break
+    if chosen is None:
+        say("3D: пробую VTK…")
+        ok, note = _run_probe(["vtk"])
+        notes.append(f"VTK: {'ок' if ok else note}")
+        chosen = Level("vtk") if ok else Level("cpu")
+    chosen.note = "; ".join(notes)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"key": key, "time": time.strftime("%Y-%m-%d %H:%M"),
+                                    **chosen.as_dict()}, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+    except OSError:
+        pass
+    _LEVEL = chosen
+    return chosen
+
+
+def forget_level():
+    """Вибір не підтвердився в цьому процесі: стерти кеш, наступний старт
+    перебере кандидатів заново."""
+    global _LEVEL
+    _LEVEL = None
+    try:
+        _cache_path().unlink()
+    except OSError:
+        pass
+
+
+_PROBE: dict = {}
+
+
+def probe(level: Level | None = None) -> tuple[bool, str]:
+    """Пробний кадр У ЦЬОМУ процесі для рівня foamview (типово — GPU, як
+    вибере wgpu). Памʼятається на весь запуск."""
+    lv = level or Level("gpu")
+    k = (lv.level, lv.backend, lv.adapter)
+    if k not in _PROBE:
+        _PROBE[k] = ((False, "foamview не зібрано") if _fv is None
+                     else _probe_foamview(lv))
+    return _PROBE[k]
 
 
 def usable() -> bool:
@@ -521,8 +793,13 @@ _VIEWS = {
 class Plotter:
     """Сцена й камера поверх foamview з іменами з pyvista/VTK."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, level: Level | None = None, on_level=None):
+        """level — хто малює (select_level()); типово GPU, як вибере wgpu.
+        on_level(Level) — коли віджет сам перейшов на інший рівень (GPU
+        відмовив під час роботи → CPU)."""
         from fs_view3d_qt import GpuWidget
+        self.level = level or Level("gpu")
+        self.on_level = on_level
         self.camera = Camera()
         self.camera.changed = self._dirty
         self.renderer = _Renderer(self)
@@ -846,3 +1123,9 @@ class Plotter:
     def close(self):
         self._closed = True
         self.interactor.release()
+
+
+if __name__ == "__main__":                 # проба рівня в дочірньому процесі
+    import sys
+    if sys.argv[1:2] == ["--probe"]:
+        sys.exit(_probe_main(sys.argv[2:]))

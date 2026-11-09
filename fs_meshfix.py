@@ -19,6 +19,13 @@ DIFFERENCES FROM THE SERVICE (measured on tests/meshfix_cases.py):
   a cut. A cut group that would give open edges is left uncut;
 - an edge or a vertex that two bodies share gets one copy for each body.
   The service keeps the two bodies joined there (one shell).
+- the Wrap step cuts all faces against each other and keeps the faces
+  between inside and outside by the winding number of the whole input
+  (also of open parts). Steps after it do not make faces cross.
+- fallbacks, when the 12 steps do not give a closed mesh: first an alpha
+  wrap of the input (shrunk onto the input), then a volumetric remesh.
+  Each result is used only when it is closed and no count of the
+  program's check is larger than in the input. Report key "fallback".
 
 UNITS. The step tolerances are in mm, as in the service. Thus the mesh goes
 from m to mm for the repair and back, as in fs_winfix.
@@ -47,6 +54,16 @@ STEP_NAMES = {
     "RemoveDegeneratedFaces": "вироджених виправлено",
     "RemoveTinyShells": "крихітних оболонок прибрано",
     "PrepareForExport": "T-зʼєднань розрізано",
+    "AlphaWrap": "обгортка alpha wrap, трикутників",
+    "VolumeRemesh": "обʼємна перебудова, трикутників",
+}
+
+# Text for the status line when a fallback replaced the result.
+FALLBACK_TEXT = {
+    "AlphaWrap": "12 кроків не дали закритої сітки — результат: обгортка "
+                 "моделі (alpha wrap), стиснута на поверхню",
+    "VolumeRemesh": "12 кроків не дали закритої сітки — результат: обʼємна "
+                    "перебудова (тонші за ~0.7 мм частини можуть зникнути)",
 }
 
 # Report of the last repair. The window uses it for the status line.
@@ -86,7 +103,10 @@ def repair_arrays(points_mm, tris, *, wrap: bool = True):
 def summary(report: dict) -> str:
     """One line "what was done" from the steps with a count above zero."""
     parts = []
+    fallback = report.get("fallback")
     for name, count, _sec in report.get("stages", ()):
+        if name in FALLBACK_TEXT and name != fallback:
+            continue                       # ran, but its result was not used
         if count:
             parts.append(f"{STEP_NAMES.get(name, name)} {count}")
     u = report.get("union") or {}
@@ -96,6 +116,17 @@ def summary(report: dict) -> str:
         parts.append(f"місць перетину лишено як є {u['skipped_clusters']}")
     if u.get("rolled_back") or u.get("panicked"):
         parts.append("обʼєднання тіл не вдалося — тіла лишилися окремими")
+    if report.get("guard"):
+        return guard_text(report["guard"])
+    if fallback in FALLBACK_TEXT:
+        return FALLBACK_TEXT[fallback]
+    after = report.get("after") or {}
+    if after.get("boundary_edges") or after.get("non_manifold_edges"):
+        # meshfix only cuts and joins closed bodies. An assembly with open
+        # and non-manifold parts needs the full wrap of the Windows service.
+        parts.append(f"лишилося відкритих ребер {after.get('boundary_edges', 0)}, "
+                     f"non-manifold {after.get('non_manifold_edges', 0)} — для "
+                     f"такої збірки «Полагодити як слайсер» або «Обгорнути»")
     return ", ".join(parts) if parts else "кроки нічого не змінили"
 
 
@@ -125,6 +156,35 @@ def repair(mesh: pv.PolyData, say=None) -> pv.PolyData:
                            "модель була плоскою або з самих крихітних "
                            "оболонок.")
     out_t = np.asarray(out_t, dtype=np.int64)
-    return pv.PolyData(
+    out = pv.PolyData(
         np.asarray(out_p) / M_TO_MM,
         np.hstack([np.full((len(out_t), 1), 3, np.int64), out_t]).ravel())
+    # Guard for the whole repair, with the counts of the program's own
+    # check (the same numbers as «Дірки / Вивернуті / Non-manifold»). When
+    # one of them is larger after the repair, the input comes back.
+    worse = worse_than(mesh, out)
+    report["guard"] = worse
+    if worse:
+        say("meshfix: " + guard_text(worse))
+        return mesh.copy()
+    return out
+
+
+# Program counts that the guard compares: (key, label for the status line).
+GUARD_COUNTS = (("open_edges", "дірок"), ("flipped_faces", "вивернутих"),
+                ("non_manifold_edges", "non-manifold"))
+
+
+def worse_than(before: pv.PolyData, after: pv.PolyData) -> list:
+    """[(label, before, after)] for each program count that got larger."""
+    import fs_geometry as geo
+    d0, d1 = geo.diagnose(before), geo.diagnose(after)
+    return [(label, getattr(d0, key), getattr(d1, key))
+            for key, label in GUARD_COUNTS
+            if getattr(d1, key) > getattr(d0, key)]
+
+
+def guard_text(worse: list) -> str:
+    return ("результат гірший за вхідну модель ("
+            + ", ".join(f"{label} {a} → {b}" for label, a, b in worse)
+            + ") — модель лишилася без змін")

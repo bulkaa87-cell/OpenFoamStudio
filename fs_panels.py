@@ -16,6 +16,7 @@ import fs_library as lib
 import fs_meshfix as meshfix
 import fs_physics as phys
 import fs_winfix as winfix
+import fs_yplus as fy
 
 # Усі блоки пояснень, створені панелями. Режим новачка просто показує або
 # ховає їх усі — так не треба протягувати прапорець крізь кожну панель.
@@ -1827,6 +1828,11 @@ class DomainPanel(Panel):
 # --------------------------------------------------------------------------
 
 class MeshPanel(Panel):
+    # The y+ check asks for another turbulence model or wall treatment
+    # (FlowPanel owns both).
+    model_fix_requested = QtCore.Signal(str)
+    treatment_fix_requested = QtCore.Signal(str)
+
     def __init__(self, cfg, parent=None):
         super().__init__(cfg, parent)
         m = cfg.mesh
@@ -2002,8 +2008,8 @@ class MeshPanel(Panel):
         self.v.addWidget(self.layers_on)
 
         lf = QtWidgets.QFormLayout()
-        self.nlayers = self.bind(ispin(1, 40, m.n_layers),
-                                 lambda: setattr(m, "n_layers", self.nlayers.value()))
+        self._auto_applying = False
+        self.nlayers = self.bind(ispin(1, 40, m.n_layers), self._nlayers_set)
         self.expansion = self.bind(dspin(1.01, 2.0, m.expansion, 0.05, 2),
                                    lambda: setattr(m, "expansion",
                                                    self.expansion.value()))
@@ -2022,23 +2028,53 @@ class MeshPanel(Panel):
         lf.addRow("minThickness", self.minthick)
         self.v.addLayout(lf)
 
+        # y+ target. With «Авто» on, the main window picks it from the
+        # turbulence model (fs_yplus.auto_pick) and writes the layers through
+        # apply_auto(). A typed y+, the button or a typed layer count is a
+        # manual choice: auto goes off until the toggle is set again.
         row = QtWidgets.QHBoxLayout()
-        self.target_yplus = dspin(0.3, 500, 50, 5, 1)
+        self.target_yplus = dspin(0.3, 500, m.target_yplus or 50, 5, 1)
+        self.target_yplus.valueChanged.connect(self._target_typed)
         self.btn_fit = QtWidgets.QPushButton("Підібрати шари")
-        self.btn_fit.clicked.connect(self._fit_layers)
+        self.btn_fit.clicked.connect(self._fit_clicked)
+        self.chk_auto = QtWidgets.QCheckBox("Авто")
+        self.chk_auto.setChecked(m.yplus_auto)
+        self.chk_auto.setToolTip(
+            "Програма сама вибирає y+ під модель турбулентності й Re і\n"
+            "підбирає шари після кожної зміни, що на це впливає.\n"
+            "Введений вручну y+ або кількість шарів вимикають «Авто».")
+        self.chk_auto.toggled.connect(self._auto_toggled)
         row.addWidget(QtWidgets.QLabel("Цільовий y+"))
         row.addWidget(self.target_yplus)
         row.addWidget(self.btn_fit)
+        row.addWidget(self.chk_auto)
         self.v.addLayout(row)
+        _b = explain(self.target_yplus, "target_yplus")
+        if _b:
+            self.v.addWidget(_b)
         self.fit_note = WrapLabel("")
         self.fit_note.hide_when_empty = True
         self.fit_note.setVisible(False)
         self.fit_note.setWordWrap(True)
-        self.fit_note.setStyleSheet("color:#b8860b; font-size:11px;")
+        self.fit_note.setStyleSheet("color:#4c9a52; font-size:11px;")
         self.v.addWidget(self.fit_note)
-        self.v.addWidget(hint(
-            "y+ між 5 і 30 — буферний шар, найгірший вибір для пристінних "
-            "функцій. Цільтеся або в ~1, або в 30-150."))
+        self.yplus_check = WrapLabel("")
+        self.yplus_check.hide_when_empty = True
+        self.yplus_check.setVisible(False)
+        self.yplus_check.setWordWrap(True)
+        self.v.addWidget(self.yplus_check)
+        fix_row = QtWidgets.QHBoxLayout()
+        self.yplus_fix_buttons = []
+        for _ in range(3):
+            b = QtWidgets.QPushButton("")
+            b.setVisible(False)
+            b.clicked.connect(self._fix_clicked)
+            fix_row.addWidget(b)
+            self.yplus_fix_buttons.append(b)
+        fix_row.addStretch(1)
+        self.v.addLayout(fix_row)
+        self.yplus_hint = hint(fy.model_hint(cfg.flow.turbulence))
+        self.v.addWidget(self.yplus_hint)
 
         self.v.addWidget(section("Адаптація: згущувати за розвʼязком"))
         self.adapt_mode = QtWidgets.QComboBox()
@@ -2053,18 +2089,18 @@ class MeshPanel(Panel):
                 ("native", "рідна OpenFOAM: ділити під час прогону "
                            "(лише нестаціонарний)")):
             self.adapt_mode.addItem(label, key)
-        idx = self.adapt_mode.findData(getattr(m := cfg.adapt, "mode", "none"))
+        idx = self.adapt_mode.findData(getattr(ad := cfg.adapt, "mode", "none"))
         self.adapt_mode.setCurrentIndex(max(idx, 0))
         self.adapt_mode.currentIndexChanged.connect(self._adapt_changed)
         self.v.addWidget(self.adapt_mode)
 
         af = QtWidgets.QFormLayout()
-        self.adapt_level = ispin(1, 4, m.max_level)
-        self.adapt_frac = dspin(0.01, 0.40, m.fraction, 0.01, 2)
-        self.adapt_every = ispin(1, 500, m.interval)
+        self.adapt_level = ispin(1, 4, ad.max_level)
+        self.adapt_frac = dspin(0.01, 0.40, ad.fraction, 0.01, 2)
+        self.adapt_every = ispin(1, 500, ad.interval)
         self.adapt_curl = QtWidgets.QCheckBox(
             "брати ще завихреність — щоб бачити слід")
-        self.adapt_curl.setChecked(m.use_curl)
+        self.adapt_curl.setChecked(ad.use_curl)
         for w in (self.adapt_level, self.adapt_frac, self.adapt_every):
             w.valueChanged.connect(lambda _: self._adapt_changed())
         self.adapt_curl.toggled.connect(lambda _: self._adapt_changed())
@@ -2176,9 +2212,112 @@ class MeshPanel(Panel):
         self.cfg.mesh.add_layers = on
         self.emit_changed()
 
+    # --- y+: auto and manual ---------------------------------------------
+
+    def _set_auto(self, on: bool) -> None:
+        self.cfg.mesh.yplus_auto = bool(on)
+        if self.chk_auto.isChecked() != bool(on):
+            self.chk_auto.blockSignals(True)
+            self.chk_auto.setChecked(bool(on))
+            self.chk_auto.blockSignals(False)
+
+    def _nlayers_set(self):
+        self.cfg.mesh.n_layers = self.nlayers.value()
+        if not self._auto_applying:
+            self._set_auto(False)
+
+    def _target_typed(self, value):
+        if self._loading or self._auto_applying:
+            return
+        self.cfg.mesh.target_yplus = float(value)
+        self._set_auto(False)
+        self.emit_changed()
+
+    def _fit_clicked(self):
+        self._set_auto(False)
+        self._fit_layers()
+        self.emit_changed()
+
+    def _auto_toggled(self, on):
+        if self._loading:
+            return
+        self.cfg.mesh.yplus_auto = bool(on)
+        if not on:
+            self.fit_note.setText("")
+        self.emit_changed()
+
+    def apply_auto(self, pick) -> None:
+        """Write the result of fs_yplus.auto_pick. It is not a manual edit."""
+        m = self.cfg.mesh
+        self._auto_applying = True
+        try:
+            if not pick.skipped:
+                m.n_layers, m.expansion = pick.n_layers, pick.expansion
+                m.target_yplus = pick.target
+                self.nlayers.setValue(pick.n_layers)
+                self.expansion.setValue(pick.expansion)
+                self.target_yplus.setValue(pick.target)
+        finally:
+            self._auto_applying = False
+        self._auto_pick = pick
+        self.fit_note.setStyleSheet("color:%s; font-size:11px;" % LEVEL_COLOR[
+            "ok" if pick.level == "ok" else "warn"])
+        self.fit_note.setText(fy.auto_line(pick, self.cfg.flow.turbulence))
+        self.emit_changed()
+
+    def _fix_clicked(self):
+        btn = self.sender()
+        fix = btn.property("fix") if btn is not None else None
+        if not fix:
+            return
+        kind, value = fix[0], fix[1]
+        if kind == "yplus":
+            self._set_auto(False)
+            self._auto_applying = True
+            try:
+                self.target_yplus.setValue(float(value))
+            finally:
+                self._auto_applying = False
+            self.cfg.mesh.target_yplus = float(value)
+            self._fit_layers()
+            self.emit_changed()
+        elif kind == "model":
+            self.model_fix_requested.emit(str(value))
+        elif kind == "treatment":
+            self.treatment_fix_requested.emit(str(value))
+
+    def refresh_yplus(self):
+        """Hint for the model, the check line and its fix buttons."""
+        c = self.cfg
+        self.yplus_hint.setText(fy.model_hint(c.flow.turbulence,
+                                              fy.cfg_treatment(c)))
+        chk = fy.case_check(c)
+        pick = getattr(self, "_auto_pick", None)
+        if c.mesh.yplus_auto and pick is not None and pick.problem:
+            text, lvl, fixes = pick.problem, pick.level, pick.fixes
+        elif chk.ok:
+            text, lvl, fixes = "", "ok", []
+        else:
+            text, lvl, fixes = chk.text, chk.level, chk.fixes
+        mark = {"error": "⛔ ", "warn": "⚠ "}.get(lvl, "")
+        self.yplus_check.setText(mark + text if text else "")
+        self.yplus_check.setStyleSheet(
+            "color:%s; font-size:11px;"
+            % LEVEL_COLOR["bad" if lvl == "error" else "warn"])
+        for i, b in enumerate(self.yplus_fix_buttons):
+            if i < len(fixes):
+                kind, value, label = fixes[i]
+                b.setText(label)
+                b.setProperty("fix", [kind, value])
+                b.setVisible(True)
+            else:
+                b.setProperty("fix", None)
+                b.setVisible(False)
+
     def _fit_layers(self):
         c = self.cfg
         target = self.target_yplus.value()
+        c.mesh.target_yplus = float(target)
         n = phys.layers_for_target_yplus(
             target, c.flow.u_inf, c.flow.l_ref, c.flow.nu,
             c.surface_cell, c.mesh.expansion, c.mesh.final_layer_rel)
@@ -2186,6 +2325,7 @@ class MeshPanel(Panel):
             self.fit_note.setText("Не вдалося підібрати: перевірте швидкість і Lref.")
             return
         self.nlayers.setValue(n)
+        self.fit_note.setStyleSheet("color:#b8860b; font-size:11px;")
 
         got = phys.LayerStack(n, c.mesh.expansion, c.mesh.final_layer_rel,
                               c.surface_cell).yplus(c.flow.u_inf, c.flow.l_ref,
@@ -2215,6 +2355,11 @@ class MeshPanel(Panel):
             self.maxcells.setValue(m.max_global_cells)
             self.nlayers.setValue(m.n_layers)
             self.expansion.setValue(m.expansion)
+            if m.target_yplus > 0:
+                self.target_yplus.setValue(m.target_yplus)
+            self.chk_auto.setChecked(bool(m.yplus_auto))
+            self._auto_pick = None
+            self.fit_note.setText("")
             self.final.setValue(m.final_layer_rel)
             self.minthick.setValue(m.min_thickness_rel)
             self.layers_on.setChecked(m.add_layers)
@@ -2424,6 +2569,7 @@ class MeshPanel(Panel):
         else:
             lines.append("Шарів немає — пристінні функції на «голій» сітці")
         self.info.setText("\n".join(lines))
+        self.refresh_yplus()
 
 
 # --------------------------------------------------------------------------
@@ -2526,12 +2672,24 @@ class FlowPanel(Panel):
         self.cmb_turb = QtWidgets.QComboBox()
         self.cmb_turb.addItems(list(fc.TURBULENCE_MODELS))
         self.cmb_turb.setCurrentText(f.turbulence)
-        self.cmb_turb.currentTextChanged.connect(
-            lambda t: (setattr(f, "turbulence", t), self.emit_changed()))
+        self.cmb_turb.currentTextChanged.connect(self._turb_changed)
         self.form3 = QtWidgets.QFormLayout()
         self.form3.addRow("Модель", self.cmb_turb)
         _b = explain(self.cmb_turb, "turbulence")
         if _b: self.form3.addRow(_b)
+        # Wall treatment. The item text says its y+ range; the items that do
+        # not suit the model are grey, with the reason as a tooltip.
+        self.cmb_wall = QtWidgets.QComboBox()
+        for key in fy.TREATMENT_ORDER:
+            self.cmb_wall.addItem(fy.TREATMENT_LABELS[key], key)
+        self.cmb_wall.setToolTip(
+            "Що OpenFOAM ставить на стінку (0/nut, 0/k).\n"
+            "Spalding працює при будь-якому y+ — найбезпечніший вибір.\n"
+            "Стандартна функція — лише коли y+ 30–300; Low-Re — лише y+ ≈ 1.\n"
+            "«Авто» біля y+ на вкладці «Сітка» підбирає шари під вибране.")
+        self.cmb_wall.currentIndexChanged.connect(self._wall_changed)
+        self.form3.addRow("Обробка стінки", self.cmb_wall)
+        self._sync_wall_items()
         self.intensity = self.bind(dspin(0.01, 30, f.intensity * 100, 0.1, 2, " %"),
                                    lambda: setattr(f, "intensity",
                                                    self.intensity.value() / 100))
@@ -2697,6 +2855,43 @@ class FlowPanel(Panel):
         self.v.addWidget(self.info)
         self.v.addStretch(1)
 
+    # --- turbulence model and wall treatment -----------------------------
+
+    def _turb_changed(self, model: str) -> None:
+        self.cfg.flow.turbulence = model
+        self._sync_wall_items()
+        self.emit_changed()
+
+    def _wall_changed(self, _index=None) -> None:
+        if self._syncing_wall:
+            return
+        key = self.cmb_wall.currentData()
+        if key:
+            self.cfg.flow.wall_treatment = key
+            self.emit_changed()
+
+    _syncing_wall = False
+
+    def _sync_wall_items(self) -> None:
+        """Grey out the treatments that do not suit the model. If the chosen
+        one does not suit it, fall back to Spalding (valid for all)."""
+        f = self.cfg.flow
+        model = f.turbulence
+        items = self.cmb_wall.model()
+        self._syncing_wall = True
+        try:
+            for i, key in enumerate(fy.TREATMENT_ORDER):
+                why = fy.why_not_treatment(model, key)
+                item = items.item(i)
+                item.setEnabled(not why)
+                item.setToolTip(why or fy.WALL_TREATMENTS[key])
+            effective = fy.case_wall_treatment(model, f.wall_treatment)
+            if effective != f.wall_treatment:
+                f.wall_treatment = effective
+            self.cmb_wall.setCurrentIndex(fy.TREATMENT_ORDER.index(effective))
+        finally:
+            self._syncing_wall = False
+
     def load_cfg(self):
         f = self.cfg.flow
 
@@ -2711,6 +2906,7 @@ class FlowPanel(Panel):
             self.intensity.setValue(f.intensity * 100)
             self.ratio.setValue(f.viscosity_ratio)
             self.cmb_turb.setCurrentText(f.turbulence)
+            self._sync_wall_items()
             index = self.cmb_far.findData(f.farfield_mode)
             if index >= 0:
                 self.cmb_far.setCurrentIndex(index)
@@ -3336,10 +3532,12 @@ class SolverPanel(Panel):
         # справа. Але радимо по ядрах, і кажемо чому.
         self.procs.setMaximum(max(1, threads))
         place = f"на {where}: " if where else "Доступно: "
+        mem = (f"{ram_gb:.1f} ГБ памʼяті" if ram_gb > 0
+               else "памʼять ще невідома")
         if threads > cores:
             self.lbl_res.setText(
                 f"{place}{cores} фізичних ядер ({threads} потоків із "
-                f"гіпертредингом), {ram_gb:.1f} ГБ памʼяті."
+                f"гіпертредингом), {mem}."
                 + chr(10)
                 + f"Ставте не більше {cores}. Два потоки одного ядра ділять "
                   f"кеш і памʼять, а розвʼязувач упирається саме в них — "
@@ -3347,7 +3545,7 @@ class SolverPanel(Panel):
                   f"зате вдвічі більше обміну між підобластями.")
         else:
             self.lbl_res.setText(
-                f"{place}{cores} ядер, {ram_gb:.1f} ГБ памʼяті. "
+                f"{place}{cores} ядер, {mem}. "
                 f"Більше процесів, ніж ядер, користі не дасть.")
 
 
@@ -3408,6 +3606,8 @@ class AdvisorPanel(Panel):
     def _yplus_widget(self):
         self.yplus = dspin(0.5, 300.0, 60.0, 5.0, 1)
         self.yplus.setToolTip(
+            "Коли на вкладці «Сітка» увімкнено «Авто» біля y+, помічник бере\n"
+            "y+ за моделлю турбулентності, а це поле не діє.\n"
             "60 — середина лог-шару, надійний вибір із пристінними функціями.\n"
             "Не ставте 5..30: це буферний шар, найгірша зона для них.\n"
             "1 означає розвʼязувати підшар — потрібні десятки шарів і чистий STL.")
@@ -4005,6 +4205,11 @@ class RunPanel(Panel):
             if g and g.get("ok") and not m.name and g.get("hostname"):
                 m.name = str(g["hostname"])
                 named = True
+            # Памʼять машини — для перевірки «чи влізе» по кожній машині.
+            ram = be.probe_ram_gb(g) if g and g.get("ok") else 0.0
+            if ram > 0 and abs(ram - m.ram_gb) > 1e-9:
+                m.ram_gb = ram
+                named = True
         self._m_refresh()
         self._m_load(self.lst_dist.currentRow())
         if named:
@@ -4015,8 +4220,10 @@ class RunPanel(Panel):
         mark = "" if g is None else ("✓ " if g.get("ok") else "✗ ")
         who = f" · {m.user}" if m.user else ""
         own = " · свій ключ" if m.key else ""
+        ram = ("" if m.ram_gb <= 0 else
+               f" · {m.ram_gb:.1f} ГБ" if m.ram_gb < 10 else f" · {m.ram_gb:.0f} ГБ")
         return (f"{mark}{m.name or '(без назви)'} — {m.addr or '?'} × "
-                f"{m.procs}{who}{own}")
+                f"{m.procs}{who}{own}{ram}")
 
     def _m_refresh(self) -> None:
         row = self.lst_dist.currentRow()
@@ -4057,12 +4264,15 @@ class RunPanel(Panel):
         if not 0 <= row < len(self._machines):
             return
         m = self._machines[row]
-        new = be.DistMachine(addr=self.ed_m_addr.text().strip(),
+        addr = self.ed_m_addr.text().strip()
+        new = be.DistMachine(addr=addr,
                              procs=self.sp_m_procs.value(),
                              name=self.ed_m_name.text().strip(),
                              user=self.ed_m_user.text().strip(),
                              key=self.ed_m_key.text().strip(),
-                             on=self.chk_m_on.isChecked())
+                             on=self.chk_m_on.isChecked(),
+                             # Інша адреса — інша машина: памʼять невідома.
+                             ram_gb=m.ram_gb if addr == m.addr else 0.0)
         if new == m:
             return
         self._machines[row] = new

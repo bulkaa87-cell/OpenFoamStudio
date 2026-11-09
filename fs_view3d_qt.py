@@ -27,10 +27,13 @@ class GpuWidget(QtWidgets.QWidget):
         self.gpu = None
         self.error = ""
         # Нативне вікно — лише там, де foamview уміє поверхню (Windows,
-        # macOS); на Linux і в offscreen-платформі тестів — малюємо в текстуру.
+        # macOS); на Linux, в offscreen-платформі тестів і для CPU-рівня —
+        # малюємо в памʼять і показуємо кадр QPainter'ом.
         self._kind = v3.window_kind()
         self._native = (self._kind is not None and QtGui.QGuiApplication.platformName()
-                        not in ("offscreen", "minimal"))
+                        not in ("offscreen", "minimal")
+                        and plotter.level.level != "cpu")
+        self._retried = False
         if self._native:
             self.setAttribute(Qt.WA_NativeWindow, True)
             self.setAttribute(Qt.WA_PaintOnScreen, True)
@@ -46,7 +49,10 @@ class GpuWidget(QtWidgets.QWidget):
     def pixel_size(self) -> tuple[int, int]:
         if self._override is not None:
             return self._override
-        dpr = self.devicePixelRatioF() if self._native else 1.0
+        # Фізичні пікселі і без нативного вікна: кадр у памʼяті (CPU, Linux)
+        # малюється 1:1, а не в логічних пікселях з розтягом — інакше на
+        # екрані 125 % лінії й краї стають сходинками.
+        dpr = self.devicePixelRatioF()
         return (max(1, round(self.width() * dpr)), max(1, round(self.height() * dpr)))
 
     def set_pixel_size(self, w: int, h: int):
@@ -61,33 +67,64 @@ class GpuWidget(QtWidgets.QWidget):
         return QtCore.QSize(640, 480)
 
     # --- GPU ---------------------------------------------------------------
-    def _ensure(self):
-        if self.gpu is not None or v3._fv is None:
-            return self.gpu
-        w, h = self.pixel_size()
-        font = v3.font_path()
+    def _go_offscreen(self):
+        self._native = False
+        self.setAttribute(Qt.WA_PaintOnScreen, False)
+
+    def _to_cpu(self, why: str):
+        """Останній рівень: CPU-растеризатор. Повільно, але картинка є."""
+        self.pl.level = v3.Level("cpu", note=why)
+        self._go_offscreen()
+        if self.pl.on_level is not None:
+            self.pl.on_level(self.pl.level)
+
+    def _make(self, w, h, font):
+        lv = self.pl.level
+        hwnd = int(self.winId()) if self._native else None
         try:
-            hwnd = int(self.winId()) if self._native else None
-            self.gpu = v3._fv.Renderer(hwnd, w, h, font, kind=self._kind or "win32")
+            return v3.make_renderer(lv, hwnd, w, h, font, kind=self._kind or "win32")
         except BaseException as exc:                      # noqa: BLE001
             if not v3.gpu_failed(exc):
                 raise
             self.error = str(exc)
-            if self._native:
-                # Без поверхні — малюємо в текстуру й показуємо кадр.
-                self._native = False
-                self.setAttribute(Qt.WA_PaintOnScreen, False)
-                try:
-                    self.gpu = v3._fv.Renderer(None, w, h, font)
-                except BaseException as exc2:             # noqa: BLE001
-                    if not v3.gpu_failed(exc2):
-                        raise
-                    self.error = f"{exc}; {exc2}"
-                    return None
-            else:
-                return None
+        if self._native and lv.level != "cpu" and (lv.backend or lv.adapter):
+            # Проба йде БЕЗ вікна, тож поверхню вікна вона не перевіряє.
+            # Вибраний бекенд не дав поверхню — у тому ж вікні вибір wgpu
+            # (усі бекенди): так було до ланцюжка, і це гладкий кадр, а не
+            # off-screen, розтягнутий QPainter'ом.
+            try:
+                r = v3.make_renderer(v3.Level(lv.level, note=lv.note), hwnd, w, h, font,
+                                     kind=self._kind or "win32")
+                self.setToolTip(f"3D: {lv.backend} не дав поверхню вікна "
+                                f"({self.error}); малює {r.adapter}")
+                return r
+            except BaseException as exc:                  # noqa: BLE001
+                if not v3.gpu_failed(exc):
+                    raise
+                self.error = f"{self.error}; {exc}"
+        if self._native:
+            # Без поверхні — той самий адаптер, кадр у памʼять.
+            self._go_offscreen()
+            try:
+                return v3.make_renderer(lv, None, w, h, font)
+            except BaseException as exc:                  # noqa: BLE001
+                if not v3.gpu_failed(exc):
+                    raise
+                self.error = f"{self.error}; {exc}"
+        if lv.level != "cpu":
+            self._to_cpu(f"{lv.text()} не створився: {self.error}")
+            return v3.make_renderer(self.pl.level, None, w, h, font)
+        return None
+
+    def _ensure(self):
+        if self.gpu is not None or v3._fv is None:
+            return self.gpu
+        w, h = self.pixel_size()
+        self.gpu = self._make(w, h, v3.font_path())
+        if self.gpu is None:
+            return None
         if hasattr(self.gpu, "set_scale"):
-            self.gpu.set_scale(self.devicePixelRatioF() if self._native else 1.0)
+            self.gpu.set_scale(self.devicePixelRatioF())
         self.gpu.set_background(*self.pl._bg)
         self.pl.upload_all()
         return self.gpu
@@ -124,8 +161,11 @@ class GpuWidget(QtWidgets.QWidget):
                 return
             h, w = img.shape[:2]
             q = QtGui.QImage(img.data, w, h, 4 * w, QtGui.QImage.Format_RGBA8888)
+            # Кадр у фізичних пікселях: позначити його dpr, щоб Qt поклав
+            # його 1:1, без масштабу.
+            q.setDevicePixelRatio(max(w / max(self.width(), 1), 1e-3))
             p = QtGui.QPainter(self)
-            p.drawImage(self.rect(), q)
+            p.drawImage(QtCore.QPointF(0, 0), q)
             p.end()
 
     def _draw(self):
@@ -137,10 +177,19 @@ class GpuWidget(QtWidgets.QWidget):
         except BaseException as exc:                      # noqa: BLE001
             if not v3.gpu_failed(exc):
                 raise
-            # Помилка GPU / скидання драйвера (TDR): далі без кадрів,
-            # причина — у підказці віджета; вікно живе.
-            self.error = str(exc)
-            self.setToolTip("3D: " + self.error)
+            self._gpu_lost(exc)
+
+    def _gpu_lost(self, exc):
+        """Помилка GPU / скидання драйвера (TDR): пристрій уже не той.
+        Раз — новий рендерер на тому ж адаптері; знову — CPU. Шари сцени
+        живуть у Plotter, тож upload_all() відновлює кадр повністю."""
+        self.error = str(exc)
+        self.setToolTip("3D: " + self.error)
+        self.gpu = None
+        if self._retried and self.pl.level.level != "cpu":
+            self._to_cpu(f"GPU відмовив двічі: {self.error}")
+        self._retried = True
+        self.update()
 
     def render_now(self):
         if self._native and self.gpu is not None:
@@ -153,13 +202,17 @@ class GpuWidget(QtWidgets.QWidget):
         if g is None:
             return None
         vp, view, persp, triad = self.pl.matrices()
-        try:
-            return g.screenshot(vp, view, persp, triad)
-        except BaseException as exc:                      # noqa: BLE001
-            if not v3.gpu_failed(exc):
-                raise
-            self.error = str(exc)
-            return None
+        for _ in range(3):                 # той самий GPU, ще раз, тоді CPU
+            try:
+                return g.screenshot(vp, view, persp, triad)
+            except BaseException as exc:                  # noqa: BLE001
+                if not v3.gpu_failed(exc):
+                    raise
+                self._gpu_lost(exc)
+                g = self._ensure()
+                if g is None:
+                    return None
+        return None
 
     def release(self):
         self.gpu = None

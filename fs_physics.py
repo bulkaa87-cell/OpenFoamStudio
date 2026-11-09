@@ -286,6 +286,11 @@ def inlet_turbulence_from_length_scale(
 # Оцінка розміру сітки та памʼяті
 # --------------------------------------------------------------------------
 
+# ГБ на мільйон комірок, сумарно по всіх процесах (виміри — у MeshEstimate).
+SNAPPY_GB_PER_MCELL = 2.3
+SOLVER_GB_PER_MCELL = 1.65
+
+
 @dataclass
 class MeshEstimate:
     background: int
@@ -317,7 +322,7 @@ class MeshEstimate:
         поверхні й копії в кожному процесі, тому з меншою кількістю процесів
         воно буде дещо нижчим.
         """
-        return self.total / 1.0e6 * 2.3
+        return self.total / 1.0e6 * SNAPPY_GB_PER_MCELL
 
     @property
     def solver_gb(self) -> float:
@@ -326,7 +331,7 @@ class MeshEstimate:
         ВИМІРЯНО там само: приріст 808 МБ на 490 тис. комірок = 1.65 ГБ на
         мільйон. Попередні 0.35 занижували майже вп'ятеро.
         """
-        return self.total / 1.0e6 * 1.65
+        return self.total / 1.0e6 * SOLVER_GB_PER_MCELL
 
 
 def estimate_mesh(
@@ -379,7 +384,8 @@ def fmt_cells(n: int) -> str:
 
 
 def memory_breakdown(est: "MeshEstimate", cfg_level: int,
-                     budget_gb: float) -> tuple[str, int]:
+                     budget_gb: float,
+                     need_gb: float | None = None) -> tuple[str, int]:
     """(пояснення, який рівень рефайнменту влізе в бюджет).
 
     Коли оцінка виходить абсурдною, користувачеві потрібна не цифра, а
@@ -399,7 +405,9 @@ def memory_breakdown(est: "MeshEstimate", cfg_level: int,
     # Кожен рівень нижче зменшує поверхневий доданок учетверо, а обʼємний —
     # у вісім разів. Беремо консервативну четвірку.
     level = cfg_level
-    gb = est.snappy_peak_gb
+    # `need_gb` — потреба того кроку, що не влазить (snappy чи розвʼязувач
+    # на одній машині); без нього — пік snappy.
+    gb = est.snappy_peak_gb if need_gb is None else need_gb
     while level > 1 and gb > budget_gb:
         level -= 1
         gb /= 4.0

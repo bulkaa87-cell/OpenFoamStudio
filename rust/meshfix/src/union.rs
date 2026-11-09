@@ -48,6 +48,9 @@ pub struct UnionReport {
     /// Cut clusters left uncut because their cut gave open or
     /// non-manifold edges.
     pub skipped_clusters: usize,
+    /// Faces kept although outside or inside, because their removal opened
+    /// an edge.
+    pub kept_patches: usize,
 }
 
 #[inline]
@@ -151,11 +154,11 @@ pub(crate) fn candidate_pairs(m: &Mesh, faces: &[u32]) -> Vec<(u32, u32)> {
 /// One end of a cut segment: mesh edge (u, v) crosses triangle `tri`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Hit {
-    u: u32,
-    v: u32,
-    tri: u32,
-    ou: f64,
-    ov: f64,
+    pub(crate) u: u32,
+    pub(crate) v: u32,
+    pub(crate) tri: u32,
+    pub(crate) ou: f64,
+    pub(crate) ov: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -236,6 +239,11 @@ pub const CONTACT_DEG: f64 = 0.5;
 const CONTACT_COS: f64 = 0.999_961_923_064_171_7; // cos(0.5 deg)
 
 pub(crate) fn test_pair(m: &Mesh, fa: u32, fb: u32) -> PairResult {
+    test_pair_x(m, fa, fb, true)
+}
+
+/// test_pair; with `contact` false, almost coplanar faces are cut too.
+pub(crate) fn test_pair_x(m: &Mesh, fa: u32, fb: u32, contact: bool) -> PairResult {
     let ta = m.triangles[fa as usize];
     let tb = m.triangles[fb as usize];
     let p = |i: u32| m.vertices[i as usize];
@@ -262,7 +270,10 @@ pub(crate) fn test_pair(m: &Mesh, fa: u32, fb: u32) -> PairResult {
         cross(sub(p(tb[1]), p(tb[0])), sub(p(tb[2]), p(tb[0]))),
     );
     let (la, lb) = (norm(na), norm(nb));
-    if la > 0.0 && lb > 0.0 && dot(na, nb).abs() > CONTACT_COS * la * lb {
+    // Only faces that face each other (opposite normals): two bodies that
+    // touch. Faces with the same direction are cut: a cut curve that
+    // becomes tangent must not stop there.
+    if contact && la > 0.0 && lb > 0.0 && -dot(na, nb) > CONTACT_COS * la * lb {
         let (lo_a, hi_a) = face_box(m, fa as usize);
         let (lo_b, hi_b) = face_box(m, fb as usize);
         if (0..3).all(|k| lo_a[k] <= hi_b[k] && lo_b[k] <= hi_a[k]) {
@@ -462,7 +473,7 @@ fn retriangulate(m: &mut Mesh, t: [u32; 3], f: u32, cuts: &Cuts, aliases: &mut V
 
 /// Solid angle of triangle a, b, c seen from p (Van Oosterom-Strackee).
 /// Zero when p is in the plane of the triangle.
-fn solid_angle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
+pub(crate) fn solid_angle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
     let (a, b, c) = (sub(a, p), sub(b, p), sub(c, p));
     let (la, lb, lc) = (norm(a), norm(b), norm(c));
     let det = det3(a, b, c);
@@ -510,21 +521,29 @@ struct Prepared {
     crossing: Vec<(u32, u32, PairResult)>,
     degenerate: usize,
     contact: usize,
+    /// Outside test by a flood fill (None when the box is empty).
+    vox: Option<VoxelOutside>,
+}
+
+/// Voxel budget of the outside test: 400 voxels for each face, at most 1e8
+/// (about 1.6 mm on a 1.5 m aircraft), at least 1e6.
+pub fn voxel_budget(faces: usize) -> usize {
+    (faces * 400).clamp(1_000_000, 100_000_000)
 }
 
 fn prepare(mesh: &Mesh) -> Option<Prepared> {
     let ef = mesh.edge_faces();
     let shells = components(mesh, &ef);
     let nf = mesh.triangles.len();
+    // All shells take part, also open ones: the winding number of a
+    // shell with a small gap is still near 0 outside and near 1 inside.
     let mut shell_of = vec![u32::MAX; nf];
     let mut rank = 0u32;
     for s in &shells {
-        if shell_closed(mesh, &ef, s) {
-            for &f in s {
-                shell_of[f as usize] = rank;
-            }
-            rank += 1;
+        for &f in s {
+            shell_of[f as usize] = rank;
         }
+        rank += 1;
     }
     if rank == 0 {
         return None;
@@ -551,7 +570,10 @@ fn prepare(mesh: &Mesh) -> Option<Prepared> {
     let jm = Mesh::new(moved.clone(), mesh.triangles.clone());
     // 2. Crossing pairs.
     let faces: Vec<u32> = (0..nf as u32).filter(|&f| shell_of[f as usize] != u32::MAX).collect();
-    let mut p = Prepared { shell_of, rank, nv0, orig, moved, crossing: Vec::new(), degenerate: 0, contact: 0 };
+    let t = std::time::Instant::now();
+    let vox = VoxelOutside::new(&jm, &faces, voxel_budget(faces.len()));
+    dbg_time("voxels", t);
+    let mut p = Prepared { shell_of, rank, nv0, orig, moved, crossing: Vec::new(), degenerate: 0, contact: 0, vox };
     let results: Vec<(u32, u32, PairResult)> = {
         use rayon::prelude::*;
         candidate_pairs(&jm, &faces)
@@ -585,20 +607,22 @@ pub fn union_shells(mesh: &mut Mesh) -> UnionReport {
     dbg_time("prepare", t0);
     let nf = mesh.triangles.len();
     let mut excluded = vec![false; nf];
+    let mut protected = vec![false; nf];
     let mut skipped = 0;
+    let mut kept_patches = 0;
     for _ in 0..MAX_ROUNDS {
         let mut m = mesh.clone();
         let mut bad = Vec::new();
+        let mut protect = Vec::new();
         let t1 = std::time::Instant::now();
-        let mut rep = union_round(&mut m, &prep, &excluded, &mut bad);
+        let mut rep = union_round(&mut m, &prep, &excluded, &protected, &mut bad, &mut protect);
         dbg_time("round", t1);
         rep.degenerate = prep.degenerate;
         rep.contact = prep.contact;
-        if bad.is_empty() {
+        if bad.is_empty() && protect.is_empty() {
             rep.skipped_clusters = skipped;
-            if rep.pairs > 0 {
-                *mesh = m;
-            }
+            rep.kept_patches = kept_patches;
+            *mesh = m;
             return rep;
         }
         skipped += bad.len();
@@ -606,6 +630,10 @@ pub fn union_shells(mesh: &mut Mesh) -> UnionReport {
             for f in cluster {
                 excluded[f as usize] = true;
             }
+        }
+        kept_patches += protect.len();
+        for f in protect {
+            protected[f as usize] = true;
         }
     }
     UnionReport { rolled_back: true, skipped_clusters: skipped, degenerate: prep.degenerate, contact: prep.contact, ..Default::default() }
@@ -618,10 +646,24 @@ pub(crate) fn dbg_time(what: &str, t: std::time::Instant) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Side {
+    Keep,
+    Flip,
+    Drop,
+}
+
 /// Union rounds before the union gives up.
 pub const MAX_ROUNDS: usize = 6;
 
-fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Vec<Vec<u32>>) -> UnionReport {
+fn union_round(
+    mesh: &mut Mesh,
+    prep: &Prepared,
+    excluded: &[bool],
+    protected: &[bool],
+    bad: &mut Vec<Vec<u32>>,
+    protect: &mut Vec<u32>,
+) -> UnionReport {
     let t_round = std::time::Instant::now();
     let mut rep = UnionReport::default();
     let nf = mesh.triangles.len();
@@ -673,10 +715,23 @@ fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Ve
             _ => {}
         }
     }
-    if rep.pairs == 0 {
-        return rep;
+    #[cfg(test)]
+    if std::env::var("MESHFIX_DEBUG_BIN").is_ok() {
+        let mut segset: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        for l in cuts.segs.values() {
+            for &(a, b) in l {
+                segset.insert((a.min(b), a.max(b)));
+            }
+        }
+        let mut deg: HashMap<u32, u32> = HashMap::new();
+        for &(a, b) in &segset {
+            *deg.entry(a).or_default() += 1;
+            *deg.entry(b).or_default() += 1;
+        }
+        let odd = deg.values().filter(|&&d| d % 2 == 1).count();
+        let odd_orig = deg.iter().filter(|(&v, &d)| d % 2 == 1 && (v as usize) < nv0).count();
+        eprintln!("debug: segments {} curve points {} odd-degree points {} (original vertices {})", segset.len(), deg.len(), odd, odd_orig);
     }
-
     // 3-4. Cut faces: faces with segments, inner points or points on an edge.
     let ef = mesh.edge_faces();
     let mut cut = vec![false; nf];
@@ -693,19 +748,28 @@ fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Ve
     let mut hit_shell = vec![false; rank as usize];
     let mut tris: Vec<[u32; 3]> = Vec::with_capacity(nf + 4 * cuts.segs.len());
     let mut tshell: Vec<u32> = Vec::with_capacity(tris.capacity());
+    let mut tsrc: Vec<u32> = Vec::with_capacity(tris.capacity());
     let mut aliases = vertex_alias;
     for f in 0..nf {
         let t = mesh.triangles[f];
         if !cut[f] {
             tris.push(t);
             tshell.push(shell_of[f]);
+            tsrc.push(f as u32);
             continue;
         }
         if shell_of[f] != u32::MAX {
             hit_shell[shell_of[f] as usize] = true;
         }
         let before = mesh.vertices.len() as u32;
-        match retriangulate(mesh, t, f as u32, &cuts, &mut aliases) {
+        // spade can assert on an almost degenerate constraint set. That
+        // face then stays uncut, and the cluster check of this round
+        // excludes its cut cluster in the next round.
+        let tri_new = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            retriangulate(mesh, t, f as u32, &cuts, &mut aliases)
+        }))
+        .unwrap_or(None);
+        match tri_new {
             Some(new) => {
                 rep.cut_faces += 1;
                 if cuts.segs.contains_key(&(f as u32)) {
@@ -716,12 +780,14 @@ fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Ve
                 for nt in new {
                     tris.push(nt);
                     tshell.push(shell_of[f]);
+                    tsrc.push(f as u32);
                 }
             }
             None => {
                 rep.failed_faces += 1;
                 tris.push(t);
                 tshell.push(shell_of[f]);
+                tsrc.push(f as u32);
             }
         }
     }
@@ -755,15 +821,18 @@ fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Ve
     }
     let mut keep_t = Vec::with_capacity(tris.len());
     let mut keep_s = Vec::with_capacity(tris.len());
-    for (t, s) in tris.into_iter().zip(tshell) {
+    let mut keep_src = Vec::with_capacity(tris.len());
+    for ((t, s), src) in tris.into_iter().zip(tshell).zip(tsrc) {
         let t = [find(&mut parent, t[0]), find(&mut parent, t[1]), find(&mut parent, t[2])];
         if t[0] != t[1] && t[1] != t[2] && t[2] != t[0] {
             keep_t.push(t);
             keep_s.push(s);
+            keep_src.push(src);
         }
     }
     mesh.triangles = keep_t;
     let tshell = keep_s;
+    let tsrc = keep_src;
     // Cluster of each welded vertex.
     // One welded vertex can be in more than one cluster: keep all of them,
     // so that the result does not depend on the map order.
@@ -814,14 +883,24 @@ fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Ve
     dbg_time("  weld+patches", t_round);
     let fwn = Fwn::new(mesh, &closed_faces);
     let mut drop_face = vec![false; nf];
-    let todo: Vec<&Vec<u32>> = patches
+    let _ = &hit_shell;
+    // MESHFIX_PER_FACE=1: classify each face on its own (no patch leak
+    // through a gap in a cut curve). Diagnosis switch for now.
+    let singles: Vec<Vec<u32>>;
+    let source: &Vec<Vec<u32>> = if std::env::var_os("MESHFIX_PER_FACE").is_some() {
+        singles = (0..nf as u32).map(|f| vec![f]).collect();
+        &singles
+    } else {
+        &patches
+    };
+    let todo: Vec<&Vec<u32>> = source
         .iter()
         .filter(|list| {
-            let s0 = tshell[list[0] as usize];
-            s0 != u32::MAX && hit_shell[s0 as usize]
+            tshell[list[0] as usize] != u32::MAX && !list.iter().any(|&g| protected[tsrc[g as usize] as usize])
         })
         .collect();
-    let ws: Vec<f64> = {
+    let vox = prep.vox.as_ref();
+    let ws: Vec<Side> = {
         use rayon::prelude::*;
         let m: &Mesh = mesh;
         todo.par_iter()
@@ -836,16 +915,67 @@ fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Ve
                     .unwrap();
                 let t = m.tri_pos(f as usize);
                 let p = scale(add(add(t[0], t[1]), t[2]), 1.0 / 3.0);
-                fwn.eval(p, Some(t))
+                let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+                let ln = norm(n);
+                if ln == 0.0 {
+                    return Side::Drop;
+                }
+                let u = scale(n, 1.0 / ln);
+                // 1. Voxel flood fill: is the space in front of / behind the
+                // face connected to the outside? Two and three voxels away,
+                // so that the own surface voxels do not count.
+                if let Some(v) = vox {
+                    let h = v.voxel();
+                    let front = v.outside(add(p, scale(u, 2.0 * h))) || v.outside(add(p, scale(u, 3.0 * h)));
+                    let back = v.outside(sub(p, scale(u, 2.0 * h))) && v.outside(sub(p, scale(u, 3.0 * h)));
+                    match (front, back) {
+                        (true, false) => return Side::Keep,
+                        (false, true) => return Side::Flip,
+                        (false, false) => return Side::Drop,
+                        (true, true) => {} // thinner than the voxels: see 2.
+                    }
+                }
+                // 2. Winding number a small step in front of and behind the
+                // face. A thin solid gives about 0 and 1, a loose sheet
+                // about -0.5 and 0.5. The step is more than the move of
+                // step 1 (1e-6), so a face of another body in contact counts.
+                let eps = (0.05 * (0.5 * ln).sqrt()).clamp(2e-5, 1e-3);
+                let e = scale(u, eps);
+                let (wf, wb) = (fwn.eval(add(p, e), None), fwn.eval(sub(p, e), None));
+                if wf < 0.25 && wb > 0.75 {
+                    Side::Keep
+                } else if wb < 0.25 && wf > 0.75 {
+                    Side::Flip
+                } else {
+                    Side::Drop
+                }
             })
             .collect()
     };
-    for (list, w) in todo.into_iter().zip(ws) {
-        if (w - 0.5).abs() > 0.25 {
-            rep.removed_patches += 1;
+    #[cfg(test)]
+    let side_of: HashMap<u32, Side> = todo.iter().zip(ws.iter()).flat_map(|(l, &sd)| l.iter().map(move |&g| (g, sd))).collect();
+    let mut flip_face = vec![false; nf];
+    for (list, side) in todo.into_iter().zip(ws) {
+        if side == Side::Keep {
+            continue; // outside in front, inside behind: outer surface
+        }
+        if side == Side::Flip {
+            // Outer surface, but turned in: turn it out.
             for &g in list {
-                drop_face[g as usize] = true;
+                flip_face[g as usize] = true;
             }
+            continue;
+        }
+        // Inside on both sides (inner wall, overlap, contact) or outside on
+        // both sides (loose sheet).
+        rep.removed_patches += 1;
+        for &g in list {
+            drop_face[g as usize] = true;
+        }
+    }
+    for f in 0..nf {
+        if flip_face[f] {
+            mesh.triangles[f].swap(1, 2);
         }
     }
 
@@ -862,20 +992,61 @@ fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Ve
             *count.entry(ekey(t[j], t[(j + 1) % 3])).or_default() += 1;
         }
     }
+    #[cfg(test)]
+    if std::env::var("MESHFIX_DEBUG_BIN").is_ok() {
+        let mut shown = 0;
+        let mut kinds: HashMap<String, usize> = HashMap::new();
+        for (&(a, b), &n) in &count {
+            if n != 4 {
+                continue;
+            }
+            let fs: Vec<u32> = ef[&(a, b)].iter().copied().filter(|&g| !drop_face[g as usize]).collect();
+            let mut key: Vec<String> = fs.iter().map(|&g| format!("s{}:{:?}:p{}", tshell[g as usize], side_of.get(&g), patches[patch[g as usize] as usize].len())).collect();
+            key.sort();
+            let shells: Vec<u32> = { let mut v: Vec<u32> = fs.iter().map(|&g| tshell[g as usize]).collect(); v.sort(); v.dedup(); v };
+            *kinds.entry(format!("shells {} sides {:?}", shells.len(), fs.iter().map(|g| side_of.get(g).copied()).collect::<Vec<_>>())).or_default() += 1;
+            if shown < 6 {
+                shown += 1;
+                eprintln!("  4-face edge {a}-{b} at {:?}: {:?}", mesh.vertices[a as usize], key);
+            }
+        }
+        let mut k: Vec<_> = kinds.into_iter().collect();
+        k.sort_by(|x, y| y.1.cmp(&x.1));
+        for (s, c) in k.iter().take(8) {
+            eprintln!("  kind {c}: {s}");
+        }
+    }
     let mut bad_roots: Vec<u32> = Vec::new();
     for (&(a, b), &n) in &count {
         if n == 2 {
             continue;
         }
+        let all = &ef[&(a, b)];
+        // A defect that was there before the removal is not ours.
+        if n as usize == all.len() {
+            continue;
+        }
+        let mut at_cut = false;
         for v in [a, b] {
             for &c in wcluster.get(&v).map(|x| x.as_slice()).unwrap_or(&[]) {
+                at_cut = true;
                 if !bad_roots.contains(&c) {
                     bad_roots.push(c);
                 }
             }
         }
+        if !at_cut {
+            // The removal of a patch opened this edge: keep that patch.
+            for &g in all {
+                if drop_face[g as usize] {
+                    protect.push(tsrc[g as usize]);
+                }
+            }
+        }
     }
-    if !bad_roots.is_empty() {
+    protect.sort_unstable();
+    protect.dedup();
+    if !bad_roots.is_empty() || !protect.is_empty() {
         let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
         for f in 0..fparent.len() as u32 {
             let r = find(&mut fparent, f);
@@ -883,7 +1054,9 @@ fn union_round(mesh: &mut Mesh, prep: &Prepared, excluded: &[bool], bad: &mut Ve
                 groups.entry(r).or_default().push(f);
             }
         }
-        bad.extend(groups.into_values());
+        let mut gs: Vec<Vec<u32>> = groups.into_values().collect();
+        gs.sort_unstable();
+        bad.extend(gs);
         return rep;
     }
 
@@ -1010,5 +1183,139 @@ impl Fwn {
             }
         }
         w / (4.0 * std::f64::consts::PI)
+    }
+}
+
+// ---- Outside test by a voxel flood fill ---------------------------------
+//
+// The winding number does not give a clear inside when an input body has
+// inner walls or gaps (each wall adds a jump of 1). The flood fill does: a
+// point is outside when empty voxels connect it to the bounding box border.
+// Gaps smaller than a voxel are closed. This is how a wrap sees the model.
+
+pub(crate) struct VoxelOutside {
+    lo: Vec3,
+    h: f64,
+    n: [usize; 3],
+    /// 1 bit per voxel: on a surface.
+    wall: Vec<u64>,
+    /// 1 bit per voxel: connected to the border by empty voxels.
+    out: Vec<u64>,
+}
+
+#[inline]
+fn bit(v: &[u64], i: usize) -> bool {
+    v[i >> 6] >> (i & 63) & 1 == 1
+}
+#[inline]
+fn set(v: &mut [u64], i: usize) {
+    v[i >> 6] |= 1 << (i & 63);
+}
+
+impl VoxelOutside {
+    /// `budget` = largest number of voxels in the box.
+    pub(crate) fn new(mesh: &Mesh, faces: &[u32], budget: usize) -> Option<Self> {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for &f in faces {
+            for p in mesh.tri_pos(f as usize) {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+        let ext = (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f64::max);
+        if !(ext > 0.0) {
+            return None;
+        }
+        let size = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+        let h = ((size[0] + ext * 0.01) * (size[1] + ext * 0.01) * (size[2] + ext * 0.01) / budget as f64).cbrt();
+        // Two empty voxel layers on each side: the border is outside.
+        let lo = [lo[0] - 2.0 * h, lo[1] - 2.0 * h, lo[2] - 2.0 * h];
+        let n = [
+            ((hi[0] - lo[0]) / h).ceil() as usize + 3,
+            ((hi[1] - lo[1]) / h).ceil() as usize + 3,
+            ((hi[2] - lo[2]) / h).ceil() as usize + 3,
+        ];
+        let total = n[0] * n[1] * n[2];
+        let words = total.div_ceil(64);
+        let mut s = VoxelOutside { lo, h, n, wall: vec![0; words], out: vec![0; words] };
+        // Mark the surface: points on each face at a third of a voxel.
+        for &f in faces {
+            let [a, b, c] = mesh.tri_pos(f as usize);
+            let l = dist(a, b).max(dist(b, c)).max(dist(c, a));
+            let k = ((l / (h / 3.0)).ceil() as usize).clamp(1, 4096);
+            for i in 0..=k {
+                for j in 0..=(k - i) {
+                    let (u, v) = (i as f64 / k as f64, j as f64 / k as f64);
+                    let p = add(a, add(scale(sub(b, a), u), scale(sub(c, a), v)));
+                    if let Some(id) = s.index(p) {
+                        set(&mut s.wall, id);
+                    }
+                }
+            }
+        }
+        // Flood fill from the border through empty voxels (6 neighbours).
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        let idx = |x: usize, y: usize, z: usize| (z * n[1] + y) * n[0] + x;
+        for z in 0..n[2] {
+            for y in 0..n[1] {
+                for x in 0..n[0] {
+                    if x == 0 || y == 0 || z == 0 || x == n[0] - 1 || y == n[1] - 1 || z == n[2] - 1 {
+                        let i = idx(x, y, z);
+                        if !bit(&s.wall, i) && !bit(&s.out, i) {
+                            set(&mut s.out, i);
+                            queue.push_back(i as u32);
+                        }
+                    }
+                }
+            }
+        }
+        let (sx, sy) = (1usize, n[0]);
+        let sz = n[0] * n[1];
+        while let Some(i) = queue.pop_front() {
+            let i = i as usize;
+            let x = i % n[0];
+            let y = (i / n[0]) % n[1];
+            let z = i / sz;
+            let mut try_push = |j: usize, s: &mut VoxelOutside| {
+                if !bit(&s.wall, j) && !bit(&s.out, j) {
+                    set(&mut s.out, j);
+                    queue.push_back(j as u32);
+                }
+            };
+            if x > 0 { try_push(i - sx, &mut s); }
+            if x + 1 < n[0] { try_push(i + sx, &mut s); }
+            if y > 0 { try_push(i - sy, &mut s); }
+            if y + 1 < n[1] { try_push(i + sy, &mut s); }
+            if z > 0 { try_push(i - sz, &mut s); }
+            if z + 1 < n[2] { try_push(i + sz, &mut s); }
+        }
+        Some(s)
+    }
+
+    fn index(&self, p: Vec3) -> Option<usize> {
+        let mut c = [0usize; 3];
+        for k in 0..3 {
+            let v = ((p[k] - self.lo[k]) / self.h).floor();
+            if v < 0.0 || v >= self.n[k] as f64 {
+                return None;
+            }
+            c[k] = v as usize;
+        }
+        Some((c[2] * self.n[1] + c[1]) * self.n[0] + c[0])
+    }
+
+    /// True when p is in a voxel that the flood fill reached.
+    pub(crate) fn outside(&self, p: Vec3) -> bool {
+        match self.index(p) {
+            Some(i) => bit(&self.out, i),
+            None => true,
+        }
+    }
+
+    pub(crate) fn voxel(&self) -> f64 {
+        self.h
     }
 }

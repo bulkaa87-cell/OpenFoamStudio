@@ -190,6 +190,45 @@ fn wrap_turns_inverted_and_drops_nested() {
 }
 
 #[test]
+fn winding_union_of_glued_and_crossing_cubes() {
+    // Two cubes glued on the plane x = 10 (caps with other triangles), and
+    // a third cube that crosses both. The union is one closed shell.
+    let a = cube(10.0, [0.0; 3]);
+    let mut b = cube(10.0, [10.0, 0.0, 0.0]);
+    // Other triangulation of the glued cap of b (x = 10: vertices 0, 3, 7, 4).
+    for t in &mut b.triangles {
+        if *t == [0, 4, 7] {
+            *t = [0, 4, 3];
+        } else if *t == [0, 7, 3] {
+            *t = [4, 7, 3];
+        }
+    }
+    let c = cube(6.0, [7.0, 2.0, 7.0]);
+    let mut m = join(&join(&a, &b), &c);
+    let before = volume(&m);
+    let (_, rep) = wrap_winding(&mut m);
+    assert!(!rep.panicked, "{rep:?}");
+    let i = mesh_info(&m);
+    assert!(i.is_closed() && i.is_oriented(), "{i:?} {rep:?}");
+    assert_eq!(i.shells, 1, "{i:?}");
+    // 2000 for the two cubes plus the part of c above z = 10 (6 x 6 x 3).
+    let v = volume(&m);
+    assert!((v - 2108.0).abs() < 1e-3, "volume {v} (input {before})");
+}
+
+#[test]
+fn winding_open_part_inside_closed_part() {
+    // An open box (no top) fully inside a closed cube: the union is the cube.
+    let mut inner = cube(4.0, [3.0, 3.0, 3.0]);
+    inner.triangles.retain(|t| *t != [4, 5, 6] && *t != [4, 6, 7]);
+    let mut m = join(&cube(10.0, [0.0; 3]), &inner);
+    wrap_winding(&mut m);
+    let i = mesh_info(&m);
+    assert!(i.is_closed() && i.is_oriented(), "{i:?}");
+    assert!((volume(&m) - 1000.0).abs() < 1e-6);
+}
+
+#[test]
 fn degenerate_face_goes() {
     let mut m = cube(10.0, [0.0; 3]);
     m.vertices.push([5.0, 0.0, 10.0]);
@@ -510,3 +549,378 @@ fn cdt_rejects_self_crossing_rim() {
     let v = vec![[0., 0., 0.], [1., 1., 0.], [1., 0., 0.], [0., 1., 0.]];
     assert!(triangulate_cdt(&v, &[0, 1, 2, 3]).is_none());
 }
+
+// ---- regressions from a real aircraft model (251k faces) ----
+
+/// Two cubes on the edge x = y = 10, each with its own vertices at the same
+/// positions (a clean, closed input). An exact weld of inner vertices joined
+/// them into a non-manifold edge, and the split then opened holes.
+#[test]
+fn touching_copies_stay_clean() {
+    let mut m = join(&cube(10.0, [0.0; 3]), &cube(10.0, [10.0, 10.0, 0.0]));
+    assert_eq!(m.defect_edges(), 0);
+    let r = fix(&mut m);
+    assert_eq!(m.defect_edges(), 0, "{:?}", r.after);
+    assert_eq!(r.after.shells, 2);
+    assert!((volume(&m) - 2000.0).abs() < 1e-9);
+}
+
+/// A cube with a flap: one more face on a cube edge (3 faces on the edge).
+/// The split cannot pair the flap, so the edge must stay as it is, and the
+/// repair must not give more open or non-manifold edges than the input.
+#[test]
+fn fin_edge_does_not_open() {
+    let mut m = cube(10.0, [0.0; 3]);
+    m.vertices.push([10.0, -5.0, 5.0]);
+    m.triangles.push([5, 1, 8]);
+    let d0 = m.defect_edges();
+    assert!(d0 > 0);
+    fix(&mut m);
+    assert!(m.defect_edges() <= d0, "{} > {d0}", m.defect_edges());
+}
+
+/// Slivers next to a closed edge: a zero-area cap on the top front edge and
+/// a needle at a corner. After the repair: no face below the zero-area limit
+/// of the program's check, and the cube stays closed and outward.
+#[test]
+fn slivers_go_and_cube_stays_closed() {
+    let mut m = cube(10.0, [0.0; 3]);
+    // cap: vertex 8 on edge 4-5, faces [4,8,6], [8,5,6] and the cap [8,4,5]
+    m.vertices.push([5.0, 0.0, 10.0]);
+    m.triangles[2] = [4, 8, 6];
+    m.triangles.push([8, 5, 6]);
+    m.triangles.push([8, 4, 5]);
+    // needle: vertex 9 at 1e-9 from corner 6 inside face [4,6,7]
+    m.vertices.push([10.0 - 1e-9, 10.0, 10.0]);
+    let i = m.triangles.iter().position(|t| *t == [4, 6, 7]).unwrap();
+    m.triangles[i] = [4, 9, 7];
+    m.triangles.push([4, 6, 9]);
+    m.triangles.push([9, 6, 7]);
+    assert!(mesh_info(&m).is_closed());
+    let r = fix(&mut m);
+    assert!(r.after.is_closed() && r.after.is_oriented(), "{:?}", r.after);
+    let limit = zero_area_limit(&m);
+    for f in 0..m.triangles.len() {
+        let [a, b, c] = m.tri_pos(f);
+        assert!(tri_area(a, b, c) >= limit, "face {f} area {}", tri_area(a, b, c));
+    }
+    assert!((volume(&m) - 1000.0).abs() < 1e-6, "volume {} {:?} {:?}", volume(&m), m.vertices, r.stages);
+}
+
+// ---------------------------------------------------------------------------
+// Alpha wrap (alphawrap.rs, delaunay.rs, aabb.rs)
+
+/// Random points: each cell is positive, the links agree, and no point is
+/// inside the circumsphere of a cell (exact signs).
+#[test]
+fn delaunay_cells_positive_and_empty() {
+    use crate::delaunay::*;
+    let mut d = Delaunay::new([0.0; 3], [10.0; 3]);
+    let mut s: u64 = 12345;
+    let mut rnd = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s % 1_000_000) as f64 / 1e5
+    };
+    for _ in 0..400 {
+        let p = [rnd(), rnd(), rnd()];
+        d.insert(p, NONE);
+    }
+    // Points on a grid: many on one plane and on one sphere.
+    for x in 0..4 {
+        for y in 0..4 {
+            d.insert([x as f64 * 2.0, y as f64 * 2.0, 5.0], NONE);
+        }
+    }
+    let n = d.pts.len();
+    let c3 = |p: Vec3| robust::Coord3D { x: p[0], y: p[1], z: p[2] };
+    for (ci, c) in d.cells.iter().enumerate() {
+        if !c.alive {
+            continue;
+        }
+        let q = d.cell_pts(ci as u32);
+        assert!(orient(q[0], q[1], q[2], q[3]) > 0.0, "cell {ci} not positive");
+        for i in 0..4 {
+            let nb = c.n[i];
+            if nb != NONE {
+                assert!(d.cells[nb as usize].alive);
+                assert!(d.cells[nb as usize].n.contains(&(ci as u32)));
+            }
+        }
+        if c.infinite() {
+            continue;
+        }
+        for v in N_SUPER as usize..n {
+            let r = robust::insphere(c3(q[0]), c3(q[1]), c3(q[2]), c3(q[3]), c3(d.pts[v]));
+            assert!(r <= 0.0, "point {v} inside the sphere of cell {ci}");
+        }
+    }
+}
+
+fn wrap_opts(alpha: f64) -> crate::alphawrap::WrapOptions {
+    crate::alphawrap::WrapOptions {
+        alpha,
+        offset: alpha / 30.0,
+        max_points: 2_000_000,
+        shrink: true,
+        gap: alpha / 300.0,
+        refine_passes: 3,
+        refine_tol: alpha / 30.0,
+    }
+}
+
+fn assert_wrap_clean(m: &Mesh) {
+    let i = mesh_info(m);
+    assert!(i.is_closed() && i.is_oriented(), "{i:?}");
+    assert!(is_clean(m));
+}
+
+/// A cube soup: the wrap is closed and outward, and after the shrink its
+/// volume is near the cube volume.
+#[test]
+fn alpha_wrap_cube_soup() {
+    let src = soup(&cube(10.0, [0.0; 3]));
+    let (w, r) = crate::alphawrap::wrap(&src, &wrap_opts(1.0));
+    let w = w.expect("wrap");
+    assert_wrap_clean(&w);
+    assert!(!r.stopped);
+    let v = volume(&w);
+    assert!((v - 1000.0).abs() < 10.0, "volume {v}");
+    // The wrap encloses the input: no wrap vertex is inside the cube.
+    for p in &w.vertices {
+        let inside = (0..3).map(|k| p[k].min(10.0 - p[k])).fold(f64::MAX, f64::min);
+        assert!(inside < 1e-9, "vertex {p:?} inside");
+    }
+}
+
+/// A flap on a cube, and a cube with an open side: the wrap gives one
+/// closed, outward body each time.
+#[test]
+fn alpha_wrap_open_and_nonmanifold_inputs() {
+    let mut fin = cube(10.0, [0.0; 3]);
+    fin.vertices.push([10.0, -5.0, 5.0]);
+    fin.triangles.push([5, 1, 8]);
+    let (w, _) = crate::alphawrap::wrap(&fin, &wrap_opts(0.5));
+    let w = w.expect("wrap");
+    assert_wrap_clean(&w);
+    assert_eq!(mesh_info(&w).shells, 1);
+    let v = volume(&w);
+    assert!(v > 1000.0 && v < 1010.0, "volume {v}");
+
+    let mut open = cube(10.0, [0.0; 3]);
+    open.triangles.drain(2..4);
+    let (w, _) = crate::alphawrap::wrap(&open, &wrap_opts(0.5));
+    assert_wrap_clean(&w.expect("wrap"));
+}
+
+/// Two crossing cubes and a cube in a cube: one closed body each, the
+/// inner faces are gone.
+#[test]
+fn alpha_wrap_union_and_nested() {
+    let m = join(&cube(10.0, [0.0; 3]), &cube(10.0, [5.0, 5.0, 5.0]));
+    let (w, _) = crate::alphawrap::wrap(&m, &wrap_opts(1.0));
+    let w = w.expect("wrap");
+    assert_wrap_clean(&w);
+    assert_eq!(mesh_info(&w).shells, 1);
+    let v = volume(&w);
+    assert!((v - 1875.0).abs() < 25.0, "volume {v}");
+    let m = join(&cube(10.0, [0.0; 3]), &cube(4.0, [3.0, 3.0, 3.0]));
+    let (w, _) = crate::alphawrap::wrap(&m, &wrap_opts(1.0));
+    let w = w.expect("wrap");
+    assert_wrap_clean(&w);
+    assert_eq!(mesh_info(&w).shells, 1);
+}
+
+/// The full repair uses the wrap only when the 12 steps leave defects: a
+/// clean cube stays as it is, an open sheet through a cube comes back
+/// closed.
+#[test]
+fn repair_uses_alpha_wrap_only_for_defects() {
+    let mut m = cube(10.0, [0.0; 3]);
+    let r = fix(&mut m);
+    assert!(r.alpha_wrap.is_none() && r.fallback.is_none());
+    assert_eq!(m.triangles.len(), 12);
+    let mut m = cube(10.0, [0.0; 3]);
+    let b = m.vertices.len() as u32;
+    m.vertices.extend_from_slice(&[[-5.0, 5.0, -5.0], [15.0, 5.0, -5.0], [15.0, 5.0, 15.0], [-5.0, 5.0, 15.0]]);
+    m.triangles.push([b, b + 1, b + 2]);
+    m.triangles.push([b, b + 2, b + 3]);
+    let r = fix(&mut m);
+    assert!(r.after.is_closed() && r.after.is_oriented(), "{:?}", r.after);
+    assert!(is_clean(&m));
+}
+
+// ---- volumetric remesh (volume.rs) ------------------------------------
+
+fn turned_box(s: f64, shift: Vec3, az: f64) -> Mesh {
+    let mut m = cube(s, [-s / 2.0; 3]);
+    let (c, d) = (az.to_radians().cos(), az.to_radians().sin());
+    for p in &mut m.vertices {
+        *p = add([c * p[0] - d * p[1], d * p[0] + c * p[1], p[2]], shift);
+    }
+    m
+}
+
+#[test]
+fn volume_remesh_gives_closed_union() {
+    // Two overlapping boxes, one inverted, and a small open slit in the
+    // other: the remesh ignores the orientation, and a gap below 2·delta
+    // does not leak.
+    let mut a = turned_box(10.0, [0.0; 3], 20.0);
+    let mut b = turned_box(10.0, [5.0, 3.0, 4.0], -15.0);
+    for t in &mut b.triangles {
+        t.swap(1, 2);
+    }
+    // Slit: vertex 6 of box a gets a copy that face 4-6-7 uses, moved by
+    // 1e-3 (h = 22/256 here, delta = 0.05 h = 4e-3).
+    let p6 = a.vertices[6];
+    a.vertices.push(add(p6, [1e-3, 0.0, 0.0]));
+    let i = a.triangles.iter().position(|t| *t == [4, 6, 7]).unwrap();
+    a.triangles[i] = [4, 8, 7];
+    let m = join(&a, &b);
+    let o = volume::VolumeOptions { cells: 256, ..Default::default() };
+    let (mut r, rep) = volume::remesh(&m, &o).expect("remesh");
+    volume::fix_zero_area(&mut r);
+    assert!(is_clean(&r), "{rep:?}");
+    assert_eq!(mesh_info(&r).shells, 1);
+    // Union volume by sampling: the remesh is close to it.
+    let inside = |p: Vec3, sh: Vec3, az: f64| {
+        let (c, d) = (az.to_radians().cos(), az.to_radians().sin());
+        let q = sub(p, sh);
+        let (x, y) = (c * q[0] + d * q[1], -d * q[0] + c * q[1]);
+        x.abs() <= 5.0 && y.abs() <= 5.0 && q[2].abs() <= 5.0
+    };
+    let n = 60;
+    let mut hit = 0;
+    for i in 0..n {
+        for j in 0..n {
+            for k in 0..n {
+                let f = |x: usize| -9.0 + 22.0 * (x as f64 + 0.5) / n as f64;
+                let p = [f(i), f(j), f(k)];
+                if inside(p, [0.0; 3], 20.0) || inside(p, [5.0, 3.0, 4.0], -15.0) {
+                    hit += 1;
+                }
+            }
+        }
+    }
+    let want = hit as f64 / (n * n * n) as f64 * 22f64.powi(3);
+    let got = volume(&r);
+    assert!((got - want).abs() < 0.03 * want, "volume {got} want {want}");
+    // Flat faces stay flat: the decimation removes most grid vertices.
+    assert!(r.triangles.len() < 2000, "decimation: {} faces", r.triangles.len());
+}
+
+#[test]
+fn volume_remesh_keeps_sharp_box() {
+    // The decimation moves the grid vertices onto the edges and corners of
+    // the input: a box comes back with its volume and few faces.
+    for az in [0.0, 20.0] {
+        let one = turned_box(10.0, [0.0; 3], az);
+        let o = volume::VolumeOptions { cells: 128, ..Default::default() };
+        let (r, _) = volume::remesh(&one, &o).unwrap();
+        assert!(is_clean(&r));
+        assert!((volume(&r) - 1000.0).abs() < 0.05, "az {az}: volume {}", volume(&r));
+        assert!(r.triangles.len() < 200, "az {az}: {} faces", r.triangles.len());
+    }
+}
+
+#[test]
+fn volume_remesh_drops_sheets() {
+    // A cube with a flap face on an edge, and a loose triangle through a
+    // wall: the remesh gives the closed cube only (a sheet has no inside).
+    let mut m = cube(10.0, [0.0; 3]);
+    m.vertices.push([10.0, -5.0, 5.0]);
+    m.triangles.push([5, 1, 8]);
+    m.vertices.extend_from_slice(&[[3.0, 3.0, 5.0], [7.0, 4.0, 15.0], [6.0, 7.0, 5.0]]);
+    m.triangles.push([9, 10, 11]);
+    let o = volume::VolumeOptions { cells: 128, ..Default::default() };
+    let (mut r, _) = volume::remesh(&m, &o).unwrap();
+    volume::fix_zero_area(&mut r);
+    assert!(is_clean(&r));
+    assert_eq!(mesh_info(&r).shells, 1);
+    assert!((volume(&r) - 1000.0).abs() < 0.05, "volume {}", volume(&r));
+    // The full repair of the flap cube ends closed too.
+    let mut f = cube(10.0, [0.0; 3]);
+    f.vertices.push([10.0, -5.0, 5.0]);
+    f.triangles.push([5, 1, 8]);
+    fix(&mut f);
+    assert!(is_clean(&f));
+    assert!((volume(&f) - 1000.0).abs() < 1.0, "volume {}", volume(&f));
+}
+
+// ---- From the stitch approach (seal.rs, rims.rs)
+/// Seal step: the flap gets its own edge, its fill makes a shell of no
+/// volume, and RemoveTinyShells removes that shell. The cube stays closed.
+#[test]
+fn fin_is_sealed() {
+    let mut m = cube(10.0, [0.0; 3]);
+    m.vertices.push([10.0, -5.0, 5.0]);
+    m.triangles.push([5, 1, 8]);
+    let r = fix(&mut m);
+    assert_eq!(m.defect_edges(), 0, "{:?}", r.after);
+    assert_good_cube(&m, &r, 1000.0);
+}
+
+/// Seal step: a sheet glued to a closed cube along a closed seam (3 faces on
+/// each seam edge), like a fairing on a fuselage. The result must be closed
+/// and outward, with no face of zero area.
+#[test]
+fn glued_sheet_is_sealed() {
+    // Cube 0..10, and a roof over the top face: a pyramid of 4 faces from
+    // the top edges to an apex. The top face of the cube stays.
+    let mut m = cube(10.0, [0.0; 3]);
+    m.vertices.push([5.0, 5.0, 14.0]);
+    for (a, b) in [(4u32, 5u32), (5, 6), (6, 7), (7, 4)] {
+        m.triangles.push([a, b, 8]);
+    }
+    assert!(m.defect_edges() > 0);
+    let r = fix(&mut m);
+    assert_eq!(m.defect_edges(), 0, "{:?}", r.after);
+    assert!(r.after.is_oriented(), "{:?}", r.after);
+    let ef = m.edge_faces();
+    for s in components(&m, &ef) {
+        assert!(shell_volume(&m, &s) > 0.0);
+    }
+    let limit = zero_area_limit(&m);
+    for f in 0..m.triangles.len() {
+        let [a, b, c] = m.tri_pos(f);
+        assert!(tri_area(a, b, c) >= limit, "face {f}");
+    }
+}
+
+/// A square tube with a wall of 1 mm, closed at z = 0, open at z = 10. The
+/// two rims of the open end get a strip (bridge_rims). Two disks would also
+/// give a closed mesh, but they block the opening of the tube.
+#[test]
+fn open_wall_end_gets_a_strip() {
+    let sq = |s0: f64, s1: f64, z: f64| vec![[s0, s0, z], [s1, s0, z], [s1, s1, z], [s0, s1, z]];
+    let mut v = sq(0.0, 10.0, 0.0);
+    v.extend(sq(0.0, 10.0, 10.0));
+    v.extend(sq(1.0, 9.0, 0.0));
+    v.extend(sq(1.0, 9.0, 10.0));
+    let (o, oo, i, ii) = (0u32, 4u32, 8u32, 12u32);
+    let mut t = Vec::new();
+    let mut quad = |a: u32, b: u32, c: u32, d: u32| {
+        t.push([a, b, c]);
+        t.push([a, c, d]);
+    };
+    for k in 0..4u32 {
+        let k1 = (k + 1) % 4;
+        quad(o + k, o + k1, oo + k1, oo + k); // outer wall, normal out
+        quad(i + k, ii + k, ii + k1, i + k1); // inner wall, normal to the axis
+        quad(o + k, i + k, i + k1, o + k1); // closed end, normal -z
+    }
+    let mut m = Mesh::new(v, t);
+    let r = fix(&mut m);
+    assert_eq!(m.defect_edges(), 0, "{:?}", r.after);
+    assert!(r.after.is_oriented());
+    assert!((volume(&m) - (1000.0 - 640.0)).abs() < 1e-6, "volume {}", volume(&m));
+    for f in 0..m.triangles.len() {
+        let [a, b, c] = m.tri_pos(f);
+        let g = scale(add(add(a, b), c), 1.0 / 3.0);
+        let inside = g[0] > 1.0 + 1e-9 && g[0] < 9.0 - 1e-9 && g[1] > 1.0 + 1e-9 && g[1] < 9.0 - 1e-9;
+        assert!(!(inside && (g[2] - 10.0).abs() < 1e-9), "a face across the opening: {g:?}");
+    }
+}
+

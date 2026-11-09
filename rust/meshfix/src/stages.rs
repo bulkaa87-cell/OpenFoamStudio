@@ -103,11 +103,14 @@ pub fn merge_boundary_vertices(mesh: &mut Mesh, tol: f64) -> usize {
 }
 
 /// Stitch = exact weld, boundary-vertex merge, T-junction split, exact weld.
+/// The exact welds use rim vertices only: a weld of inner vertices joins
+/// bodies that touch at a vertex into one non-manifold vertex (measured on
+/// a clean, closed aircraft model: 57 new non-manifold edges).
 pub fn stitch(mesh: &mut Mesh, tol: f64) -> usize {
-    mesh.weld_exact()
+    mesh.weld_rim(0.0)
         + merge_boundary_vertices(mesh, tol)
         + mesh.split_boundary_tjunctions(tol)
-        + mesh.weld_exact()
+        + mesh.weld_rim(0.0)
 }
 
 // ---- CloseTrivialHoles -------------------------------------------------
@@ -130,7 +133,7 @@ pub fn close_trivial_holes(mesh: &mut Mesh) -> usize {
 /// Weld with `weld_tol`, then remove each triangle that uses the same three
 /// vertices as another triangle (either orientation).
 pub fn remove_double_triangles(mesh: &mut Mesh, weld_tol: f64) -> usize {
-    mesh.weld(weld_tol);
+    mesh.weld_rim(weld_tol);
     let mut seen = HashSet::with_capacity(mesh.triangles.len());
     let mut keep = vec![true; mesh.triangles.len()];
     let mut removed = 0;
@@ -379,8 +382,15 @@ fn triangulate_dp(v: &[Vec3], poly: &[u32], banned: &dyn Fn(usize, usize, usize)
 }
 
 /// Close each boundary loop. Returns the number of holes closed.
+///
+/// First (from the stitch approach, rims.rs): two rims that are the two
+/// sides of one open wall end get a strip between them, not two disks
+/// across the opening. Then the vertex copies at one position on a rim are
+/// welded (a slit closes, a pinched rim becomes simple rims). Then each
+/// simple rim gets a fill.
 pub fn close_all_holes(mesh: &mut Mesh) -> usize {
-    let loops = mesh.boundary_loops();
+    let bridged = crate::rims::bridge_rims(mesh);
+    let (loops, _welded) = crate::rims::weld_rim_copies(mesh);
     let mut ef = mesh.edge_faces();
     for l in &loops {
         // The fill faces go opposite to the rim.
@@ -409,7 +419,66 @@ pub fn close_all_holes(mesh: &mut Mesh) -> usize {
             }
         }
     }
-    loops.len()
+    bridged + loops.len()
+}
+
+/// CloseAllHoles for the winding Wrap: as `close_all_holes`, but a fill
+/// that crosses another face is made again with the next method (minimum
+/// area, then CDT, then a fan from the centroid). Returns the number of
+/// holes closed.
+pub fn close_all_holes_checked(mesh: &mut Mesh) -> usize {
+    let bridged = crate::rims::bridge_rims(mesh);
+    let (loops, _welded) = crate::rims::weld_rim_copies(mesh);
+    if loops.is_empty() {
+        return bridged;
+    }
+    let ef = mesh.edge_faces();
+    let base_nf = mesh.triangles.len();
+    let base_nv = mesh.vertices.len();
+    let mut choice = vec![0usize; loops.len()];
+    for _ in 0..3 {
+        mesh.triangles.truncate(base_nf);
+        mesh.vertices.truncate(base_nv);
+        let mut owner: Vec<usize> = Vec::new();
+        for (i, l) in loops.iter().enumerate() {
+            let poly: Vec<u32> = l.iter().rev().copied().collect();
+            let tris = match choice[i] {
+                0 if poly.len() <= MAX_DP_HOLE => triangulate_min_area(&mesh.vertices, &poly, &ef),
+                0 | 1 => triangulate_cdt(&mesh.vertices, &poly)
+                    .or_else(|| (poly.len() <= MAX_DP_FALLBACK).then(|| triangulate_min_area(&mesh.vertices, &poly, &ef)))
+                    .unwrap_or_else(|| fan(&mut mesh.vertices, &poly)),
+                _ => fan(&mut mesh.vertices, &poly),
+            };
+            for t in tris {
+                mesh.triangles.push(t);
+                owner.push(i);
+            }
+        }
+        if std::env::var_os("MESHFIX_NO_CROSS_CHECK").is_some() {
+            break;
+        }
+        let active: Vec<bool> = (0..mesh.triangles.len()).map(|f| f >= base_nf).collect();
+        let pairs = crate::alphawrap::crossing_pairs_opt(mesh, Some(&active), false);
+        let mut changed = false;
+        let mut bad = vec![false; loops.len()];
+        for (f, g) in pairs {
+            for h in [f as usize, g as usize] {
+                if h >= base_nf {
+                    bad[owner[h - base_nf]] = true;
+                }
+            }
+        }
+        for i in 0..loops.len() {
+            if bad[i] && choice[i] < 2 {
+                choice[i] += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    bridged + loops.len()
 }
 
 // ---- Wrap --------------------------------------------------------------
@@ -439,14 +508,178 @@ pub fn wrap(mesh: &mut Mesh) -> usize {
     wrap_report(mesh).0
 }
 
+/// The Wrap mode: "winding" (arrange.rs, default) or "union" (union.rs).
+/// The variable MESHFIX_WRAP selects it.
+pub fn wrap_mode_winding() -> bool {
+    !matches!(std::env::var("MESHFIX_WRAP").as_deref(), Ok("union"))
+}
+
+/// Wrap by the arrangement and winding-number labels (arrange.rs).
+pub fn wrap_winding(mesh: &mut Mesh) -> (usize, crate::arrange::ArrangeReport) {
+    let t = std::time::Instant::now();
+    let before_split = mesh.clone();
+    let defects = mesh.defect_edges();
+    split_nonmanifold(mesh);
+    if mesh.defect_edges() > defects {
+        *mesh = before_split;
+    }
+    orient_shells(mesh);
+    crate::union::dbg_time("winding orient", t);
+    if std::env::var_os("MESHFIX_NO_PLANAR").is_none() {
+        if let Some(p) = std::env::var_os("MESHFIX_DUMP_PREPLANAR") {
+            let _ = mesh.write_obj(std::path::Path::new(&p));
+        }
+        let i0 = crate::mesh_info(mesh);
+        let pr = crate::planar::overlay_axis_planes(mesh);
+        if std::env::var_os("MESHFIX_TIMING").is_some() {
+            eprintln!("winding planar {pr:?}\n  before {i0:?}\n  after {:?}", crate::mesh_info(mesh));
+        }
+    }
+    crate::union::dbg_time("winding planar", t);
+    if let Some(p) = std::env::var_os("MESHFIX_DUMP_PLANAR") {
+        let _ = mesh.write_obj(std::path::Path::new(&p));
+    }
+    let rep = crate::arrange::winding_union(mesh);
+    crate::union::dbg_time("winding union", t);
+    if let Some(p) = std::env::var_os("MESHFIX_DUMP_UNION") {
+        let _ = mesh.write_obj(std::path::Path::new(&p));
+    }
+    // A closed shell with a negative volume is a void inside the body. The
+    // Windows Wrap fills such voids; so does this step.
+    let voids = remove_voids(mesh);
+    if std::env::var_os("MESHFIX_TIMING").is_some() {
+        eprintln!("winding voids removed {voids}");
+        eprintln!("winding after union {:?}", crate::mesh_info(mesh));
+    }
+    // Seams of the labels (open input regions): stitch, close the holes,
+    // split what still touches. Each is kept only when it does not give
+    // more open or non-manifold edges.
+    if std::env::var_os("MESHFIX_NO_POST").is_none() {
+        for k in 0..5 {
+            let before = mesh.clone();
+            let d0 = mesh.defect_edges();
+            match k {
+                0 => {
+                    split_nonmanifold(mesh);
+                }
+                4 => {
+                    split_pinched_edges(mesh);
+                }
+                1 => {
+                    // The stitch moves rim vertices by up to 0.01 units, and
+                    // then faces cross. The fill below welds the rim copies.
+                    if std::env::var_os("MESHFIX_POST_STITCH").is_some() {
+                        stitch(mesh, 0.01);
+                    }
+                }
+                2 => {
+                    close_all_holes_checked(mesh);
+                }
+                _ => {
+                    split_nonmanifold(mesh);
+                }
+            }
+            // A step that makes faces cross (a weld moves vertices, a fill
+            // can go through a near surface) goes back too.
+            if mesh.defect_edges() > d0 || k == 1 && new_crossings(&before, mesh) > 0 {
+                *mesh = before;
+            }
+            if std::env::var_os("MESHFIX_TIMING").is_some() {
+                eprintln!("winding post {k}: {:?}", crate::mesh_info(mesh));
+            }
+        }
+        // Seams that the steps above cannot close: the seal of the stitch
+        // approach (split by turn order, orient, bridge, weld, fill). It is
+        // kept only when it gives fewer open + non-manifold edges.
+        if mesh.defect_edges() > 0 && std::env::var_os("MESHFIX_NO_SEAL").is_none() {
+            let before = mesh.clone();
+            let d0 = mesh.defect_edges();
+            let r = crate::seal::seal(mesh);
+            if mesh.defect_edges() >= d0 || new_crossings(&before, mesh) > 0 {
+                *mesh = before;
+            }
+            if std::env::var_os("MESHFIX_TIMING").is_some() {
+                eprintln!("winding seal {r:?}: {:?}", crate::mesh_info(mesh));
+            }
+        }
+        remove_voids(mesh);
+        remove_inverted_parts(mesh, 1e-3);
+    }
+    if std::env::var_os("MESHFIX_TIMING").is_some() {
+        eprintln!("winding report {rep:?}");
+        eprintln!("winding after {:?}", crate::mesh_info(mesh));
+    }
+    (rep.removed_patches, rep)
+}
+
+/// Crossing face pairs in `after` with at least one face that is not in
+/// `before` (a face is the same when its three corner positions are).
+pub fn new_crossings(before: &Mesh, after: &Mesh) -> usize {
+    if std::env::var_os("MESHFIX_NO_CROSS_CHECK").is_some() {
+        return 0;
+    }
+    let key = |m: &Mesh, f: usize| {
+        let mut k: Vec<[u64; 3]> = m.tri_pos(f).iter().map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]).collect();
+        k.sort_unstable();
+        [k[0], k[1], k[2]]
+    };
+    let old: HashSet<[[u64; 3]; 3]> = (0..before.triangles.len()).map(|f| key(before, f)).collect();
+    let active: Vec<bool> = (0..after.triangles.len()).map(|f| !old.contains(&key(after, f))).collect();
+    if !active.iter().any(|&a| a) {
+        return 0;
+    }
+    crate::alphawrap::crossing_pairs_opt(after, Some(&active), false).len()
+}
+
+/// Remove each closed shell with a negative volume (a void). Returns the
+/// number of shells removed.
+pub fn remove_voids(mesh: &mut Mesh) -> usize {
+    let ef = mesh.edge_faces();
+    let shells = components(mesh, &ef);
+    let mut keep = vec![true; mesh.triangles.len()];
+    let mut n = 0;
+    for s in &shells {
+        if shell_closed(mesh, &ef, s) && shell_volume(mesh, s) < 0.0 {
+            n += 1;
+            for &f in s {
+                keep[f as usize] = false;
+            }
+        }
+    }
+    if n > 0 {
+        mesh.retain_faces(&keep);
+    }
+    n
+}
+
 /// Wrap with the union report: (count for the step, union report).
 pub fn wrap_report(mesh: &mut Mesh) -> (usize, crate::union::UnionReport) {
+    if wrap_mode_winding() {
+        let (n, r) = wrap_winding(mesh);
+        let u = crate::union::UnionReport {
+            pairs: r.pairs,
+            degenerate: r.degenerate,
+            cut_faces: r.cut_faces,
+            removed_patches: r.removed_patches,
+            failed_faces: r.failed_faces,
+            panicked: r.panicked,
+            contact: r.contact,
+            ..Default::default()
+        };
+        return (n, u);
+    }
     // Two bodies on one edge are one edge-connected shell that is not
     // closed. After the split each body is a closed shell of its own.
     let t = std::time::Instant::now();
+    // The split must not make more open or non-manifold edges.
+    let before_split = mesh.clone();
+    let defects = mesh.defect_edges();
     split_nonmanifold(mesh);
+    if mesh.defect_edges() > defects {
+        *mesh = before_split;
+    }
     crate::union::dbg_time("wrap split", t);
-    orient_closed_shells(mesh);
+    orient_shells(mesh);
     crate::union::dbg_time("wrap orient", t);
     // The union uses a third-party CDT. A panic in it must not stop the
     // repair: the mesh then stays as it was before the union.
@@ -462,7 +695,7 @@ pub fn wrap_report(mesh: &mut Mesh) -> (usize, crate::union::UnionReport) {
     // The union must not make the mesh worse. If it gives new open or
     // non-manifold edges (for example where a cut curve runs into a face
     // contact), the mesh goes back to the state before the union.
-    if rep.pairs > 0 && !rep.panicked {
+    if rep.pairs > 0 && !rep.panicked && std::env::var_os("MESHFIX_NO_UNION_GUARD").is_none() {
         let info1 = crate::mesh_info(mesh);
         let bad = (info1.boundary_edges + info1.non_manifold_edges)
             .saturating_sub(info0.boundary_edges + info0.non_manifold_edges);
@@ -476,14 +709,40 @@ pub fn wrap_report(mesh: &mut Mesh) -> (usize, crate::union::UnionReport) {
     crate::union::dbg_time("wrap union", t);
     let n = remove_nested(mesh);
     crate::union::dbg_time("wrap nested", t);
+    // The union removes inner walls and loose sheets of open parts. Their
+    // gaps are now holes of the outer surface: stitch and close them, then
+    // split what still touches. Each of these is kept only when it does not
+    // give more open or non-manifold edges.
+    for k in 0..3 {
+        let before = mesh.clone();
+        let d0 = mesh.defect_edges();
+        match k {
+            0 => {
+                stitch(mesh, 0.01);
+            }
+            1 => {
+                close_all_holes(mesh);
+            }
+            _ => {
+                split_nonmanifold(mesh);
+            }
+        }
+        if mesh.defect_edges() > d0 {
+            *mesh = before;
+        }
+    }
+    orient_shells(mesh);
+    crate::union::dbg_time("wrap close", t);
     (n + rep.removed_patches, rep)
 }
 
-fn orient_closed_shells(mesh: &mut Mesh) {
+/// Turn each shell so that its signed volume is positive. For an open shell
+/// with a small gap the sign still tells the side.
+fn orient_shells(mesh: &mut Mesh) {
     let ef = mesh.edge_faces();
     let shells = components(mesh, &ef);
     for s in &shells {
-        if shell_closed(mesh, &ef, s) && shell_volume(mesh, s) < 0.0 {
+        if shell_volume(mesh, s) < 0.0 {
             for &f in s {
                 mesh.triangles[f as usize].swap(1, 2);
             }
@@ -615,6 +874,8 @@ impl VertexFaces {
 /// when the edge is on the boundary. Returns the number of changes.
 pub fn remove_degenerated_faces(mesh: &mut Mesh, tol: f64) -> usize {
     let mut total = 0;
+    // Vertices whose collapse made a face cross: not tried again.
+    let mut refused: Vec<bool> = Vec::new();
     for _ in 0..64 {
         // A fast scan first: most rounds end here.
         let mut short = false;
@@ -640,6 +901,10 @@ pub fn remove_degenerated_faces(mesh: &mut Mesh, tol: f64) -> usize {
             let mut remap: Vec<u32> = (0..nv as u32).collect();
             let mut locked = vec![false; nv];
             let mut collapsed = 0;
+            let mut plan: Vec<(u32, u32, Vec3)> = Vec::new();
+            if refused.len() < nv {
+                refused.resize(nv, false);
+            }
             for fi in 0..mesh.triangles.len() {
                 let t = mesh.triangles[fi];
                 for i in 0..3 {
@@ -669,8 +934,13 @@ pub fn remove_degenerated_faces(mesh: &mut Mesh, tol: f64) -> usize {
                     if faces.len() == 2 && vf.on_rim(mesh, a) && vf.on_rim(mesh, b) {
                         continue;
                     }
-                    mesh.vertices[a as usize] = scale(add(pa, pb), 0.5);
-                    remap[b as usize] = a;
+                    if !collapse_keeps_normals(mesh, &vf, a, b, scale(add(pa, pb), 0.5)) {
+                        continue;
+                    }
+                    if refused[a as usize] || refused[b as usize] {
+                        continue;
+                    }
+                    plan.push((a, b, scale(add(pa, pb), 0.5)));
                     // Lock both one-rings: the rings above stay true for
                     // each later collapse in this pass.
                     for &x in ra.iter().chain(rb.iter()) {
@@ -678,8 +948,15 @@ pub fn remove_degenerated_faces(mesh: &mut Mesh, tol: f64) -> usize {
                     }
                     locked[a as usize] = true;
                     locked[b as usize] = true;
-                    collapsed += 1;
                 }
+            }
+            // A collapse that makes a face cross another face is refused
+            // (the union result has surfaces very near each other).
+            let plan = keep_without_crossings(mesh, plan, &mut refused);
+            for &(a, b, to) in &plan {
+                mesh.vertices[a as usize] = to;
+                remap[b as usize] = a;
+                collapsed += 1;
             }
             if collapsed > 0 {
                 mesh.apply_remap(&remap);
@@ -695,6 +972,7 @@ pub fn remove_degenerated_faces(mesh: &mut Mesh, tol: f64) -> usize {
         let mut dirty = vec![false; nv];
         let mut new_edges: HashSet<EdgeKey> = HashSet::new();
         let mut changed = 0;
+        let mut flips: Vec<(usize, usize, [u32; 3], [u32; 3])> = Vec::new();
         for f in 0..nf {
             if touched[f] {
                 continue;
@@ -746,6 +1024,7 @@ pub fn remove_degenerated_faces(mesh: &mut Mesh, tol: f64) -> usize {
             if h1.min(h2) <= old_h || dot(n1, n2) <= 0.0 {
                 continue;
             }
+            flips.push((f, g, mesh.triangles[f], mesh.triangles[g]));
             mesh.triangles[f] = [a, d, c];
             mesh.triangles[g] = [d, b, c];
             new_edges.insert(cd);
@@ -756,6 +1035,8 @@ pub fn remove_degenerated_faces(mesh: &mut Mesh, tol: f64) -> usize {
             }
             changed += 1;
         }
+        // A flip that makes a face cross another face goes back.
+        changed -= undo_crossing_flips(mesh, &flips);
         if changed == 0 {
             break;
         }
@@ -765,6 +1046,180 @@ pub fn remove_degenerated_faces(mesh: &mut Mesh, tol: f64) -> usize {
         total += changed;
     }
     total
+}
+
+/// The collapses of `plan` (a, b, new position) without the ones that make
+/// a face cross another face. The vertices of a refused collapse are marked
+/// in `refused`.
+fn keep_without_crossings(mesh: &Mesh, plan: Vec<(u32, u32, Vec3)>, refused: &mut [bool]) -> Vec<(u32, u32, Vec3)> {
+    if plan.is_empty() || std::env::var_os("MESHFIX_NO_CROSS_CHECK").is_some() {
+        return plan;
+    }
+    let nv = mesh.vertices.len();
+    let mut trial = mesh.clone();
+    let mut remap: Vec<u32> = (0..nv as u32).collect();
+    let mut owner = vec![u32::MAX; nv];
+    for (i, &(a, b, to)) in plan.iter().enumerate() {
+        trial.vertices[a as usize] = to;
+        remap[b as usize] = a;
+        owner[a as usize] = i as u32;
+    }
+    // No compaction: `owner` is indexed by the vertex ids of the mesh.
+    for t in &mut trial.triangles {
+        for x in t.iter_mut() {
+            *x = remap[*x as usize];
+        }
+    }
+    trial.drop_collapsed();
+    let active: Vec<bool> = trial.triangles.iter().map(|t| t.iter().any(|&x| owner[x as usize] != u32::MAX)).collect();
+    let pairs = crate::alphawrap::crossing_pairs_opt(&trial, Some(&active), false);
+    if pairs.is_empty() {
+        return plan;
+    }
+    let mut bad = vec![false; plan.len()];
+    for (f, g) in pairs {
+        for h in [f, g] {
+            for &x in &trial.triangles[h as usize] {
+                let o = owner[x as usize];
+                if o != u32::MAX {
+                    bad[o as usize] = true;
+                }
+            }
+        }
+    }
+    plan.into_iter()
+        .zip(bad)
+        .filter_map(|(p, b)| {
+            if b {
+                refused[p.0 as usize] = true;
+                refused[p.1 as usize] = true;
+                None
+            } else {
+                Some(p)
+            }
+        })
+        .collect()
+}
+
+/// Undo each flip of `flips` (f, g, old f, old g) whose new faces cross
+/// another face. Returns the number of flips undone.
+fn undo_crossing_flips(mesh: &mut Mesh, flips: &[(usize, usize, [u32; 3], [u32; 3])]) -> usize {
+    if flips.is_empty() || std::env::var_os("MESHFIX_NO_CROSS_CHECK").is_some() {
+        return 0;
+    }
+    let mut active = vec![false; mesh.triangles.len()];
+    let mut of = vec![u32::MAX; mesh.triangles.len()];
+    for (i, &(f, g, _, _)) in flips.iter().enumerate() {
+        active[f] = true;
+        active[g] = true;
+        of[f] = i as u32;
+        of[g] = i as u32;
+    }
+    let pairs = crate::alphawrap::crossing_pairs_opt(mesh, Some(&active), false);
+    let mut undo = vec![false; flips.len()];
+    for (f, g) in pairs {
+        for h in [f, g] {
+            if of[h as usize] != u32::MAX {
+                undo[of[h as usize] as usize] = true;
+            }
+        }
+    }
+    let mut n = 0;
+    for (i, &(f, g, tf, tg)) in flips.iter().enumerate() {
+        if undo[i] {
+            mesh.triangles[f] = tf;
+            mesh.triangles[g] = tg;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Undo the operations of one pass that make a face cross another face:
+/// collapses (a, b, old position of a; `remap[b] = a`), flips (f, g, old
+/// f, old g) and vertex moves (v, old position). The operations of one
+/// pass touch separate one-rings, so each one goes back alone. Returns
+/// (collapses undone, flips undone); for moves the first number counts
+/// the moves undone.
+fn undo_crossing_ops(
+    mesh: &mut Mesh,
+    remap: &mut [u32],
+    cols: &[(u32, u32, Vec3)],
+    flips: &[(usize, usize, [u32; 3], [u32; 3])],
+    moves: &[(u32, Vec3)],
+) -> (usize, usize) {
+    if (cols.is_empty() && flips.is_empty() && moves.is_empty()) || std::env::var_os("MESHFIX_NO_CROSS_CHECK").is_some() {
+        return (0, 0);
+    }
+    let nv = mesh.vertices.len();
+    let mut hot = vec![false; nv];
+    for &(a, _, _) in cols {
+        hot[a as usize] = true;
+    }
+    for &(v, _) in moves {
+        hot[v as usize] = true;
+    }
+    let mut flip_face = vec![false; mesh.triangles.len()];
+    for &(f, g, _, _) in flips {
+        flip_face[f] = true;
+        flip_face[g] = true;
+    }
+    // The trial mesh: remap applied, collapsed faces left out, no
+    // compaction (vertex ids stay).
+    let mut trial = Mesh::new(mesh.vertices.clone(), Vec::with_capacity(mesh.triangles.len()));
+    let mut old_of: Vec<usize> = Vec::with_capacity(mesh.triangles.len());
+    for (f, t) in mesh.triangles.iter().enumerate() {
+        let t = [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]];
+        if t[0] != t[1] && t[1] != t[2] && t[2] != t[0] {
+            trial.triangles.push(t);
+            old_of.push(f);
+        }
+    }
+    let active: Vec<bool> = trial
+        .triangles
+        .iter()
+        .zip(&old_of)
+        .map(|(t, &f)| flip_face[f] || t.iter().any(|&x| hot[x as usize]))
+        .collect();
+    if !active.iter().any(|&a| a) {
+        return (0, 0);
+    }
+    let pairs = crate::alphawrap::crossing_pairs_opt(&trial, Some(&active), false);
+    if pairs.is_empty() {
+        return (0, 0);
+    }
+    let mut bad_v = vec![false; nv];
+    let mut bad_f = vec![false; mesh.triangles.len()];
+    for (f, g) in pairs {
+        for h in [f, g] {
+            bad_f[old_of[h as usize]] = true;
+            for &x in &trial.triangles[h as usize] {
+                bad_v[x as usize] = true;
+            }
+        }
+    }
+    let (mut nc, mut nf) = (0, 0);
+    for &(a, b, old) in cols {
+        if bad_v[a as usize] {
+            mesh.vertices[a as usize] = old;
+            remap[b as usize] = b;
+            nc += 1;
+        }
+    }
+    for &(v, old) in moves {
+        if bad_v[v as usize] {
+            mesh.vertices[v as usize] = old;
+            nc += 1;
+        }
+    }
+    for &(f, g, tf, tg) in flips {
+        if bad_f[f] || bad_f[g] {
+            mesh.triangles[f] = tf;
+            mesh.triangles[g] = tg;
+            nf += 1;
+        }
+    }
+    (nc, nf)
 }
 
 // ---- RemoveTinyShells --------------------------------------------------
@@ -806,7 +1261,332 @@ pub fn prepare_for_export(mesh: &mut Mesh, tol: f64) -> usize {
     }
     mesh.weld_exact_where(Some(&rim));
     mesh.drop_collapsed();
-    n + split_nonmanifold(mesh)
+    let mut n = n + split_nonmanifold(mesh);
+    if wrap_mode_winding() {
+        n += split_pinched_edges(mesh);
+    }
+    // Winding mode: the thorough cleanup of the library approach (each edge,
+    // to the midpoint or to an end), then the last cleanup below.
+    n += remove_zero_area_with(mesh, wrap_mode_winding());
+    if wrap_mode_winding() {
+        n += remove_zero_area_final(mesh) + remove_inverted_parts(mesh, 1e-3);
+    }
+    n
+}
+
+/// True when moving a and b to `to` turns no face around them over and
+/// makes no face of zero area (the faces on edge ab disappear).
+fn collapse_keeps_normals(mesh: &Mesh, vf: &VertexFaces, a: u32, b: u32, to: Vec3) -> bool {
+    for &v in &[a, b] {
+        for &f in vf.of(v) {
+            let t = mesh.triangles[f as usize];
+            if t.contains(&a) && t.contains(&b) {
+                continue;
+            }
+            let old = mesh.tri_pos(f as usize);
+            let mut new = old;
+            for k in 0..3 {
+                if t[k] == a || t[k] == b {
+                    new[k] = to;
+                }
+            }
+            let n0 = cross(sub(old[1], old[0]), sub(old[2], old[0]));
+            let n1 = cross(sub(new[1], new[0]), sub(new[2], new[0]));
+            if dot(n0, n1) <= 0.0 || norm(n1) <= 1e-12 * norm(n0) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Last cleanup of the winding mode, after remove_zero_area: the faces that
+/// still have a zero area (the program's limit). A collapse of the
+/// shortest possible edge needs only the link condition here (the faces
+/// are in a region of the size of the small vertex move, where the face
+/// normals have no meaning). When no collapse is possible, the vertices of
+/// the face move a little to the centroid of their neighbors (two copies
+/// of one vertex then separate). No face is deleted, so a closed mesh stays
+/// closed. Returns the number of changes.
+pub fn remove_zero_area_final(mesh: &mut Mesh) -> usize {
+    let mut total = 0;
+    for round in 0..32 {
+        let limit = zero_area_limit(mesh);
+        let cand: Vec<usize> = (0..mesh.triangles.len())
+            .filter(|&f| {
+                let [a, b, c] = mesh.tri_pos(f);
+                tri_area(a, b, c) < limit
+            })
+            .collect();
+        if cand.is_empty() {
+            break;
+        }
+        let vf = VertexFaces::new(mesh);
+        let nv = mesh.vertices.len();
+        let mut locked = vec![false; nv];
+        let mut remap: Vec<u32> = (0..nv as u32).collect();
+        let mut collapsed = 0;
+        let mut stuck: Vec<usize> = Vec::new();
+        let mut col_log: Vec<(u32, u32, Vec3)> = Vec::new();
+        for &f in &cand {
+            let t = mesh.triangles[f];
+            if t.iter().any(|&v| locked[v as usize]) {
+                continue;
+            }
+            let p = mesh.tri_pos(f);
+            let lens = [dist(p[0], p[1]), dist(p[1], p[2]), dist(p[2], p[0])];
+            let mut order = [0usize, 1, 2];
+            order.sort_by(|&x, &y| lens[x].total_cmp(&lens[y]));
+            let mut done = false;
+            for &i in &order {
+                let (a, b) = (t[i], t[(i + 1) % 3]);
+                if vf.edge(mesh, a, b).len() != 2 {
+                    continue;
+                }
+                let (ra, rb) = (vf.ring(mesh, a), vf.ring(mesh, b));
+                let common = ra.iter().filter(|x| rb.binary_search(x).is_ok()).count();
+                if common != 2 || (vf.on_rim(mesh, a) && vf.on_rim(mesh, b)) {
+                    continue;
+                }
+                let to = scale(add(mesh.vertices[a as usize], mesh.vertices[b as usize]), 0.5);
+                col_log.push((a, b, mesh.vertices[a as usize]));
+                mesh.vertices[a as usize] = to;
+                remap[b as usize] = a;
+                for &x in ra.iter().chain(rb.iter()) {
+                    locked[x as usize] = true;
+                }
+                locked[a as usize] = true;
+                locked[b as usize] = true;
+                collapsed += 1;
+                done = true;
+                break;
+            }
+            if !done {
+                stuck.push(f);
+            }
+        }
+        let mut nudged = 0;
+        if collapsed == 0 {
+            let w = (0.01 * (1u64 << round.min(6)) as f64).min(0.5);
+            let mut moves: Vec<(u32, Vec3)> = Vec::new();
+            for &f in &stuck {
+                for &v in &mesh.triangles[f] {
+                    let ring = vf.ring(mesh, v);
+                    if ring.is_empty() {
+                        continue;
+                    }
+                    let mut c = [0.0; 3];
+                    for &x in &ring {
+                        c = add(c, mesh.vertices[x as usize]);
+                    }
+                    c = scale(c, 1.0 / ring.len() as f64);
+                    let p = mesh.vertices[v as usize];
+                    moves.push((v, add(p, scale(sub(c, p), w))));
+                }
+            }
+            moves.sort_by_key(|m| m.0);
+            moves.dedup_by_key(|m| m.0);
+            let mut nudge_log: Vec<(u32, Vec3)> = Vec::new();
+            for (v, p) in moves {
+                nudge_log.push((v, mesh.vertices[v as usize]));
+                mesh.vertices[v as usize] = p;
+                nudged += 1;
+            }
+            let mut ident: Vec<u32> = (0..nv as u32).collect();
+            nudged -= undo_crossing_ops(mesh, &mut ident, &[], &[], &nudge_log).0;
+        } else {
+            collapsed -= undo_crossing_ops(mesh, &mut remap, &col_log, &[], &[]).0;
+            mesh.apply_remap(&remap);
+        }
+        if collapsed + nudged == 0 {
+            break;
+        }
+        total += collapsed + nudged;
+    }
+    total
+}
+
+/// As `collapse_keeps_normals`, but a face with an area below `limit`
+/// before the collapse is not checked when it stays below 1e4 · limit:
+/// its normal has no direction.
+fn collapse_keeps_normals_lim(mesh: &Mesh, vf: &VertexFaces, a: u32, b: u32, to: Vec3, limit: f64) -> bool {
+    for &v in &[a, b] {
+        for &f in vf.of(v) {
+            let t = mesh.triangles[f as usize];
+            if t.contains(&a) && t.contains(&b) {
+                continue;
+            }
+            let old = mesh.tri_pos(f as usize);
+            let mut new = old;
+            for k in 0..3 {
+                if t[k] == a || t[k] == b {
+                    new[k] = to;
+                }
+            }
+            let n0 = cross(sub(old[1], old[0]), sub(old[2], old[0]));
+            let n1 = cross(sub(new[1], new[0]), sub(new[2], new[0]));
+            if 0.5 * norm(n0) < limit && 0.5 * norm(n1) < 1e4 * limit {
+                continue;
+            }
+            if dot(n0, n1) <= 0.0 || norm(n1) <= 1e-12 * norm(n0) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Zero-area limit of the program's «Вироджені» counter (fs_geometry.diagnose):
+/// area < max(mean area * 1e-10, 1e-24).
+pub fn zero_area_limit(mesh: &Mesh) -> f64 {
+    let n = mesh.triangles.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let total: f64 = (0..n)
+        .map(|f| {
+            let [a, b, c] = mesh.tri_pos(f);
+            tri_area(a, b, c)
+        })
+        .sum();
+    (total / n as f64 * 1e-10).max(1e-24)
+}
+
+/// Last cleanup: each face with an area below the limit of the program's
+/// check goes away by an edge collapse (link condition, no face turns over)
+/// or by a flip of its longest edge. No face is deleted, so a closed mesh
+/// stays closed. Returns the number of changes.
+pub fn remove_zero_area(mesh: &mut Mesh) -> usize {
+    remove_zero_area_with(mesh, false)
+}
+
+/// As `remove_zero_area`. With `thorough`, a face that the first try
+/// cannot remove also tries the collapse of each of its edges, to the
+/// midpoint and to each end, and more rounds are done (library stage).
+pub fn remove_zero_area_with(mesh: &mut Mesh, thorough: bool) -> usize {
+    let mut total = 0;
+    let rounds = if thorough { 64 } else { 16 };
+    for _ in 0..rounds {
+        let limit = zero_area_limit(mesh);
+        let cand: Vec<usize> = (0..mesh.triangles.len())
+            .filter(|&f| {
+                let [a, b, c] = mesh.tri_pos(f);
+                tri_area(a, b, c) < limit
+            })
+            .collect();
+        if cand.is_empty() {
+            break;
+        }
+        let vf = VertexFaces::new(mesh);
+        let nv = mesh.vertices.len();
+        let mut locked = vec![false; nv];
+        let mut remap: Vec<u32> = (0..nv as u32).collect();
+        let mut collapsed = 0;
+        let mut flipped = 0;
+        let mut new_edges: HashSet<EdgeKey> = HashSet::new();
+        let mut col_log: Vec<(u32, u32, Vec3)> = Vec::new();
+        let mut flip_log: Vec<(usize, usize, [u32; 3], [u32; 3])> = Vec::new();
+        for &f in &cand {
+            let t = mesh.triangles[f];
+            if t.iter().any(|&v| locked[v as usize]) {
+                continue;
+            }
+            let p = mesh.tri_pos(f);
+            let lens = [dist(p[0], p[1]), dist(p[1], p[2]), dist(p[2], p[0])];
+            // 1. Collapse the shortest edge (a needle).
+            let mut order = [0usize, 1, 2];
+            order.sort_by(|&x, &y| lens[x].total_cmp(&lens[y]));
+            let tries: &[usize] = if thorough { &order } else { &order[..1] };
+            let mut done = false;
+            'edges: for &i in tries {
+                let (a, b) = (t[i], t[(i + 1) % 3]);
+                let faces = vf.edge(mesh, a, b);
+                if faces.len() != 2 {
+                    continue;
+                }
+                let (ra, rb) = (vf.ring(mesh, a), vf.ring(mesh, b));
+                let common = ra.iter().filter(|x| rb.binary_search(x).is_ok()).count();
+                if common != 2 || (vf.on_rim(mesh, a) && vf.on_rim(mesh, b)) {
+                    continue;
+                }
+                let (pa, pb) = (mesh.vertices[a as usize], mesh.vertices[b as usize]);
+                let mid = scale(add(pa, pb), 0.5);
+                let dests: &[Vec3] = if thorough { &[mid, pa, pb] } else { &[mid] };
+                for &to in dests {
+                    let ok = if thorough {
+                        collapse_keeps_normals_lim(mesh, &vf, a, b, to, limit)
+                    } else {
+                        collapse_keeps_normals(mesh, &vf, a, b, to)
+                    };
+                    if ok {
+                        col_log.push((a, b, mesh.vertices[a as usize]));
+                        mesh.vertices[a as usize] = to;
+                        remap[b as usize] = a;
+                        for &x in ra.iter().chain(rb.iter()) {
+                            locked[x as usize] = true;
+                        }
+                        locked[a as usize] = true;
+                        locked[b as usize] = true;
+                        collapsed += 1;
+                        done = true;
+                        break 'edges;
+                    }
+                }
+            }
+            if done {
+                continue;
+            }
+            // 2. Flip the longest edge (a cap).
+            let i = (0..3).max_by(|&x, &y| lens[x].total_cmp(&lens[y])).unwrap();
+            let (a, b, c) = (t[i], t[(i + 1) % 3], t[(i + 2) % 3]);
+            let adj = vf.edge(mesh, a, b);
+            if adj.len() != 2 {
+                continue;
+            }
+            let g = if adj[0] as usize == f { adj[1] } else { adj[0] } as usize;
+            let tg = mesh.triangles[g];
+            if !directed(&tg, b, a) || tg.iter().any(|&v| locked[v as usize]) {
+                continue;
+            }
+            let Some(d) = tg.iter().copied().find(|&x| x != a && x != b) else { continue };
+            let cd = ekey(c, d);
+            if d == c || !vf.edge(mesh, c, d).is_empty() || new_edges.contains(&cd) {
+                continue;
+            }
+            let (pa, pb, pc, pd) = (
+                mesh.vertices[a as usize],
+                mesh.vertices[b as usize],
+                mesh.vertices[c as usize],
+                mesh.vertices[d as usize],
+            );
+            let n1 = cross(sub(pd, pa), sub(pc, pa));
+            let n2 = cross(sub(pb, pd), sub(pc, pd));
+            let ng = cross(sub(pa, pb), sub(pd, pb));
+            if dot(n1, n2) <= 0.0 || dot(n1, ng) <= 0.0 || 0.5 * norm(n1) < limit || 0.5 * norm(n2) < limit {
+                continue;
+            }
+            flip_log.push((f, g, mesh.triangles[f], mesh.triangles[g]));
+            mesh.triangles[f] = [a, d, c];
+            mesh.triangles[g] = [d, b, c];
+            new_edges.insert(cd);
+            for v in [a, b, c, d] {
+                locked[v as usize] = true;
+            }
+            flipped += 1;
+        }
+        // Collapses and flips that make a face cross another face go back.
+        let (rc, rf) = undo_crossing_ops(mesh, &mut remap, &col_log, &flip_log, &[]);
+        collapsed -= rc;
+        flipped -= rf;
+        if collapsed > 0 {
+            mesh.apply_remap(&remap);
+        }
+        if collapsed + flipped == 0 {
+            break;
+        }
+        total += collapsed + flipped;
+    }
+    total
 }
 
 // ---- Non-manifold split ------------------------------------------------
@@ -814,7 +1594,7 @@ pub fn prepare_for_export(mesh: &mut Mesh, tol: f64) -> usize {
 /// Pairs of faces on an edge with more than two faces. Each body is on the
 /// back side of its faces, so a face that runs a to b pairs with the face
 /// before it in the turn order around the edge (and that face runs b to a).
-fn pair_around_edge(mesh: &Mesh, a: u32, b: u32, fs: &[u32]) -> Vec<(u32, u32)> {
+pub(crate) fn pair_around_edge(mesh: &Mesh, a: u32, b: u32, fs: &[u32]) -> Vec<(u32, u32)> {
     let (pa, pb) = (mesh.vertices[a as usize], mesh.vertices[b as usize]);
     let d = sub(pb, pa);
     let ld = norm(d);
@@ -855,6 +1635,109 @@ fn pair_around_edge(mesh: &Mesh, a: u32, b: u32, fs: &[u32]) -> Vec<(u32, u32)> 
     out
 }
 
+/// An edge with 2k faces (k > 1) that vertex copies cannot split: the
+/// sheets touch along the edge and meet again around both end points (a
+/// pinch). Each face pair after the first gets its own copy of the edge:
+/// a new middle vertex splits the two faces of the pair. The edge then has
+/// two faces on each copy. Returns the number of edges split.
+pub fn split_pinched_edges(mesh: &mut Mesh) -> usize {
+    let ef = mesh.edge_faces();
+    let mut todo: Vec<(u32, u32, Vec<(u32, u32)>)> = Vec::new();
+    let mut used = vec![false; mesh.triangles.len()];
+    let mut keys: Vec<(&EdgeKey, &Vec<u32>)> = ef.iter().filter(|(_, fs)| fs.len() >= 4 && fs.len() % 2 == 0).collect();
+    keys.sort_unstable_by_key(|x| *x.0);
+    for (&(a, b), fs) in keys {
+        let mut pairs = pair_around_edge(mesh, a, b, fs);
+        if 2 * pairs.len() != fs.len() {
+            // The turn order does not alternate (the faces cross at the
+            // edge). Pair the directions in face order: each pair still
+            // gives an edge with two opposite faces.
+            let plus: Vec<u32> = fs.iter().copied().filter(|&f| directed(&mesh.triangles[f as usize], a, b)).collect();
+            let minus: Vec<u32> = fs.iter().copied().filter(|&f| directed(&mesh.triangles[f as usize], b, a)).collect();
+            if plus.len() != minus.len() || 2 * plus.len() != fs.len() {
+                continue;
+            }
+            pairs = plus.into_iter().zip(minus).collect();
+        }
+        // A face can be split only one time in this pass.
+        if fs.iter().any(|&f| used[f as usize]) {
+            continue;
+        }
+        for &f in fs {
+            used[f as usize] = true;
+        }
+        todo.push((a, b, pairs));
+    }
+    let n = todo.len();
+    let mut add: Vec<[u32; 3]> = Vec::new();
+    for (a, b, pairs) in todo {
+        let mid = scale(add3(mesh.vertices[a as usize], mesh.vertices[b as usize]), 0.5);
+        for &(f, g) in pairs.iter().skip(1) {
+            let m = mesh.vertices.len() as u32;
+            mesh.vertices.push(mid);
+            for h in [f, g] {
+                let t = mesh.triangles[h as usize];
+                // Turn the face so that it starts with the edge.
+                let t = if directed(&t, a, b) { rotate_to(t, a) } else { rotate_to(t, b) };
+                let (u, v, c) = (t[0], t[1], t[2]);
+                mesh.triangles[h as usize] = [u, m, c];
+                add.push([m, v, c]);
+            }
+        }
+    }
+    mesh.triangles.extend(add);
+    n
+}
+
+/// Parts below this |volume| (normalized units cubed) are removed by
+/// remove_inverted_parts: the Windows limit of RemoveTinyShells.
+pub const TINY_PART_VOLUME: f64 = 0.001;
+
+#[inline]
+fn add3(a: Vec3, b: Vec3) -> Vec3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+/// Remove each part (faces joined by vertices, as the program counts parts)
+/// with a negative volume that is small: below `rel` times the volume of
+/// all parts. Such a part is a thin void left by the union. Returns the
+/// number of parts removed. A part with |volume| below TINY_PART_VOLUME
+/// goes too.
+pub fn remove_inverted_parts(mesh: &mut Mesh, rel: f64) -> usize {
+    if mesh.triangles.is_empty() {
+        return 0;
+    }
+    let nv = mesh.vertices.len();
+    let mut parent: Vec<u32> = (0..nv as u32).collect();
+    for t in &mesh.triangles {
+        for i in 1..3 {
+            let (ra, rb) = (find(&mut parent, t[0]), find(&mut parent, t[i]));
+            if ra != rb {
+                parent[ra.max(rb) as usize] = ra.min(rb);
+            }
+        }
+    }
+    let mut vol: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    let mut total = 0.0;
+    for f in 0..mesh.triangles.len() {
+        let [a, b, c] = mesh.tri_pos(f);
+        let v = det3(a, b, c) / 6.0;
+        *vol.entry(find(&mut parent, mesh.triangles[f][0])).or_default() += v;
+        total += v;
+    }
+    let limit = rel * total.abs();
+    // A part with almost no volume: its sign is noise (the program sums in
+    // absolute coordinates), so it goes too.
+    let bad: std::collections::HashSet<u32> =
+        vol.iter().filter(|(_, &v)| (v < 0.0 && -v < limit) || v.abs() < TINY_PART_VOLUME).map(|(&r, _)| r).collect();
+    if bad.is_empty() {
+        return 0;
+    }
+    let keep: Vec<bool> = (0..mesh.triangles.len()).map(|f| !bad.contains(&find(&mut parent, mesh.triangles[f][0]))).collect();
+    mesh.retain_faces(&keep);
+    bad.len()
+}
+
 /// Give each manifold sheet at a non-manifold edge or vertex its own
 /// vertex copies. Returns the number of new vertices.
 pub fn split_nonmanifold(mesh: &mut Mesh) -> usize {
@@ -877,7 +1760,17 @@ pub fn split_nonmanifold(mesh: &mut Mesh) -> usize {
     for (&(a, b), fs) in &ef {
         let pairs = match fs.len() {
             2 => vec![(fs[0], fs[1])],
-            n if n > 2 => pair_around_edge(mesh, a, b, fs),
+            n if n > 2 => {
+                // Split only when each face gets a partner. A face without
+                // a partner would get an open edge: then the edge stays as
+                // it is (all faces stay joined).
+                let p = pair_around_edge(mesh, a, b, fs);
+                if 2 * p.len() == n {
+                    p
+                } else {
+                    (1..n).map(|i| (fs[0], fs[i])).collect()
+                }
+            }
             _ => Vec::new(),
         };
         for (f, g) in pairs {

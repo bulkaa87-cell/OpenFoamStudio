@@ -22,6 +22,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use wgpu::util::DeviceExt;
 
+mod cpu;
+
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const ATLAS: u32 = 1024;
 const TRIAD_PX: u32 = 110;
@@ -118,6 +120,32 @@ struct Targets {
 }
 
 type Raw = (raw_window_handle::RawDisplayHandle, raw_window_handle::RawWindowHandle);
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> isize;
+}
+
+/// The HINSTANCE of a Win32 window (GWLP_HINSTANCE); a window made with
+/// hInstance = NULL has none — then the module of this process.
+#[cfg(windows)]
+fn win32_hinstance(hwnd: isize) -> Option<NonZeroIsize> {
+    const GWLP_HINSTANCE: i32 = -6;
+    NonZeroIsize::new(unsafe { GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) })
+        .or_else(|| NonZeroIsize::new(unsafe { GetModuleHandleW(std::ptr::null()) }))
+}
+
+#[cfg(not(windows))]
+fn win32_hinstance(_hwnd: isize) -> Option<NonZeroIsize> {
+    None
+}
 
 #[pyclass(unsendable)]
 pub struct Renderer {
@@ -435,10 +463,10 @@ impl Renderer {
                 }),
                 timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });
-            rp.set_bind_group(0, &self.globals_bind, &[]);
+            rp.set_bind_group(0, &self.globals_bind, &[0]);
             rp.set_bind_group(2, &self.atlas.bind, &[]);
             if let Some((_, b)) = &self.default_bind {
-                rp.set_bind_group(1, b, &[]);
+                rp.set_bind_group(1, b, &[0]);
             }
             rp.set_pipeline(&self.pipes.bg);
             rp.draw(0..3, 0..1);
@@ -453,7 +481,7 @@ impl Renderer {
             if triad.is_some() && self.targets.w > tpx + 6 && self.targets.h > tpx + 6 {
                 rp.set_viewport(6.0, (self.targets.h - tpx - 6) as f32,
                                 tpx as f32, tpx as f32, 0.0, 1.0);
-                rp.set_bind_group(0, &self.triad_bind, &[]);
+                rp.set_bind_group(0, &self.triad_bind, &[0]);
                 for l in &self.triad {
                     draw_layer(&mut rp, &self.pipes, l);
                 }
@@ -515,7 +543,7 @@ impl Renderer {
 }
 
 fn draw_layer<'a>(rp: &mut wgpu::RenderPass<'a>, p: &'a Pipelines, l: &'a Layer) {
-    rp.set_bind_group(1, &l.bind, &[]);
+    rp.set_bind_group(1, &l.bind, &[0]);
     match &l.geom {
         Geom::Tri { vbuf, ibuf, count } => {
             rp.set_pipeline(match l.pass {
@@ -545,16 +573,28 @@ impl Renderer {
     /// `hwnd` — a native window (Qt `winId()`), or None for off-screen.
     /// `kind` — what the handle is: "win32" (HWND) or "appkit" (NSView*).
     /// On Linux (X11 / Wayland) there is no window mode yet: pass None.
+    /// `backend` ("vulkan", "dx12", "metal", "gl") and `adapter` (a part of
+    /// the adapter name) select one adapter — the choice of
+    /// fs_view3d.select_level(). Without them: WGPU_BACKEND /
+    /// WGPU_ADAPTER_NAME, else the high-performance adapter of DX12 / Vulkan /
+    /// Metal.
     #[new]
-    #[pyo3(signature = (hwnd, width, height, font_path=None, samples=4, kind="win32"))]
+    #[pyo3(signature = (hwnd, width, height, font_path=None, samples=4, kind="win32",
+                        backend=None, adapter=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(hwnd: Option<isize>, width: u32, height: u32, font_path: Option<String>,
-           samples: u32, kind: &str) -> PyResult<Self> {
+           samples: u32, kind: &str, backend: Option<String>, adapter: Option<String>)
+           -> PyResult<Self> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         // NOT GL by default: wgpu's GL backend makes its own WGL context
         // current while it looks for adapters, and VTK (the results view in
         // the same window) then crashes with an access violation in its
         // OpenGL calls. DX12 / Vulkan / Metal; WGPU_BACKEND overrides (tests).
-        desc.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY);
+        let backends = backend.as_deref().map(wgpu::Backends::from_comma_list)
+            .filter(|b| !b.is_empty())
+            .or_else(wgpu::Backends::from_env)
+            .unwrap_or(wgpu::Backends::PRIMARY);
+        desc.backends = backends;
         let instance = wgpu::Instance::new(desc);
         let raw: Option<Raw> = match hwnd {
             Some(h) => {
@@ -568,10 +608,19 @@ impl Renderer {
                          raw_window_handle::RawWindowHandle::AppKit(
                              raw_window_handle::AppKitWindowHandle::new(view)))
                     }
-                    "win32" => (raw_window_handle::RawDisplayHandle::Windows(
-                                    raw_window_handle::WindowsDisplayHandle::new()),
-                                raw_window_handle::RawWindowHandle::Win32(
-                                    raw_window_handle::Win32WindowHandle::new(nz))),
+                    "win32" => {
+                        // Vulkan on Win32 needs the HINSTANCE of the window
+                        // (DX12 does not). Without it the surface failed with
+                        // "Vulkan requires ... hinstance", the widget fell back
+                        // to the off-screen path and the view was stretched
+                        // and jagged (2026-11-09, after the adapter choice
+                        // started to pass backend="vulkan").
+                        let mut wh = raw_window_handle::Win32WindowHandle::new(nz);
+                        wh.hinstance = win32_hinstance(nz.get());
+                        (raw_window_handle::RawDisplayHandle::Windows(
+                             raw_window_handle::WindowsDisplayHandle::new()),
+                         raw_window_handle::RawWindowHandle::Win32(wh))
+                    }
                     other => return Err(PyValueError::new_err(format!(
                         "window kind {other}: only win32 / appkit (use off-screen)"))),
                 })
@@ -587,12 +636,26 @@ impl Renderer {
             }
             None => None,
         };
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: surface.as_ref(),
-            ..Default::default()
-        })).map_err(|e| PyRuntimeError::new_err(format!("no GPU adapter: {e}")))?;
+        // WGPU_ADAPTER_NAME (a part of the adapter name, any case) selects
+        // one adapter, as WGPU_BACKEND selects the backend (gpucheck: Intel,
+        // WARP). Not wgpu::util::initialize_adapter_from_env: it panics when
+        // no name matches, and a panic is a PanicException in Python.
+        let wanted = adapter.or_else(|| std::env::var("WGPU_ADAPTER_NAME").ok())
+            .map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+        let adapter = match wanted {
+            Some(name) => pollster::block_on(instance.enumerate_adapters(backends))
+                .into_iter()
+                .filter(|a| a.get_info().name.to_lowercase().contains(&name))
+                .find(|a| surface.as_ref().map_or(true, |s| a.is_surface_supported(s)))
+                .ok_or_else(|| PyRuntimeError::new_err(format!(
+                    "no GPU adapter: WGPU_ADAPTER_NAME={name:?} matches no adapter")))?,
+            None => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: surface.as_ref(),
+                ..Default::default()
+            })).map_err(|e| PyRuntimeError::new_err(format!("no GPU adapter: {e}")))?,
+        };
         let ai = adapter.get_info();
         let info = format!("{} ({:?})", ai.name, ai.backend);
         let kind_s = format!("{:?}", ai.device_type);
@@ -644,10 +707,16 @@ impl Renderer {
             label: Some("foamview"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
         });
+        // Dynamic offset (always 0), on purpose: DX12 then binds each uniform
+        // buffer as a root CBV, not through a descriptor table. On WARP
+        // (Microsoft Basic Render Driver) every table of one layout read the
+        // buffer of the LAST bind group made with that layout: globals read
+        // the empty triad buffer and the frame was black (measured 2026-11-09).
+        // Limit: 2 of the 8 dynamic uniform buffers that wgpu guarantees.
         let uniform_entry = |vis| wgpu::BindGroupLayoutEntry {
             binding: 0, visibility: vis,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
-                                            has_dynamic_offset: false, min_binding_size: None },
+                                            has_dynamic_offset: true, min_binding_size: None },
             count: None,
         };
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -997,9 +1066,37 @@ impl Renderer {
     }
 }
 
+/// The adapters that wgpu sees: a list of dicts (name, backend, device_type,
+/// driver, driver_info, vendor, device). `backends`: "vulkan,dx12", ...;
+/// default DX12 / Vulkan / Metal. GL only when asked for: its adapter search
+/// makes a WGL context current, and VTK in the same process then crashes.
+#[pyfunction]
+#[pyo3(signature = (backends=None))]
+fn adapters(backends: Option<&str>) -> Vec<HashMap<String, String>> {
+    let b = backends.map(wgpu::Backends::from_comma_list)
+        .unwrap_or(wgpu::Backends::PRIMARY);
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = b;
+    let instance = wgpu::Instance::new(desc);
+    pollster::block_on(instance.enumerate_adapters(b)).into_iter().map(|a| {
+        let i = a.get_info();
+        HashMap::from([
+            ("name".to_string(), i.name.clone()),
+            ("backend".to_string(), format!("{:?}", i.backend).to_lowercase()),
+            ("device_type".to_string(), format!("{:?}", i.device_type)),
+            ("driver".to_string(), i.driver.clone()),
+            ("driver_info".to_string(), i.driver_info.clone()),
+            ("vendor".to_string(), format!("{:#06x}", i.vendor)),
+            ("device".to_string(), format!("{:#06x}", i.device)),
+        ])
+    }).collect()
+}
+
 #[pymodule]
 fn foamview(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Renderer>()?;
+    m.add_class::<cpu::CpuRenderer>()?;
+    m.add_function(wrap_pyfunction!(adapters, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

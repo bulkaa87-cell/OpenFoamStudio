@@ -711,13 +711,17 @@ class DistMachine:
     user: str = ""
     key: str = ""
     on: bool = True
+    # Памʼять машини, ГБ: з `foamdist probe` («Перевірити машини», «Знайти
+    # машини»). 0 — ще не питали; перевірка памʼяті тоді каже «невідома».
+    ram_gb: float = 0.0
 
     def label(self) -> str:
         return self.name or self.addr
 
     def to_dict(self) -> dict:
         return {"name": self.name, "addr": self.addr, "procs": self.procs,
-                "user": self.user, "key": self.key, "on": self.on}
+                "user": self.user, "key": self.key, "on": self.on,
+                "ram_gb": self.ram_gb}
 
     @staticmethod
     def from_dict(d: dict) -> "DistMachine":
@@ -725,11 +729,31 @@ class DistMachine:
             procs = max(1, int(d.get("procs", 4)))
         except (TypeError, ValueError):
             procs = 4
+        try:
+            ram = max(0.0, float(d.get("ram_gb", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            ram = 0.0
         return DistMachine(addr=str(d.get("addr", "")).strip(), procs=procs,
                            name=str(d.get("name", "")).strip(),
                            user=str(d.get("user", "")).strip(),
                            key=str(d.get("key", "")).strip(),
-                           on=bool(d.get("on", True)))
+                           on=bool(d.get("on", True)), ram_gb=ram)
+
+
+def probe_ram_gb(g: dict) -> float:
+    """Памʼять машини з відповіді `foamdist probe`, ГБ; 0 — невідома.
+
+    `mem_total_gb` (MemTotal) — у нових foamdist; старі дають лише
+    `mem_gb` (MemAvailable у мить перевірки) — беремо її: вона менша,
+    тобто обережніша."""
+    for k in ("mem_total_gb", "mem_gb"):
+        try:
+            v = float((g or {}).get(k) or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            return v
+    return 0.0
 
 
 _ADDR_RE = re.compile(r"[\w.\-]+")
@@ -969,7 +993,8 @@ def scan_to_machines(found: list[dict], existing: "list[DistMachine]") -> list:
         threads = int(float(g.get("threads", 0) or 0))
         m = DistMachine(addr=g["addr"], name=g.get("name", ""),
                         user=g.get("user", ""),
-                        procs=cores or max(1, threads // 2) or 4)
+                        procs=cores or max(1, threads // 2) or 4,
+                        ram_gb=probe_ram_gb(g) if g.get("ok") else 0.0)
         if not g.get("ok"):
             err = " ".join(str(g.get("error", "")).split())
             if "Permission denied" in err:
@@ -2877,13 +2902,44 @@ def _parse_resources(out: str) -> "tuple[int, int, float]":
 
 
 def wsl_resources(backend: Backend) -> tuple[int, int, float]:
-    """(фізичних ядер, потоків, ГБ памʼяті) всередині WSL."""
+    """(фізичних ядер, потоків, ГБ памʼяті) всередині WSL.
+
+    Не відповів — памʼять 0.0, тобто «невідома». Раніше тут стояло 8.0, і
+    перевірка памʼяті впевнено казала «не влізе в 8 ГБ» про число, якого
+    ніхто не міряв."""
     rc, out = _run(wsl_argv(backend.distro, _RES_PROBE), timeout=60)
     try:
         return _parse_resources(out)
     except (ValueError, IndexError):
         n = os.cpu_count() or 4
-        return (max(1, n // 2), n, 8.0)
+        return (max(1, n // 2), n, 0.0)
+
+
+def local_ram_gb() -> float:
+    """Уся памʼять цього компʼютера, ГБ (для Docker, BlueCFD, native).
+    0.0 — не вдалося дізнатися."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MemStatus()
+            ms.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return ms.ullTotalPhys / 2 ** 30
+            return 0.0
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2 ** 30
+    except (OSError, ValueError, AttributeError):
+        return 0.0
 
 
 def ssh_resources(backend: Backend) -> tuple[int, int, float]:

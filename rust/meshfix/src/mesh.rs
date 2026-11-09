@@ -92,6 +92,19 @@ impl Mesh {
         Self { vertices, triangles }
     }
 
+    /// Write the mesh as an OBJ file (for diagnosis).
+    pub fn write_obj(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for p in &self.vertices {
+            writeln!(w, "v {:.17e} {:.17e} {:.17e}", p[0], p[1], p[2])?;
+        }
+        for t in &self.triangles {
+            writeln!(w, "f {} {} {}", t[0] + 1, t[1] + 1, t[2] + 1)?;
+        }
+        Ok(())
+    }
+
     pub fn bbox(&self) -> Option<(Vec3, Vec3)> {
         let first = *self.vertices.first()?;
         let (mut lo, mut hi) = (first, first);
@@ -190,6 +203,78 @@ impl Mesh {
             let r = *seen.entry([fbits(p[0]), fbits(p[1]), fbits(p[2])]).or_insert(i as u32);
             merged += (r != i as u32) as usize;
             remap.push(r);
+        }
+        if merged > 0 {
+            self.apply_remap(&remap);
+        }
+        merged
+    }
+
+    /// True for each vertex on an edge with one face (a hole rim). An
+    /// unwelded triangle soup has all vertices on a rim.
+    pub fn rim_vertices(&self) -> Vec<bool> {
+        let mut rim = vec![false; self.vertices.len()];
+        for (&(a, b), fs) in &self.edge_faces() {
+            if fs.len() == 1 {
+                rim[a as usize] = true;
+                rim[b as usize] = true;
+            }
+        }
+        rim
+    }
+
+    /// Open edges plus non-manifold edges, by sorting (fast).
+    pub fn defect_edges(&self) -> usize {
+        let mut keys: Vec<u64> = Vec::with_capacity(self.triangles.len() * 3);
+        for t in &self.triangles {
+            for i in 0..3 {
+                let (a, b) = ekey(t[i], t[(i + 1) % 3]);
+                keys.push(((a as u64) << 32) | b as u64);
+            }
+        }
+        keys.sort_unstable();
+        let mut n = 0;
+        let mut i = 0;
+        while i < keys.len() {
+            let mut j = i + 1;
+            while j < keys.len() && keys[j] == keys[i] {
+                j += 1;
+            }
+            if j - i != 2 {
+                n += 1;
+            }
+            i = j;
+        }
+        n
+    }
+
+    /// Merge each rim vertex into the first earlier rim vertex within
+    /// `tol`. Inner vertices stay: two bodies that touch at a vertex must
+    /// not become one non-manifold vertex.
+    pub fn weld_rim(&mut self, tol: f64) -> usize {
+        let rim = self.rim_vertices();
+        let tol2 = tol * tol;
+        let mut grid = Grid::new(tol.max(1e-12));
+        let mut remap = Vec::with_capacity(self.vertices.len());
+        let mut near = Vec::new();
+        let mut merged = 0;
+        for (i, &p) in self.vertices.iter().enumerate() {
+            if !rim[i] {
+                remap.push(i as u32);
+                continue;
+            }
+            near.clear();
+            grid.near(p, &mut near);
+            match near.iter().copied().find(|&j| dist2(p, self.vertices[j as usize]) <= tol2) {
+                Some(j) => {
+                    remap.push(j);
+                    merged += 1;
+                }
+                None => {
+                    grid.insert(i as u32, p);
+                    remap.push(i as u32);
+                }
+            }
         }
         if merged > 0 {
             self.apply_remap(&remap);

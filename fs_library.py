@@ -49,6 +49,7 @@ ENUMS: dict[str, tuple[str, ...]] = {
     # винен зіпсований маніфест.
     "regime": tuple(fc.REGIMES),
     "farfield_mode": ("freestream", "tunnel"),
+    "wall_treatment": ("spalding", "wallfn", "lowre"),
     "decompose_method": ("scotch", "hierarchical", "simple"),
     "write_format": ("binary", "ascii"),
 }
@@ -1395,6 +1396,22 @@ def project_mesh_key(path: str | os.PathLike) -> str:
             return key
     except (OSError, KeyError, ValueError, zipfile.BadZipFile):
         return ""
+
+
+def project_mesh_source(path: str | os.PathLike):
+    """(cfg, ключ сітки) проєкту з вбудованою сіткою, або None.
+
+    Лише маніфест, без STL: так перевіряють, чи підійде сітка проєкту до
+    теперішніх налаштувань, і роблять це часто."""
+    key = project_mesh_key(path)
+    if not key:
+        return None
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            m = json.loads(z.read(PROJECT_MANIFEST).decode("utf-8"))
+        return cfg_from_dict(m.get("cfg")), key
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return None
 
 
 def extract_project_mesh(path: str | os.PathLike, store: str | os.PathLike) -> str:

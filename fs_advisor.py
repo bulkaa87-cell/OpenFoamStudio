@@ -20,7 +20,9 @@ import math
 from dataclasses import dataclass, field
 
 import fs_case as fc
+import fs_memfit as memfit
 import fs_physics as phys
+import fs_yplus as fy
 
 # Скільки комірок на довжину тіла хочемо на поверхні. 150 — робочий компроміс
 # між «видно форму» і «влазить у памʼять» для зовнішньої аеродинаміки.
@@ -40,7 +42,8 @@ TARGET_YPLUS = 60.0
 # сам Windows, це вікно з VTK і PyVista, і віртуальна машина WSL уміє роздути
 # свій обсяг під тиском. Прогін, у якому сітка передбачала 0.6 ГБ, система
 # зняла саме через брак памʼяті на боці Windows, а не всередині WSL.
-RAM_HEADROOM = 0.6
+# Тепер це fs_memfit.RAM_HEADROOM_SHARED; ім'я лишаємо для старих викликів.
+RAM_HEADROOM = memfit.RAM_HEADROOM_SHARED
 
 
 @dataclass
@@ -69,6 +72,12 @@ class Plan:
         return [t for t in self.tips if t.changed]
 
 
+def auto_layer_cap(diag) -> int:
+    """Layer limit for the auto y+ pick: the same cap as below on messy
+    geometry (layers grow in patches there), else the spin maximum."""
+    return 5 if _is_assembly(diag) else fy.LAYER_CAP
+
+
 def _is_assembly(diag) -> bool:
     """Чи це збірка з окремих деталей, а не одне чисте тіло.
 
@@ -92,9 +101,24 @@ def _fmt(v) -> str:
 
 
 def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
-           cores: int = 6, target_yplus: float = TARGET_YPLUS) -> Plan:
-    """Повертає план: копію конфігу з порадами і список пояснень."""
+           cores: int = 6, target_yplus: "float | None" = TARGET_YPLUS,
+           mem=None, layer_fit=None) -> Plan:
+    """Повертає план: копію конфігу з порадами і список пояснень.
+
+    `mem` — функція cfg -> fs_memfit.MemFit, та сама, що в рядку стану й у
+    перевірці перед запуском (машини, збережена сітка, розподіл). Без неї —
+    одна машина з `ram_gb` і запасом для WSL.
+
+    `target_yplus` None means «Авто»: the y+ and the layers come from
+    fs_yplus.auto_pick for the turbulence model, the same as the «Сітка»
+    panel does, so that the auto pick after «Застосувати все» gives the same
+    numbers. `layer_fit` is the memory check for that pick (cfg -> reason).
+    """
     import copy
+
+    if mem is None:
+        host = memfit.MemHost("цей компʼютер", ram_gb, RAM_HEADROOM)
+        mem = lambda c: memfit.memory_fit(c.estimate(), host)   # noqa: E731
 
     new = copy.deepcopy(cfg)
     tips: list[Tip] = []
@@ -187,17 +211,21 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
     new.mesh.boxes = [new.default_box(factor=1.8, level=2, wake=4.0)]
 
     # ------------------------------------------------- памʼять і зниження
-    budget = ram_gb * RAM_HEADROOM
     for _ in range(4):
-        est = new.estimate()
-        if est.snappy_peak_gb <= budget or new.mesh.surface_level_max <= 3:
+        fit = mem(new)
+        if fit.verdict != "over" or new.mesh.surface_level_max <= 3:
             break
+        w = fit.worst
         new.mesh.surface_level_max -= 1
         new.mesh.surface_level_min = max(1, new.mesh.surface_level_max - 1)
         new.mesh.feature_level = new.mesh.surface_level_max
+        what = "snappyHexMesh" if w.stage == "snappy" else "розвʼязувач"
         notes.append(("warn", (
             f"Рівень рефайнменту знижено до {new.mesh.surface_level_max}: "
-            f"на попередньому сітка не влазила у {ram_gb:.0f} ГБ.")))
+            f"на попередньому {what} не влазив на {w.host.name} "
+            f"(~{w.need_gb:.1f} ГБ, під задачу "
+            f"{memfit.fmt_gb(w.host.budget_gb)} з "
+            f"{memfit.fmt_gb(w.host.ram_gb)} ГБ).")))
 
     _add(tips, "Сітка", "Рівень поверхні", cfg.mesh.surface_level_max,
          new.mesh.surface_level_max,
@@ -215,6 +243,12 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
           if dirty else "150° — стандарт для чистої геометрії"))
     new.mesh.included_angle = included
 
+    auto = target_yplus is None
+    if auto:
+        target_yplus, _ = fy.best_yplus(
+            cfg.flow.turbulence, fy.cfg_treatment(cfg), cfg.flow.u_inf,
+            cfg.flow.l_ref or L,
+            cfg.flow.nu)
     n_layers = phys.layers_for_target_yplus(
         target_yplus, cfg.flow.u_inf, cfg.flow.l_ref or L, cfg.flow.nu,
         new.surface_cell, new.mesh.expansion, new.mesh.final_layer_rel)
@@ -275,6 +309,25 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
         else:
             # Жоден варіант не влазить у пограншар — беремо мінімум шарів.
             new.mesh.n_layers = 3
+        if auto:
+            # The count and the expansion as «Авто» will pick them for the
+            # chosen finalLayerThickness.
+            pick = fy.auto_pick(new, fits=layer_fit,
+                                layer_cap=auto_layer_cap(diag))
+            if not pick.skipped:
+                new.mesh.n_layers, new.mesh.expansion = (pick.n_layers,
+                                                         pick.expansion)
+                new.mesh.target_yplus = target_yplus = pick.target
+                notes.append(("info", fy.auto_line(
+                    pick, cfg.flow.turbulence)))
+            if pick.problem:
+                notes.append(("bad" if pick.level == "error" else "warn",
+                              pick.problem))
+            if abs(new.mesh.expansion - cfg.mesh.expansion) > 1e-9:
+                _add(tips, "Сітка", "expansionRatio", cfg.mesh.expansion,
+                     new.mesh.expansion,
+                     "інакше перший шар не дотягнеться до потрібного y+ "
+                     "у межах кількості шарів")
 
         got_yplus = _predicted_yplus(new, target_yplus)
         if got_yplus > target_yplus * 4:
@@ -350,7 +403,7 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
     new.solver.robust_iterations = robust
 
     # ------------------------------------------------------------ нотатки
-    _flow_notes(new, diag, notes, target_yplus, ram_gb)
+    _flow_notes(new, diag, notes, target_yplus, mem(new))
     return Plan(cfg=new, tips=tips, notes=notes)
 
 
@@ -383,7 +436,7 @@ def _add(tips: list[Tip], where: str, what: str, current, suggested,
 
 
 def _flow_notes(cfg: fc.CaseCfg, diag, notes: list, target_yplus: float,
-                ram_gb: float) -> None:
+                fit: "memfit.MemFit") -> None:
     f = cfg.flow
     L = f.l_ref or cfg.body_length
     re = phys.reynolds(f.u_inf, L, f.nu)
@@ -392,8 +445,11 @@ def _flow_notes(cfg: fc.CaseCfg, diag, notes: list, target_yplus: float,
 
     notes.append(("info", (
         f"Re = {re:.3g}, M = {ma:.2f}, оцінка сітки "
-        f"{phys.fmt_cells(est.total)} комірок, пік памʼяті "
-        f"{est.snappy_peak_gb:.1f} ГБ з {ram_gb:.0f} доступних.")))
+        f"{phys.fmt_cells(est.total)} комірок. "
+        + "Памʼять: " + "; ".join(ln.strip() for ln
+                                   in fit.details().splitlines()[1:]) + ".")))
+    if fit.verdict == "unknown":
+        notes.append(("warn", fit.warning().lstrip("ℹ ")))
 
     if ma > 0.3 and not f.compressible:
         notes.append(("warn", (
@@ -419,14 +475,16 @@ def _flow_notes(cfg: fc.CaseCfg, diag, notes: list, target_yplus: float,
     yp_now = _predicted_yplus(cfg, target_yplus)
     resolved = yp_now <= 2.0
 
-    if f.turbulence == "kOmegaSSTLM" and not resolved:
-        notes.append(("warn", (
-            f"kOmegaSSTLM рахує перехід, але для цього пограншар має бути "
-            f"розвʼязаний до стінки: y+ близько 1. Зараз виходить y+ ≈ "
-            f"{yp_now:.0f} — на такій сітці працює пристінна функція, і "
-            f"модель переходу нічого не додає, лише коштує два зайві "
-            f"рівняння. Або доведіть y+ до 1, або поверніться на kOmegaSST.")))
-    elif phys.is_transitional(re) and f.turbulence != "kOmegaSSTLM":
+    # y+ against the model: the same rules as the «Сітка» panel and the
+    # check before a run (fs_yplus).
+    chk = fy.check_yplus(f.turbulence, fy.cfg_treatment(cfg), target_yplus,
+                         yp_now)
+    if not chk.ok:
+        fix = "; ".join(label for _, _, label in chk.fixes)
+        notes.append(("bad" if chk.level == "error" else "warn",
+                      chk.text + (f" Що зробити: {fix}." if fix else "")))
+    if (phys.is_transitional(re)
+            and fy.model_family(f.turbulence) != "transition"):
         common = (f"Re = {re:.2g} нижче 5·10⁵: пограншар частково ламінарний, "
                   f"а RAS вважає його турбулентним усюди й завищує опір тертя.")
         if resolved:
@@ -711,7 +769,7 @@ def apply_plan(target: fc.CaseCfg, plan: Plan) -> None:
         setattr(target.domain, name, getattr(src.domain, name))
     for name in ("surface_level_min", "surface_level_max", "feature_level",
                  "included_angle", "add_layers", "n_layers",
-                 "final_layer_rel", "boxes"):
+                 "final_layer_rel", "boxes", "expansion", "target_yplus"):
         setattr(target.mesh, name, getattr(src.mesh, name))
     for name in ("n_procs", "n_iterations", "write_interval",
                  "robust_iterations"):
