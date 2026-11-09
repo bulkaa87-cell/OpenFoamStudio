@@ -1370,6 +1370,10 @@ PROJECT_EXT = ".foamproj"
 PROJECT_MANIFEST = "project.json"
 PROJECT_PARTS = "parts"
 PROJECT_VERSION = 1
+# Сітка проєкту: зібрана, з рівнями згущення (як у сховищі сіток бекенда).
+# Лежить під mesh/polyMesh/…, а ключ (fs_backend.mesh_key) — у маніфесті:
+# без ключа не сказати, чи ця сітка ще пасує до геометрії й налаштувань.
+PROJECT_MESH = "mesh"
 
 
 def _safe_stem(name: str, fallback: str) -> str:
@@ -1379,18 +1383,86 @@ def _safe_stem(name: str, fallback: str) -> str:
     return stem or fallback
 
 
+def project_mesh_key(path: str | os.PathLike) -> str:
+    """Ключ сітки, що лежить у проєкті, або "" (сітки немає)."""
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            m = json.loads(z.read(PROJECT_MANIFEST).decode("utf-8"))
+            key = str((m.get("mesh") or {}).get("key") or "")
+            if key and f"{PROJECT_MESH}/polyMesh/faces" not in z.namelist() \
+                    and f"{PROJECT_MESH}/polyMesh/faces.gz" not in z.namelist():
+                return ""
+            return key
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return ""
+
+
+def extract_project_mesh(path: str | os.PathLike, store: str | os.PathLike) -> str:
+    """Сітку з проєкту — у `store/<ключ>/polyMesh`. Повертає ключ або "".
+
+    Уже розпакована (та сама тека є) — не чіпаємо: сітка під ключем одна.
+    """
+    key = project_mesh_key(path)
+    if not key or not re.fullmatch(r"[0-9a-f]{8,64}", key):
+        return ""
+    dst = Path(store) / key
+    if be._mesh_complete(dst):
+        return key
+    part = Path(store) / f".prj-{key}"
+    shutil.rmtree(part, ignore_errors=True)
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            for info in z.infolist():
+                name = info.filename
+                if not name.startswith(PROJECT_MESH + "/polyMesh/") or info.is_dir():
+                    continue
+                rel = Path(name).relative_to(PROJECT_MESH)
+                if ".." in rel.parts:
+                    continue
+                out = part / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(info) as src, open(out, "wb") as fh:
+                    shutil.copyfileobj(src, fh, 1 << 20)
+        if not be._mesh_complete(part):
+            return ""
+        shutil.rmtree(dst, ignore_errors=True)
+        os.replace(part, dst)
+        return key
+    except (OSError, zipfile.BadZipFile):
+        return ""
+    finally:
+        shutil.rmtree(part, ignore_errors=True)
+
+
 def write_project(path: str | os.PathLike, cfg: fc.CaseCfg, parts,
-                  extra: dict | None = None) -> str:
+                  extra: dict | None = None, mesh_key: str = "",
+                  mesh_dir: str | os.PathLike | None = None) -> str:
     """Записати проєкт. `parts` — список словників із ключем `stl` (bytes).
 
     Решта ключів словника йде в маніфест як є: імʼя, роль, оберти, вісь,
     завіса, галочка. Що саме там лежить, вирішує той, хто викликає —
     бібліотека не має знати про будову `Part` у вікні.
+
+    Сітка: `mesh_dir` (тека з polyMesh/) кладеться у проєкт під ключем
+    `mesh_key`. Немає теки, але старий файл на тому самому місці вже має
+    сітку З ТИМ САМИМ ключем — її переносимо: інакше автозбереження перед
+    прогоном (коли нової сітки ще немає) мовчки викидало б сітку з проєкту.
+    Ключ інший — стара сітка вже не пасує, і її не переносимо.
     """
     target = Path(path)
     if target.suffix.lower() != PROJECT_EXT:
         target = target.with_suffix(PROJECT_EXT)
     target.parent.mkdir(parents=True, exist_ok=True)
+    mesh_src = Path(mesh_dir) / "polyMesh" if mesh_dir else None
+    if mesh_src is not None and not mesh_src.is_dir():
+        mesh_src = None
+    # Ключ невідомий (кейс ще не створено) — переносимо як є: сітка з
+    # чужим ключем у проєкті нешкідлива, бо перед прогоном її беруть лише
+    # тоді, коли ключ збігся.
+    old_key = project_mesh_key(target) if (mesh_src is None and target.is_file()) else ""
+    carry = bool(old_key) and (not mesh_key or old_key == mesh_key)
+    if carry:
+        mesh_key = old_key
 
     meta = []
     blobs = []
@@ -1411,6 +1483,8 @@ def write_project(path: str | os.PathLike, cfg: fc.CaseCfg, parts,
         "parts": meta,
         "extra": dict(extra or {}),
     }
+    if mesh_key and (mesh_src is not None or carry):
+        manifest["mesh"] = {"key": mesh_key}
     # Пишемо ЧЕРЕЗ ТИМЧАСОВИЙ ФАЙЛ і лише тоді підміняємо. Проєкт
     # зберігають поверх старого, і обрив на середині запису коштував би
     # і нового файлу, і старого.
@@ -1422,6 +1496,19 @@ def write_project(path: str | os.PathLike, cfg: fc.CaseCfg, parts,
             # STL уже стиснений погано, але геть без стиснення архів
             # виходить утричі більший — лишаємо DEFLATE.
             z.writestr(fname, data)
+        if mesh_src is not None:
+            for f in sorted(mesh_src.rglob("*")):
+                if f.is_file():
+                    z.write(f, f"{PROJECT_MESH}/polyMesh/"
+                               + f.relative_to(mesh_src).as_posix())
+        elif carry:
+            # Потоком, а не в памʼять: сітка — сотні мегабайт.
+            with zipfile.ZipFile(target, "r") as old:
+                for info in old.infolist():
+                    if info.filename.startswith(PROJECT_MESH + "/"):
+                        with old.open(info) as src, \
+                                z.open(info.filename, "w", force_zip64=True) as dst:
+                            shutil.copyfileobj(src, dst, 1 << 20)
     os.replace(tmp, target)
     return str(target)
 

@@ -38,6 +38,7 @@ import fs_backend as be
 import fs_case as fc
 import fs_geometry as geo
 import fs_library as lib
+import fs_meshfix as meshfix
 import fs_panels as panels
 import fs_physics as phys
 import fs_post as post
@@ -115,6 +116,23 @@ _LAYER_STYLE = {
     "degen": dict(color=COL_DEGEN, point_size=13,
                   render_points_as_spheres=True),
 }
+
+
+def _mesh_key(mesh):
+    """Відбиток сітки: та сама геометрія — той самий ключ (кеш перевірки).
+
+    За вмістом, а не за `id`: ремонт і масштаб міняють сітку на місці, і
+    ключ за обʼєктом віддав би стару відповідь. 250 тис. трикутників — ~10 мс.
+    """
+    import hashlib
+    if mesh is None:
+        return None
+    h = hashlib.blake2b(digest_size=16)
+    h.update(np.ascontiguousarray(mesh.points).tobytes())
+    faces = getattr(mesh, "faces", None)
+    if faces is not None:
+        h.update(np.ascontiguousarray(faces).tobytes())
+    return (int(mesh.n_points), int(mesh.n_cells), h.hexdigest())
 
 
 @dataclass
@@ -521,7 +539,7 @@ class Viewport(QtWidgets.QWidget):
         super().__init__(parent)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        self.plotter = QtInteractor(self)
+        self.plotter = self._make_plotter()
         lay.addWidget(self.plotter.interactor)
         self.plotter.set_background("#22262b", top="#3a4149")
         self.plotter.add_axes(line_width=2)
@@ -590,6 +608,30 @@ class Viewport(QtWidgets.QWidget):
         self.btn_fit_all.clicked.connect(self.fit_all)
         bar.addWidget(self.btn_fit_all)
         lay.addWidget(bar_box)
+
+    def _make_plotter(self):
+        """Хто малює вкладку «3D»: foamview (Rust, GPU) або, запасним, VTK.
+
+        Решта класу однакова для обох: новий рушій (fs_view3d.Plotter)
+        розуміє ті самі виклики pyvista, що й QtInteractor. VTK — якщо
+        foamview не зібрано, GPU не відповів або FS_3D=vtk.
+        """
+        self.backend = "vtk"
+        self.backend_note = ""
+        if os.environ.get("FS_3D", "").lower() != "vtk":
+            try:
+                import fs_view3d
+                # Пробний кадр, а не лише «модуль є»: адаптера чи пристрою
+                # може не бути, а WARP віддає чорний кадр без помилки.
+                ok, note = fs_view3d.probe()
+                self.backend_note = note
+                if ok:
+                    pl = fs_view3d.Plotter(self)
+                    self.backend = "foamview"
+                    return pl
+            except Exception as exc:                      # noqa: BLE001
+                self.backend_note = str(exc)
+        return QtInteractor(self)
 
     # --- керування акторами ---------------------------------------------
 
@@ -1173,6 +1215,10 @@ class RunWorker(QtCore.QObject):
         # Тека сесії на сервері, до якої ПІДКЛЮЧАЄМОСЬ замість того, щоб
         # пускати нову. Порожньо — звичайний запуск.
         self.attach_to = attach_to
+        # Ключ сітки прогону: після нього сітку з тієї машини забираємо на
+        # цей компʼютер, щоб вона пішла у файл проєкту.
+        self.mesh_key = (be.mesh_key(case_dir) if case_dir
+                         and be.mesh_cache_supported(backend) else "")
         self.runner: be.Runner | None = None
         # Звідки читати postProcessing під час прогону. Коли кейс у рідній ФС
         # WSL, Windows бачить його через \\wsl.localhost.
@@ -1222,7 +1268,26 @@ class RunWorker(QtCore.QObject):
                                      self.case_dir)
             except Exception as exc:
                 self.line.emit(f"не вдалося скопіювати назад: {exc}")
+        self._fetch_mesh()
         self.done.emit(ok, msg)
+
+    def _fetch_mesh(self) -> None:
+        """Сітку прогону — у сховище на цьому компʼютері (а звідти в проєкт).
+
+        Лише коли її тут ще немає, а там є: це сотні мегабайт.
+        """
+        key = self.mesh_key
+        if not key or be.local_mesh_dir(key) is not None:
+            return
+        try:
+            if not be.remote_mesh_exists(self.backend, key):
+                return
+            self.line.emit(f"Забираю сітку {key} на цей компʼютер (для "
+                           "файлу проєкту)…")
+            err = be.fetch_mesh(self.backend, key)
+            self.line.emit(err or f"Сітку {key} забрано.")
+        except Exception as exc:                          # noqa: BLE001
+            self.line.emit(f"сітку не забрано: {exc}")
 
     def stop(self):
         if self.runner:
@@ -1353,6 +1418,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scene: fv.SliceScene | None = None
         self._streams: fv.StreamScene | None = None
         self._streams_ctx: dict = {}
+        # Звідки ростуть лінії. Як і позиція зрізу, живе тут, а не в сцені:
+        # куди потягли відрізок чи кулю, має пережити зміну часу й поля.
+        self._seeding = fv.Seeding()
+        self._seed_widget: fv.SeedWidget | None = None
+        # Лінії рахуються секунди, а число в полі міняють стрілками по
+        # одиниці: перераховуємо, коли людина на мить зупинилася.
+        self._stream_timer = QtCore.QTimer(self)
+        self._stream_timer.setSingleShot(True)
+        self._stream_timer.setInterval(450)
+        self._stream_timer.timeout.connect(self._retrace_streams)
         self._slice_case = ""              # для якого кейса памʼятаємо вибір
         self._view_box = None              # де тіло — для косого вигляду
         self._model_box = None             # що вписує «До моделі» в результатах
@@ -1767,6 +1842,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ed.editingFinished.connect(
                 lambda k=key, e=ed: self._store().setValue(k, e.text().strip()))
         pr.btn_dist_probe.clicked.connect(self.probe_dist)
+        pr.btn_dist_scan.clicked.connect(self.scan_dist)
         self.panel_run.install_requested.connect(self.install_openfoam)
         self.panel_run.create_requested.connect(lambda: self.create_case(True))
         self.panel_run.run_requested.connect(self.start_run)
@@ -1797,6 +1873,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sb = self.slice_bar
         sb.toggled.connect(lambda on: self._view_toggled(on, sb.streams_on()))
         sb.streams_toggled.connect(lambda on: self._view_toggled(on, sb.is_on()))
+        self._restore_seeding()
+        sb.seeding_changed.connect(self._seeding_changed)
+        sb.seed_reset.connect(self._seed_reset)
         sb.moved.connect(self._slice_moved)
         sb.axis_changed.connect(self._slice_axis)
         sb.field_changed.connect(self._slice_field)
@@ -1958,8 +2037,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "case_dir": self.case_dir or "",
             "cases_dir": self.panel_run.ed_dir.text().strip(),
         }
+        # СІТКА — У ПРОЄКТ, якщо вона є на цьому компʼютері для ТЕПЕРІШНЬОЇ
+        # геометрії й налаштувань. Немає — write_project перенесе ту, що
+        # вже лежала в старому файлі з тим самим ключем.
+        mkey = (be.mesh_key(self.case_dir)
+                if self.case_dir and os.path.isdir(self.case_dir) else "")
+        mdir = be.local_mesh_dir(mkey)
         try:
-            out = lib.write_project(path, self.cfg, rows, extra)
+            out = lib.write_project(path, self.cfg, rows, extra,
+                                    mesh_key=mkey, mesh_dir=mdir)
         except OSError as exc:
             if ask:
                 QtWidgets.QMessageBox.critical(
@@ -1970,8 +2056,10 @@ class MainWindow(QtWidgets.QMainWindow):
         size = os.path.getsize(out) / 1e6
         self._project_path = out
         self._project_mark = self._project_signature()
+        has = lib.project_mesh_key(out)
         self.log.push(f"Проєкт збережено: {out} ({size:.1f} МБ, "
-                      f"{len(rows)} деталей)")
+                      f"{len(rows)} деталей"
+                      + (f", із сіткою {has}" if has else ", без сітки") + ")")
         self.statusBar().showMessage(
             f"Проєкт збережено: {Path(out).name}", 8000)
         return out
@@ -2018,6 +2106,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Файл {Path(path).name} не вдалося прочитати як проєкт "
                 f"OpenFOAM Studio.")
             return
+        # Сітка з проєкту — у сховище на цьому компʼютері; на сервер вона
+        # піде перед прогоном, якщо там її немає.
+        if lib.project_mesh_key(path):
+            try:
+                key = self._off_thread(
+                    "Розпаковую сітку з проєкту…",
+                    lambda: lib.extract_project_mesh(path, be.LOCAL_MESH_STORE))
+                if key:
+                    self.log.push(f"У проєкті є сітка {key}: будувати її не "
+                                  "доведеться, якщо геометрія й налаштування "
+                                  "сітки ті самі.")
+            except Exception as exc:                      # noqa: BLE001
+                self.log.push(f"Сітку з проєкту не розпаковано: {exc}")
         self._open_project_data(data, path)
 
     def _open_project_data(self, data: dict, path: str,
@@ -2498,7 +2599,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # Саму діагностику передаємо далі тільки тоді, коли масштаб той
         # самий і модель у сцені одна: інакше в ній чужі габарити й площі.
         same_scale = abs(target - auto) < 1e-12
-        self.apply_units(precomputed=diag if same_scale and not add else None)
+        if self._restore_queue or self._batch_queue:
+            # ЩЕ НЕ ОСТАННЯ ДЕТАЛЬ: сцену не перебудовуємо. Раніше кожна
+            # деталь проєкту перевіряла всю сцену заново — на моделі з 250
+            # тис. трикутників це 4 перевірки по ~1.3 с замість однієї, і
+            # вікна «Читаю…» висіли одне над одним (2026-11-09). Перевіримо
+            # раз, коли прийде остання.
+            self._scale_parts()
+        else:
+            self.apply_units(precomputed=diag if same_scale and not add else None)
         if self._restore_queue:
             # Частина вже в сцені — беремо наступну. Потік до цього моменту
             # вже закритий у _end_load, тож load_stl приймає новий виклик
@@ -3026,6 +3135,11 @@ class MainWindow(QtWidgets.QMainWindow):
         антена в міліметрах поруч із фюзеляжем у метрах від одного множника
         стане або нитяною, або завбільшки з крило. Кожна модель памʼятає свій.
         """
+        changed = self._scale_parts()
+        self.rebuild_geometry(None if changed else precomputed)
+
+    def _scale_parts(self) -> bool:
+        """Множник одиниць кожній деталі — без перебудови сцени."""
         changed = False
         for part in self.parts:
             if not part.loaded or part.factor <= 0 or part.pinned:
@@ -3035,7 +3149,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 part.mesh = geo.apply_scale(part.mesh, target / part.factor)
                 part.factor = target
                 changed = True
-        self.rebuild_geometry(None if changed else precomputed)
+        return changed
 
     def _off_thread(self, text: str, job, size: int = 0):
         """Довга робота поза потоком вікна — але з результатом тут і зараз.
@@ -3105,11 +3219,26 @@ class MainWindow(QtWidgets.QMainWindow):
         #
         # `job` не чіпає ні `self`, ні віджетів — лише сітку, яку дістав
         # аргументом: він може піти в інший потік (див. _off_thread).
+        shown = getattr(self, "_show_mesh", None) or mesh
+        # КЕШ: та сама геометрія — та сама відповідь. Перебудову сцени
+        # кличуть звідусіль (ролі, одиниці, відкриття проєкту), і без кешу
+        # одна сцена перевірялася по кілька разів поспіль.
+        key = (_mesh_key(probe), _mesh_key(shown)) if precomputed is None else None
+        hit = getattr(self, "_diag_cache", None)
+
         def job():
-            d = precomputed if precomputed is not None else geo.diagnose(probe)
+            if key is not None and hit is not None and hit[0] == key:
+                d, disp, lay = hit[1]
+                if not fresh:
+                    return d, None, None
+                if disp is not None:
+                    return d, disp, lay
+            elif precomputed is not None:
+                d = precomputed
+            else:
+                d = geo.diagnose(probe)
             if not fresh:
                 return d, None, None
-            shown = getattr(self, "_show_mesh", None) or mesh
             return d, geo.display_mesh(shown), self._problem_layers(probe, d)
 
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
@@ -3117,6 +3246,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.diag, display, layers = self._off_thread(
                 "Перевіряю геометрію й готую її до показу…", job,
                 mesh.n_cells)
+            if key is not None:
+                self._diag_cache = (key, (self.diag, display if fresh else None,
+                                          layers if fresh else None))
             if fresh:
                 self.mesh_display = display
                 self._show_problem_layers(layers)
@@ -3355,6 +3487,24 @@ class MainWindow(QtWidgets.QMainWindow):
                     head = (f"модель {i} з {len(meshes)}: "
                             if len(meshes) > 1 else "")
                     out.append(winfix.repair(
+                        mesh, lambda text, h=head: say(h + text)))
+                return out
+            return job, "parts"
+
+        if key == "meshfix":
+            # The button is disabled without the Rust module, but a session
+            # from another computer can still come here.
+            if not meshfix.available():
+                QtWidgets.QMessageBox.information(
+                    self, "meshfix", meshfix.why_not())
+                return None, ""
+
+            def job(meshes, say):
+                out = []
+                for i, mesh in enumerate(meshes, 1):
+                    head = (f"модель {i} з {len(meshes)}: "
+                            if len(meshes) > 1 else "")
+                    out.append(meshfix.repair(
                         mesh, lambda text, h=head: say(h + text)))
                 return out
             return job, "parts"
@@ -3765,6 +3915,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if key == "winfix" and before.open_edges and after.open_edges == 0:
             msg += (".  Дірок більше немає, і модель при цьому не прорідило — "
                     "на відміну від обгортання")
+        if key == "meshfix" and meshfix.last_report:
+            msg += ".  meshfix: " + meshfix.summary(meshfix.last_report)
         if key == "fill" and after.open_edges > 0:
             msg += (".  Решта «дірок» — це лінії врізання перетинних оболонок, "
                     "а не замкнені контури; vtkFillHolesFilter їх не бере")
@@ -5849,6 +6001,52 @@ class MainWindow(QtWidgets.QMainWindow):
             return [], ""
         return be.check_machines(pr.machines())
 
+    def scan_dist(self) -> None:
+        """«Знайти машини»: сервер обходить свою мережу й ~/.ssh/config."""
+        pr = self.panel_run
+        backend = self._ssh_backend_or_complain()
+        if backend is None:
+            return
+        key, user = pr.ed_dist_key.text().strip(), pr.ed_dist_user.text().strip()
+        try:
+            # foamdist на сервері не перекладаємо: пошук лише читає, і
+            # підміняти бінарник посеред чужої роботи над ним не варто.
+            # Кладемо, тільки якщо його там немає зовсім.
+            if not be.has_foamdist(backend):
+                err = self._off_thread("Кладу foamdist на сервер…",
+                                       lambda: be.ensure_foamdist(backend))
+                if err:
+                    pr.lbl_dist.setText(err)
+                    return
+            found = self._off_thread(
+                "Шукаю машини в мережі сервера…",
+                lambda: be.scan_dist(backend, key, user))
+        except Exception as exc:                          # noqa: BLE001
+            pr.lbl_dist.setText(f"пошук не вдався: {exc}")
+            return
+        have = pr.machines()
+        rows = be.scan_to_machines(found, have)
+        if not rows:
+            pr.lbl_dist.setText("У мережі сервера не знайдено жодної машини з "
+                                "відкритим ssh.")
+            return
+        dlg = panels.ScanDialog(rows, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        new = dlg.selected()
+        if not new:
+            return
+        pr.set_machines(have + new)
+        pr.lst_dist.setCurrentRow(len(have))
+        pr.dist_machines_changed.emit()
+        if not pr.box_dist.isChecked():
+            pr.box_dist.setChecked(True)
+        pr.lbl_dist.setText(
+            "Додано: " + ", ".join(m.label() for m in new)
+            + (". Без галочки (не готові) — "
+               + ", ".join(m.label() for m in new if not m.on)
+               if any(not m.on for m in new) else "") + ".")
+
     def probe_dist(self) -> None:
         pr = self.panel_run
         hosts, why = be.check_machines(pr.machines())
@@ -6030,6 +6228,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # Збережена сітка: ключ — з файлів кейсу, щойно записаних.
         mkey = be.mesh_key(self.case_dir) if be.mesh_cache_supported(backend) else ""
         remesh = self.panel_run.chk_remesh.isChecked()
+        # Сітка є тут (з проєкту чи з минулого прогону), а там, де рахуємо,
+        # — ні: вивантажуємо. Це хвилини проти десятка хвилин snappy.
+        if mkey and not remesh and be.local_mesh_dir(mkey) is not None:
+            try:
+                if not be.remote_mesh_exists(backend, mkey):
+                    err = self._off_thread(
+                        "Вивантажую збережену сітку…",
+                        lambda: be.push_mesh(backend, mkey))
+                    self.log.push(err or f"Сітку {mkey} вивантажено — "
+                                         "будувати не доведеться.")
+            except Exception as exc:                      # noqa: BLE001
+                self.log.push(f"Сітку не вивантажено, збудую: {exc}")
         steps = be.build_steps(
             self.cfg.solver.n_procs, backend,
             # Не solver.potential_init, а похідне від нього: у стисливому
@@ -6231,6 +6441,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.thread.wait(4000)
         self.refresh_plots()
         self.record_run(ok, msg, st)
+        # Сітку прогону вже забрано на цей компʼютер — тепер у проєкт.
+        key = getattr(self.worker, "mesh_key", "") if self.worker else ""
+        if (key and self._project_path and be.local_mesh_dir(key) is not None
+                and lib.project_mesh_key(self._project_path) != key):
+            self._autosave_project()
         if ok:
             self.load_results()
             self.tabs_right.setCurrentWidget(self.results_view)
@@ -6364,6 +6579,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if here != self._slice_case:
                 self._slice_pos.clear()
                 self._slice_limits.clear()
+                self._seeding.forget_place()
                 self._slice_case = here
         except Exception as exc:
             self.lbl_coeffs.setText(f"Не вдалося прочитати кейс: {exc}")
@@ -7078,8 +7294,10 @@ class MainWindow(QtWidgets.QMainWindow):
         streams, self._streams = self._streams, None
         overlay, self._overlay = self._overlay, None
         wash, self._wash = self._wash, None
+        seed, self._seed_widget = self._seed_widget, None
+        self._stream_timer.stop()
         self._streams_ctx = {}
-        for item in (scene, streams, overlay, wash):
+        for item in (scene, streams, overlay, wash, seed):
             if item is not None:
                 try:
                     item.close()
@@ -7162,6 +7380,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slice_bar.set_position(pos)
 
     def _slice_moved(self, pos: float) -> None:
+        self._slice_moved_streams()
         scene = self._scene
         if scene is None:
             return
@@ -7171,6 +7390,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.slice_bar.set_position(got)
 
     def _slice_axis(self, axis: int) -> None:
+        self._slice_moved_streams()
         scene = self._scene
         if scene is None:
             return
@@ -7321,7 +7541,7 @@ class MainWindow(QtWidgets.QMainWindow):
         p.render()
 
     def _draw_streams(self, t: float, parts: dict, beside_slice: bool) -> None:
-        """Лінії потоку: кільця перед дисками гвинтів і гребінка перед носом.
+        """Лінії потоку — звідти, звідки вибрано в смузі (`_seeding`).
 
         Рахуються кілька секунд, тож курсор — «очікування». Обʼєм той самий,
         що й для зрізу, і читається один раз.
@@ -7334,16 +7554,147 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         fs = fv.Freestream.from_flow(self.cfg.flow)
         rotors = [fv.Rotor.from_zone(z) for z in self.cfg.rotating]
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            lines = fv.case_streamlines(volume, parts, fs, rotors)
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
-        self._streams = fv.StreamScene(self.res_plotter, lines,
-                                       vertical=beside_slice)
         # Обʼєм тут НЕ тримаємо: він гігабайтний, а живе й так у Results
         # рівно один. Кадр ліній бере вже пораховані лінії.
-        self._streams_ctx = dict(bodies=parts, fs=fs, rotors=rotors)
+        self._streams_ctx = dict(t=t, bodies=parts, fs=fs, rotors=rotors,
+                                 beside_slice=beside_slice,
+                                 bounds=fv.bodies_bounds(volume, parts))
+        self._trace_streams(volume)
+        self._place_seed_widget()
+
+    def _current_seeding(self) -> fv.Seeding:
+        """Вибір зі смуги + те, що памʼятає вікно (куди потягли)."""
+        sb, s = self.slice_bar, self._seeding
+        s.mode = sb.seed_mode()
+        s.count = sb.seed_count()
+        s.direction = sb.seed_direction()
+        # Радіус зі смуги — лише коли кулю вже поставили: до того в полі
+        # стоїть заглушка, а справжній радіус іде від габариту тіла.
+        if s.mode == "sphere" and s.radius is not None:
+            s.radius = sb.seed_radius()
+        s.plane = (sb.axis(), sb.position())
+        return s
+
+    def _trace_streams(self, volume) -> None:
+        """Порахувати лінії й поставити їх у сцену замість старих. Віджет
+        насіння не чіпає: його можуть саме тягнути."""
+        ctx = self._streams_ctx
+        old, self._streams = self._streams, None
+        if old is not None:
+            old.close()
+        seeding = self._current_seeding()
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            lines = fv.case_streamlines(volume, ctx["bodies"], ctx["fs"],
+                                        ctx["rotors"], seeding=seeding)
+        except ValueError as exc:
+            self.statusBar().showMessage(f"Лінії потоку: {exc}", 10000)
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if not lines.n_points:
+            self.statusBar().showMessage(
+                "Лінії потоку: з цього місця не вийшло жодної лінії — "
+                "насінини поза доменом або в тілі.", 10000)
+        self._streams = fv.StreamScene(self.res_plotter, lines,
+                                       vertical=ctx["beside_slice"])
+        ctx["label"] = fv.seed_label(seeding, ctx["rotors"])
+        ctx["seeding"] = dataclasses.replace(seeding)
+
+    def _place_seed_widget(self) -> None:
+        """Відрізок чи кулю — у вʼюпорт, якщо місце таке, що його тягнуть."""
+        old, self._seed_widget = self._seed_widget, None
+        if old is not None:
+            old.close()
+        ctx = self._streams_ctx
+        s = self._seeding
+        if not ctx or s.mode not in fv.SEED_DRAGGABLE:
+            return
+        bounds, fs = ctx["bounds"], ctx["fs"]
+        if s.mode == "line":
+            kw = dict(line=s.line or fv.default_line(bounds, fs))
+        else:
+            centre, radius = fv.default_ball(bounds, fs)
+            if s.centre is None:
+                s.centre = centre
+            if not s.radius:
+                s.radius = radius
+                self.slice_bar.set_seeding(radius=radius)
+            kw = dict(centre=s.centre, radius=s.radius)
+        self._seed_widget = fv.SeedWidget(
+            self.res_plotter, s.mode, bounds=fv.view_bounds(ctx["bodies"]),
+            on_change=self._seed_dragged, **kw)
+
+    def _seed_dragged(self, state: dict) -> None:
+        """Відрізок чи кулю відпустили: запамʼятати й перерахувати лінії.
+        Не прямо тут — ми всередині події віджета, а перерахунок прибирає
+        й ставить актори; тож одразу після неї."""
+        s = self._seeding
+        if "line" in state:
+            s.line = state["line"]
+        else:
+            s.centre, s.radius = state["centre"], state["radius"]
+            self.slice_bar.set_seeding(radius=s.radius)
+        QtCore.QTimer.singleShot(0, self._retrace_streams)
+
+    def _retrace_streams(self) -> None:
+        """Перерахувати лише лінії: тіло, зріз і шари лишаються як були."""
+        self._stream_timer.stop()
+        ctx = self._streams_ctx
+        if not ctx or self.results is None or not self.slice_bar.streams_on():
+            return
+        volume = self.results.internal(ctx["t"])
+        if volume is None:
+            return
+        self._trace_streams(volume)
+        self.res_plotter.render()
+
+    def _seeding_changed(self) -> None:
+        """Смуга: інше місце, кількість, напрямок чи радіус."""
+        sb = self.slice_bar
+        mode_was = self._seeding.mode
+        self._current_seeding()
+        st = self._store()
+        st.setValue("streams_seed", sb.seed_mode())
+        st.setValue("streams_count", sb.seed_count())
+        st.setValue("streams_direction", sb.seed_direction())
+        if not self._streams_ctx:
+            return
+        if self._seeding.mode != mode_was:
+            self._place_seed_widget()
+            self.res_plotter.render()
+        elif self._seed_widget is not None and self._seeding.mode == "sphere":
+            self._seed_widget.set_radius(self._seeding.radius)
+        self._stream_timer.start()
+
+    def _seed_reset(self) -> None:
+        """«На місце»: відрізок і кулю — туди, де вони стоять спочатку."""
+        self._seeding.forget_place()
+        if not self._streams_ctx:
+            return
+        self._place_seed_widget()
+        self._stream_timer.start()
+
+    def _restore_seeding(self) -> None:
+        """Місце, кількість і напрямок — як були минулого разу. Куди тягнули
+        відрізок чи кулю, не памʼятаємо: у кожного кейса воно своє."""
+        st = self._store()
+        try:
+            count = int(st.value("streams_count", fv.SEED_COUNT))
+        except (TypeError, ValueError):
+            count = fv.SEED_COUNT
+        self.slice_bar.set_seeding(
+            mode=str(st.value("streams_seed", "auto") or "auto"),
+            count=count,
+            direction=str(st.value("streams_direction", "forward")
+                          or "forward"))
+        self._current_seeding()
+
+    def _slice_moved_streams(self) -> None:
+        """Площину зрізу посунули: якщо лінії ростуть з неї — перерахувати,
+        коли рух на мить зупиниться."""
+        if self._streams_ctx and self.slice_bar.seed_mode() == "slice":
+            self._stream_timer.start()
 
     def _save_frame(self) -> None:
         """Кадр для звіту: та сама сцена, але позаекранно, з підписом, шкалою
@@ -7393,7 +7744,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 fv.streams_report(
                     [fv.CaseView(None, ctx["bodies"], ctx["fs"], "")],
                     rotors=ctx["rotors"], name=self.cfg.name,
-                    traced=[streams.lines], path=path)
+                    traced=[streams.lines], path=path,
+                    seeding=ctx.get("seeding"))
         except Exception as exc:
             QtWidgets.QApplication.restoreOverrideCursor()
             QtWidgets.QMessageBox.critical(self, "Не вдалося зберегти кадр",

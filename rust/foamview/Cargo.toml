@@ -1,0 +1,23 @@
+[package]
+name = "foamview"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+fontdue = "0.9.5"
+numpy = "0.30"
+pollster = "1.0.1"
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"] }
+raw-window-handle = "0.6.2"
+wgpu = "30.0.1"
+
+[lib]
+name = "foamview"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+

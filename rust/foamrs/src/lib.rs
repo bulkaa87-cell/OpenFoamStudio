@@ -12,6 +12,7 @@ use rayon::prelude::*;
 
 pub mod field;
 pub mod surface;
+pub mod topo;
 
 fn to_py<'py>(py: Python<'py>, v: field::Values) -> PyResult<Bound<'py, PyAny>> {
     let n = v.len();
@@ -194,6 +195,69 @@ fn surface_lines<'py>(
     Ok((p, c))
 }
 
+fn tri_rows(tris: &numpy::PyReadonlyArray2<'_, i64>, n: usize) -> PyResult<Vec<[u32; 3]>> {
+    let t = tris.as_array();
+    if t.ncols() != 3 {
+        return Err(PyValueError::new_err("tris: need (M, 3)"));
+    }
+    let mut out = Vec::with_capacity(t.nrows());
+    for r in t.rows() {
+        if r.iter().any(|&i| i < 0 || i as usize >= n) {
+            return Err(PyValueError::new_err("tris: index out of range"));
+        }
+        out.push([r[0] as u32, r[1] as u32, r[2] as u32]);
+    }
+    Ok(out)
+}
+
+/// Geometry check of a triangle surface (see topo.rs). Returns a dict:
+/// open_edges, non_manifold_edges, bad_winding, n_regions, regions (M,),
+/// area, degenerate, part_volumes, signed_volume, edge_stats (4),
+/// hole_sizes (largest first, at most hole_limit).
+#[pyfunction]
+#[pyo3(signature = (points, tris, hole_limit=400))]
+fn mesh_check<'py>(py: Python<'py>, points: numpy::PyReadonlyArray2<'py, f64>,
+                   tris: numpy::PyReadonlyArray2<'py, i64>, hole_limit: usize)
+                   -> PyResult<Bound<'py, PyDict>> {
+    let pts = rows3(&points, "points")?;
+    let tri = tri_rows(&tris, pts.len())?;
+    let r = py.detach(move || topo::check(&pts, &tri, hole_limit));
+    let d = PyDict::new(py);
+    d.set_item("open_edges", r.open_edges)?;
+    d.set_item("non_manifold_edges", r.non_manifold_edges)?;
+    d.set_item("bad_winding", r.bad_winding)?;
+    d.set_item("n_regions", r.n_regions)?;
+    d.set_item("regions", r.regions.into_pyarray(py))?;
+    d.set_item("area", r.area)?;
+    d.set_item("degenerate", r.degenerate)?;
+    d.set_item("part_volumes", r.part_volumes.into_pyarray(py))?;
+    d.set_item("signed_volume", r.signed_volume)?;
+    d.set_item("edge_stats", r.edge_stats.to_vec())?;
+    d.set_item("hole_sizes", r.hole_sizes)?;
+    Ok(d)
+}
+
+/// Silhouette projections of the surface voxels (vtkVoxelModeller rule):
+/// (along X (ny,nz), along Y (nx,nz), along Z (nx,ny)) uint8 arrays.
+#[pyfunction]
+fn shell_projections<'py>(py: Python<'py>, points: numpy::PyReadonlyArray2<'py, f64>,
+                          tris: numpy::PyReadonlyArray2<'py, i64>,
+                          origin: (f64, f64, f64), dims: (usize, usize, usize),
+                          voxel: f64, max_dist: f64)
+                          -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let pts = rows3(&points, "points")?;
+    let tri = tri_rows(&tris, pts.len())?;
+    let (nx, ny, nz) = dims;
+    if nx * ny * nz == 0 {
+        return Err(PyValueError::new_err("dims: zero"));
+    }
+    let (px, pyy, pz) = py.detach(move || topo::shell_projections(
+        &pts, &tri, [origin.0, origin.1, origin.2], [nx, ny, nz], voxel, max_dist));
+    Ok((px.into_pyarray(py).reshape([ny, nz])?.into_any(),
+        pyy.into_pyarray(py).reshape([nx, nz])?.into_any(),
+        pz.into_pyarray(py).reshape([nx, ny])?.into_any()))
+}
+
 /// Number of worker threads rayon uses.
 #[pyfunction]
 fn threads() -> usize {
@@ -205,6 +269,8 @@ fn foamrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_internal, m)?)?;
     m.add_function(wrap_pyfunction!(read_fields, m)?)?;
     m.add_function(wrap_pyfunction!(surface_lines, m)?)?;
+    m.add_function(wrap_pyfunction!(mesh_check, m)?)?;
+    m.add_function(wrap_pyfunction!(shell_projections, m)?)?;
     m.add_function(wrap_pyfunction!(threads, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

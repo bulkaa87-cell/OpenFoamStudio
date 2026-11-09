@@ -18,6 +18,24 @@ from PySide6 import QtCore, QtWidgets
 import fs_help as fshelp
 import fs_panels as panels
 
+# Ті самі ключі й назви, що в fs_views. Тут — копія, а не імпорт: смуга
+# свідомо без VTK (див. вище), а fs_views тягне його за собою. Що вони
+# не розійшлися, перевіряє tests/test_views.py.
+SEED_MODES = (
+    ("auto", "Гвинти й перед носом"),
+    ("nose", "Перед носом"),
+    ("rotors", "Від гвинтів"),
+    ("line", "Відрізок — тягнути у вікні"),
+    ("sphere", "Куля — тягнути у вікні"),
+    ("slice", "На площині зрізу"),
+)
+SEED_DIRECTIONS = (
+    ("forward", "За потоком"),
+    ("both", "В обидва боки"),
+    ("backward", "Проти потоку"),
+)
+SEED_COUNT = 75
+
 SLIDER_STEPS = 4000       # роздільність повзунка: хід / 4000
 _STEPS_MM = (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 
@@ -31,6 +49,8 @@ class SliceBar(QtWidgets.QWidget):
     limits_auto = QtCore.Signal()           # повернути шкалу «сама»
     limits_fit = QtCore.Signal()            # підігнати шкалу під цей зріз
     streams_toggled = QtCore.Signal(bool)   # лінії потоку
+    seeding_changed = QtCore.Signal()       # звідки, скільки, куди — лінії
+    seed_reset = QtCore.Signal()            # «На місце»: відрізок / кулю
     contour_toggled = QtCore.Signal(bool)
     edges_toggled = QtCore.Signal(bool)
     body_toggled = QtCore.Signal(bool)
@@ -61,8 +81,8 @@ class SliceBar(QtWidgets.QWidget):
             "(у косому вигляді) або повзунком.")
         self.chk_streams = QtWidgets.QCheckBox("Лінії потоку")
         self.chk_streams.setToolTip(
-            "Лінії потоку від кілець перед дисками гвинтів і гребінки перед "
-            "носом, розфарбовані швидкістю. Рахуються кілька секунд.")
+            "Лінії потоку, розфарбовані швидкістю. Звідки вони ростуть — "
+            "вибір у рядку нижче. Рахуються кілька секунд.")
         self.btn_face = QtWidgets.QPushButton("Вид на зріз")
         self.btn_face.setToolTip("Дивитися рівно на площину, без перспективи")
         self.btn_iso = QtWidgets.QPushButton("3D")
@@ -81,6 +101,57 @@ class SliceBar(QtWidgets.QWidget):
             ra.addWidget(b)
         lay.addLayout(ra)
         self.btn_face.setEnabled(False)
+
+        # --- звідки ростуть лінії потоку: видно, лише коли вони ввімкнені
+        self.streams_box = QtWidgets.QWidget()
+        sl = QtWidgets.QVBoxLayout(self.streams_box)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(3)
+        rs = QtWidgets.QHBoxLayout()
+        self.cmb_seed = QtWidgets.QComboBox()
+        for key, title in SEED_MODES:
+            self.cmb_seed.addItem(title, key)
+        self.spin_seeds = QtWidgets.QSpinBox()
+        self.spin_seeds.setRange(2, 2000)
+        self.spin_seeds.setValue(SEED_COUNT)
+        self.spin_seeds.setKeyboardTracking(False)
+        self.spin_seeds.setToolTip(
+            "Скільки насінин — стільки й ліній. Кільця перед гвинтами мають "
+            "свою густину й цього числа не слухають.")
+        self.lbl_radius = QtWidgets.QLabel("Радіус")
+        self.spin_radius = panels.dspin(0.1, 1e6, 50.0, step=5.0, decimals=1,
+                                        suffix=" мм")
+        self.spin_radius.setKeyboardTracking(False)
+        self.spin_radius.setToolTip(
+            "Радіус кулі, в обʼємі якої сидять насінини. У вікні його "
+            "можна змінити й правою кнопкою миші.")
+        self.cmb_seed_dir = QtWidgets.QComboBox()
+        for key, title in SEED_DIRECTIONS:
+            self.cmb_seed_dir.addItem(title, key)
+        self.cmb_seed_dir.setToolTip(
+            "За потоком — куди йде повітря від насінин. Проти потоку — звідки "
+            "воно прийшло. В обидва боки — для насіння посеред течії: у "
+            "слід, у вихор, на площину зрізу.")
+        self.btn_seed_reset = QtWidgets.QPushButton("На місце")
+        self.btn_seed_reset.setToolTip(
+            "Поставити відрізок чи кулю туди, де вони стоять спочатку: "
+            "відрізок — перед носом, куля — за тілом.")
+        rs.addWidget(QtWidgets.QLabel("Звідки"))
+        rs.addWidget(self.cmb_seed)
+        rs.addWidget(QtWidgets.QLabel("Ліній"))
+        rs.addWidget(self.spin_seeds)
+        rs.addWidget(self.lbl_radius)
+        rs.addWidget(self.spin_radius)
+        rs.addWidget(self.cmb_seed_dir)
+        rs.addWidget(self.btn_seed_reset)
+        rs.addStretch(1)
+        sl.addLayout(rs)
+        block = panels.explain(self.cmb_seed, "streams_seed")
+        if block is not None:
+            sl.addWidget(block)
+        lay.addWidget(self.streams_box)
+        self.streams_box.setVisible(False)
+        self._seed_mode_shown()
 
         # --- шари поверх тіла: видно завжди, як і зріз із лініями. Кожен
         # рахується лише ввімкнений — обʼєм і так читається один раз.
@@ -213,7 +284,16 @@ class SliceBar(QtWidgets.QWidget):
         self.spin_hi.valueChanged.connect(lambda _: self._limits_edited())
         self.btn_auto.clicked.connect(lambda: self.limits_auto.emit())
         self.btn_fit.clicked.connect(lambda: self.limits_fit.emit())
+        self.chk_streams.toggled.connect(self.streams_box.setVisible)
         self.chk_streams.toggled.connect(self.streams_toggled)
+        self.cmb_seed.currentIndexChanged.connect(self._seed_mode_changed)
+        self.spin_seeds.valueChanged.connect(
+            lambda _: self._emit(self.seeding_changed))
+        self.spin_radius.valueChanged.connect(
+            lambda _: self._emit(self.seeding_changed))
+        self.cmb_seed_dir.currentIndexChanged.connect(
+            lambda _: self._emit(self.seeding_changed))
+        self.btn_seed_reset.clicked.connect(lambda: self.seed_reset.emit())
         self.chk_contour.toggled.connect(self.contour_toggled)
         self.chk_edges.toggled.connect(self.edges_toggled)
         self.chk_body.toggled.connect(self.body_toggled)
@@ -229,6 +309,19 @@ class SliceBar(QtWidgets.QWidget):
     def _emit(self, signal, *args):
         if not self._silent:
             signal.emit(*args)
+
+    def _seed_mode_shown(self):
+        """Поля, які щось значать лише для деяких місць: радіус — для кулі,
+        «На місце» — для того, що тягнуть, число — не для самих гвинтів."""
+        mode = self.seed_mode()
+        self.lbl_radius.setVisible(mode == "sphere")
+        self.spin_radius.setVisible(mode == "sphere")
+        self.btn_seed_reset.setVisible(mode in ("line", "sphere"))
+        self.spin_seeds.setEnabled(mode != "rotors")
+
+    def _seed_mode_changed(self, _index: int):
+        self._seed_mode_shown()
+        self._emit(self.seeding_changed)
 
     def _enable_toggled(self, on: bool):
         self.details.setVisible(on)
@@ -290,6 +383,42 @@ class SliceBar(QtWidgets.QWidget):
 
     def streams_on(self) -> bool:
         return self.chk_streams.isChecked()
+
+    def seed_mode(self) -> str:
+        """Звідки ростуть лінії: ключ із SEED_MODES."""
+        return str(self.cmb_seed.currentData() or "auto")
+
+    def seed_count(self) -> int:
+        return int(self.spin_seeds.value())
+
+    def seed_direction(self) -> str:
+        return str(self.cmb_seed_dir.currentData() or "forward")
+
+    def seed_radius(self) -> float:
+        """Радіус кулі, м."""
+        return self.spin_radius.value() / 1000.0
+
+    def set_seeding(self, mode: str | None = None, count: int | None = None,
+                    direction: str | None = None,
+                    radius: float | None = None) -> None:
+        """Показати вибір, що прийшов ззовні (налаштування, віджет у вікні),
+        — без сигналу: це відгомін, а не нова воля людини."""
+        was = self._silent
+        self._silent = True
+        if mode is not None:
+            i = self.cmb_seed.findData(mode)
+            if i >= 0:
+                self.cmb_seed.setCurrentIndex(i)
+        if count is not None:
+            self.spin_seeds.setValue(int(count))
+        if direction is not None:
+            i = self.cmb_seed_dir.findData(direction)
+            if i >= 0:
+                self.cmb_seed_dir.setCurrentIndex(i)
+        if radius is not None:
+            self.spin_radius.setValue(float(radius) * 1000.0)
+        self._silent = was
+        self._seed_mode_shown()
 
     def layers(self) -> set:
         """Які шари ввімкнено: {"reverse", "loss", "wall", "wash"}."""

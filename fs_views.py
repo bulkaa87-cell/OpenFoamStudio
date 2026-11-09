@@ -1587,18 +1587,295 @@ def nose_seeds(bounds: tuple, fs: Freestream, *, across: int = 25,
     return np.array([origin + a * e1 + b * e2 for b in vs for a in us])
 
 
-def trace(volume, seeds: np.ndarray, *, length: float):
-    """Лінії потоку вперед від насінин, довжиною не більше `length`. Кожна
-    точка отримує швидкість SPEED — для розфарбування."""
+def trace(volume, seeds: np.ndarray, *, length: float,
+          direction: str = "forward"):
+    """Лінії потоку від насінин, довжиною не більше `length` у кожен бік.
+    `direction` — "forward" (за потоком), "backward" (звідки прийшло) або
+    "both". Кожна точка отримує швидкість SPEED — для розфарбування."""
+    if direction not in ("forward", "backward", "both"):
+        raise ValueError(f"невідомий напрямок ліній: {direction!r}")
     lines = volume.streamlines_from_source(
         pv.PolyData(np.asarray(seeds, dtype=float)), vectors="U",
-        integration_direction="forward", max_length=float(length),
+        integration_direction=direction, max_length=float(length),
         initial_step_length=0.5, step_unit="cl", max_step_length=1.0,
         terminal_speed=1e-2, max_steps=200000, compute_vorticity=False)
     if lines.n_points:
         lines.point_data[SPEED] = np.linalg.norm(
             np.asarray(lines.point_data["U"], dtype=float), axis=1)
     return lines
+
+
+# --- Де сіяти: вибір людини -----------------------------------------------
+#
+# «Авто» — це те, що було завжди: кільця перед гвинтами й гребінка перед
+# носом. Але цікаве буває й деінде: кінцевий вихор, слід за хвостом, канал.
+# Тому місце насіння можна вибрати: відрізок або кулю, які тягнуть мишею у
+# вікні, або площину зрізу. Лінії рахуються секунди, тож перераховуються,
+# коли кнопку миші ВІДПУСТИЛИ, а не на кожному кроці перетягування.
+
+SEED_MODES = (
+    ("auto", "Гвинти й перед носом"),
+    ("nose", "Перед носом"),
+    ("rotors", "Від гвинтів"),
+    ("line", "Відрізок — тягнути у вікні"),
+    ("sphere", "Куля — тягнути у вікні"),
+    ("slice", "На площині зрізу"),
+)
+SEED_DIRECTIONS = (
+    ("forward", "За потоком"),
+    ("both", "В обидва боки"),
+    ("backward", "Проти потоку"),
+)
+SEED_COUNT = 75            # 25 × 3 — гребінка, яка була до вибору
+SEED_DRAGGABLE = ("line", "sphere")
+
+
+@dataclass
+class Seeding:
+    """Звідки ростуть лінії потоку. Координати — у метрах, як у кейсі.
+
+    `line`, `centre`, `radius` — None, доки людина нічого не тягнула: тоді
+    місце ставиться саме, за габаритом тіла (`default_line`, `default_ball`).
+    `count` — скільки насінин; кільця перед гвинтами його не слухають, у
+    них своя густина за радіусом.
+    """
+    mode: str = "auto"
+    count: int = SEED_COUNT
+    direction: str = "forward"
+    line: tuple | None = None          # ((x, y, z), (x, y, z))
+    centre: tuple | None = None
+    radius: float | None = None
+    plane: tuple | None = None         # (вісь 0/1/2, позиція)
+
+    def forget_place(self) -> None:
+        """Забути, куди тягнули: для іншого кейса місце ставиться заново."""
+        self.line = self.centre = self.radius = None
+
+
+def bodies_bounds(volume, bodies: dict) -> tuple:
+    """Габарит усіх частин тіла (xmin, xmax, ymin, …). Без тіла — обʼєм."""
+    parts = [m for m in (bodies or {}).values() if m is not None and m.n_points]
+    src = np.asarray([m.bounds for m in parts] if parts else [volume.bounds])
+    bb = src.reshape(-1, 3, 2)
+    lo3, hi3 = bb[:, :, 0].min(axis=0), bb[:, :, 1].max(axis=0)
+    return tuple(np.column_stack([lo3, hi3]).ravel())
+
+
+def default_line(bounds: tuple, fs: Freestream) -> tuple:
+    """Відрізок, з якого починати: упоперек потоку перед носом, на всю
+    ширину тіла й на середині висоти — середній ряд гребінки «Перед носом»."""
+    ends = nose_seeds(bounds, fs, across=2, levels=1)
+    return tuple(map(float, ends[0])), tuple(map(float, ends[-1]))
+
+
+def default_ball(bounds: tuple, fs: Freestream) -> tuple:
+    """Куля, з якої починати: одразу за тілом, по осі потоку. Радіус — 8 %
+    діагоналі габариту, щоб було видно й тіло, й кулю. → (центр, радіус)."""
+    d = _unit(fs.direction)
+    lo, hi = np.asarray(bounds[0::2], float), np.asarray(bounds[1::2], float)
+    centre = 0.5 * (lo + hi)
+    reach = stream_reach(lo, hi, d)
+    diag = float(np.linalg.norm(hi - lo))
+    radius = 0.08 * diag
+    at = centre + d * (0.5 * reach + 1.5 * radius)
+    return tuple(map(float, at)), float(radius)
+
+
+def line_seeds(p0, p1, count: int) -> np.ndarray:
+    """`count` насінин рівно по відрізку, обидва кінці включно."""
+    t = np.linspace(0.0, 1.0, max(int(count), 2))
+    a, b = np.asarray(p0, float), np.asarray(p1, float)
+    return a + t[:, None] * (b - a)
+
+
+def ball_seeds(centre, radius: float, count: int) -> np.ndarray:
+    """`count` насінин рівномірно в ОБʼЄМІ кулі. Розклад сталий (той самий
+    генератор щоразу): інакше лінії мінялися б від кожного перерахунку, і
+    не було б видно, що змінилося від того, що кулю зсунули."""
+    n = max(int(count), 1)
+    rng = np.random.default_rng(0)
+    dirs = rng.normal(size=(n, 3))
+    dirs /= np.maximum(np.linalg.norm(dirs, axis=1), 1e-12)[:, None]
+    r = float(radius) * np.cbrt(rng.random(n))
+    return np.asarray(centre, float) + dirs * r[:, None]
+
+
+def plane_seeds(axis: int, pos: float, bounds: tuple, count: int, *,
+                margin: float = 0.25) -> np.ndarray:
+    """Рівна сітка насінин на площині зрізу, в межах габариту тіла з запасом
+    `margin` з кожного боку. Комірки сітки — майже квадратні."""
+    u, v = [a for a in (0, 1, 2) if a != axis]
+    lo = np.asarray(bounds[0::2], float)
+    hi = np.asarray(bounds[1::2], float)
+    span = np.maximum(hi - lo, 1e-9)
+    lo, hi = lo - margin * span, hi + margin * span
+    eu, ev = hi[u] - lo[u], hi[v] - lo[v]
+    n = max(int(count), 1)
+    nu = max(1, int(round(math.sqrt(n * eu / ev))))
+    nv = max(1, int(round(n / nu)))
+    # Центри комірок, а не краї: на краю габариту з запасом течія
+    # нецікава, а насінина на самому тілі нічого не покаже.
+    us = lo[u] + (np.arange(nu) + 0.5) * eu / nu
+    vs = lo[v] + (np.arange(nv) + 0.5) * ev / nv
+    pts = np.zeros((nu * nv, 3))
+    pts[:, axis] = pos
+    gu, gv = np.meshgrid(us, vs)
+    pts[:, u], pts[:, v] = gu.ravel(), gv.ravel()
+    return pts
+
+
+def seed_points(seeding: Seeding, bounds: tuple, fs: Freestream,
+                rotors=()) -> np.ndarray:
+    """Насінини за вибором людини. ValueError — якщо сіяти нема звідки
+    (гвинтів немає, площину не задано): це треба сказати, а не мовчки
+    показати порожнечу."""
+    mode = seeding.mode
+    rotors = list(rotors or [])
+    count = max(int(seeding.count), 1)
+    if mode == "rotors" and not rotors:
+        raise ValueError("У кейсі немає гвинтів (обертових зон) — сіяти від "
+                         "них нема звідки. Виберіть інше місце.")
+    if mode in ("auto", "nose", "rotors"):
+        pts = [rotor_seeds(r, fs) for r in rotors] if mode != "nose" else []
+        if mode != "rotors":
+            levels = 3 if count >= 6 else 1
+            across = max(2, int(round(count / levels)))
+            pts.append(nose_seeds(bounds, fs, across=across, levels=levels))
+        return np.vstack(pts)
+    if mode == "line":
+        p0, p1 = seeding.line or default_line(bounds, fs)
+        return line_seeds(p0, p1, count)
+    if mode == "sphere":
+        centre, radius = default_ball(bounds, fs)
+        if seeding.centre is not None:
+            centre = seeding.centre
+        if seeding.radius:
+            radius = seeding.radius
+        return ball_seeds(centre, radius, count)
+    if mode == "slice":
+        if seeding.plane is None:
+            raise ValueError("Площину зрізу не задано.")
+        axis, pos = seeding.plane
+        return plane_seeds(int(axis), float(pos), bounds, count)
+    raise ValueError(f"невідоме місце насіння: {mode!r}")
+
+
+def seed_label(seeding: Seeding | None, rotors=()) -> str:
+    """Підпис «засів: …» для кадру звіту — словами, як у смузі керування."""
+    mode = seeding.mode if seeding is not None else "auto"
+    if mode == "auto":
+        text = ("кільця перед дисками гвинтів і гребінка перед носом"
+                if rotors else "гребінка перед носом")
+    elif mode == "nose":
+        text = "гребінка перед носом"
+    elif mode == "rotors":
+        text = "кільця перед дисками гвинтів"
+    elif mode == "line":
+        text = "відрізок"
+    elif mode == "sphere":
+        text = "куля"
+    else:
+        axis = int(seeding.plane[0]) if seeding.plane else 0
+        pos = float(seeding.plane[1]) if seeding.plane else 0.0
+        text = f"площина {AXES[axis].upper()} = {pos * 1000:g} мм"
+    if seeding is not None and seeding.direction != "forward":
+        text += ", " + dict(SEED_DIRECTIONS)[seeding.direction].lower()
+    return text
+
+
+class SeedWidget:
+    """Насіння, яке тягнуть мишею у вʼюпорті: відрізок або куля.
+
+    Відрізок — два кінці-ручки (тягнути кінець) і сама лінія (тягнути
+    цілим). Куля — тягнути лівою кнопкою, радіус — правою або числом у
+    смузі. `on_change` викликається, коли кнопку ВІДПУСТИЛИ, з новим станом:
+    {"line": (p0, p1)} або {"centre": c, "radius": r}.
+    """
+
+    def __init__(self, plotter, kind: str, *, bounds: tuple,
+                 line: tuple | None = None, centre=None,
+                 radius: float | None = None, on_change=None):
+        if kind not in SEED_DRAGGABLE:
+            raise ValueError(f"тягнути можна лише {SEED_DRAGGABLE}: {kind!r}")
+        self.kind = kind
+        self.plotter = plotter
+        self._on_change = on_change
+        self._widget = None
+        self._rep = None
+        iren = getattr(plotter, "iren", None)
+        interactor = getattr(iren, "interactor", None)
+        if interactor is None:
+            return
+        ink = pv.Color(INK).float_rgb
+        if kind == "line":
+            w = vtk.vtkLineWidget()
+            w.SetInteractor(interactor)
+            w.SetCurrentRenderer(plotter.renderer)
+            w.SetPlaceFactor(1.0)
+            w.PlaceWidget(bounds)
+            # Без цього віджет сам повертає відрізок уздовж осі X.
+            w.SetAlignToNone()
+            w.SetClampToBounds(False)
+            p0, p1 = line
+            w.SetPoint1(*map(float, p0))
+            w.SetPoint2(*map(float, p1))
+            w.GetLineProperty().SetColor(*ink)
+            w.GetLineProperty().SetLineWidth(3.0)
+            w.GetHandleProperty().SetColor(*ink)
+            self._widget = w
+        else:
+            rep = vtk.vtkSphereRepresentation()
+            rep.SetPlaceFactor(1.0)
+            rep.PlaceWidget(bounds)
+            rep.SetCenter(*map(float, centre))
+            rep.SetRadius(float(radius))
+            rep.SetRepresentationToWireframe()
+            rep.SetHandleVisibility(0)
+            rep.SetThetaResolution(24)
+            rep.SetPhiResolution(12)
+            rep.GetSphereProperty().SetColor(*ink)
+            rep.GetSphereProperty().SetOpacity(0.6)
+            rep.GetSelectedSphereProperty().SetColor(*ink)
+            w = vtk.vtkSphereWidget2()
+            w.SetInteractor(interactor)
+            w.SetRepresentation(rep)
+            w.SetCurrentRenderer(plotter.renderer)
+            w.SetTranslationEnabled(True)
+            w.SetScalingEnabled(True)
+            self._widget, self._rep = w, rep
+        w.AddObserver("EndInteractionEvent", lambda *_: self._released())
+        w.On()
+
+    def has_widget(self) -> bool:
+        return self._widget is not None
+
+    def state(self) -> dict:
+        w = self._widget
+        if w is None:
+            return {}
+        if self.kind == "line":
+            return {"line": (tuple(w.GetPoint1()), tuple(w.GetPoint2()))}
+        return {"centre": tuple(self._rep.GetCenter()),
+                "radius": float(self._rep.GetRadius())}
+
+    def set_radius(self, radius: float) -> None:
+        """Радіус числом зі смуги — без сигналу: він і так відомий."""
+        if self._rep is not None:
+            self._rep.SetRadius(float(radius))
+
+    def _released(self) -> None:
+        if self._on_change is not None and self._widget is not None:
+            self._on_change(self.state())
+
+    def close(self) -> None:
+        w, self._widget, self._rep = self._widget, None, None
+        if w is not None:
+            try:
+                w.Off()
+                w.RemoveAllObservers()
+                w.SetInteractor(None)
+            except Exception:
+                pass
 
 
 def stream_limits(lines) -> tuple:
@@ -1759,23 +2036,31 @@ def stream_reach(lo3, hi3, direction) -> float:
 
 def case_streamlines(volume, bodies: dict, fs: Freestream, rotors=(), *,
                      across: int = 25, levels: int = 3,
-                     length: float | None = None):
-    """Насіння (кільця перед гвинтами + гребінка перед носом) і лінії від
-    нього. Одна функція і для вікна, і для звіту: вони мусять показувати
-    однакове."""
+                     length: float | None = None,
+                     seeding: Seeding | None = None):
+    """Насіння і лінії від нього. Одна функція і для вікна, і для звіту:
+    вони мусять показувати однакове.
+
+    Без `seeding` — як було завжди: кільця перед гвинтами + гребінка перед
+    носом (`across` × `levels`). З `seeding` — там, де вибрала людина.
+    """
     if "U" not in volume.point_data:
         raise ValueError("У обʼємі немає швидкості U — ліній потоку не буде.")
-    parts = [m for m in (bodies or {}).values() if m is not None and m.n_points]
-    src = np.asarray([m.bounds for m in parts] if parts else [volume.bounds])
-    bb = src.reshape(-1, 3, 2)
-    lo3, hi3 = bb[:, :, 0].min(axis=0), bb[:, :, 1].max(axis=0)
-    bounds = tuple(np.column_stack([lo3, hi3]).ravel())
-    seeds = [rotor_seeds(r, fs) for r in rotors]
-    seeds.append(nose_seeds(bounds, fs, across=across, levels=levels))
+    bounds = bodies_bounds(volume, bodies)
+    lo3, hi3 = np.asarray(bounds[0::2]), np.asarray(bounds[1::2])
+    direction = "forward"
+    if seeding is None:
+        seeds = [rotor_seeds(r, fs) for r in rotors]
+        seeds.append(nose_seeds(bounds, fs, across=across, levels=levels))
+        seeds = np.vstack(seeds)
+    else:
+        seeds = seed_points(seeding, bounds, fs, rotors)
+        direction = seeding.direction
     # Довжина ліній — втричі більша за тіло вздовж потоку: цього досить, щоб
     # було видно слід, а далі лінії лише витрачають час і кадр.
     reach = stream_reach(lo3, hi3, fs.direction)
-    return trace(volume, np.vstack(seeds), length=length or 3.0 * reach)
+    return trace(volume, seeds, length=length or 3.0 * reach,
+                 direction=direction)
 
 
 def streams_report(views: list[CaseView], *, rotors: list[Rotor] | None = None,
@@ -1783,7 +2068,8 @@ def streams_report(views: list[CaseView], *, rotors: list[Rotor] | None = None,
                    size: tuple[int, int] = (1300, 700), path: str | None = None,
                    across: int = 25, levels: int = 3,
                    length: float | None = None,
-                   traced: list | None = None) -> np.ndarray:
+                   traced: list | None = None,
+                   seeding: Seeding | None = None) -> np.ndarray:
     """Лінії потоку для одного або кількох кейсів: рядок — кейс, стовпці —
     зблизька на гвинт (або 3D, якщо гвинтів нема) і згори. Шкала швидкості
     одна на всі кадри — з нею порівнюються кейси."""
@@ -1792,7 +2078,8 @@ def streams_report(views: list[CaseView], *, rotors: list[Rotor] | None = None,
     # вдруге — це найдорожча частина кадру.
     if traced is None:
         traced = [case_streamlines(v.volume, v.bodies, v.fs, rotors,
-                                   across=across, levels=levels, length=length)
+                                   across=across, levels=levels, length=length,
+                                   seeding=seeding)
                   for v in views]
     if limits is None:
         found = [stream_limits(t) for t in traced if t.n_points]
@@ -1815,8 +2102,7 @@ def streams_report(views: list[CaseView], *, rotors: list[Rotor] | None = None,
     fs = views[0].fs
     spec = replace(spec_by_key("umag"),
                    label=f"швидкість U,  м/с      (набігаючий потік {fs.u_inf:g})")
-    seeded = "кільця перед дисками гвинтів і гребінка перед носом" if rotors \
-        else "гребінка перед носом"
+    seeded = seed_label(seeding, rotors)
     head = (f"{name} — " if name else "") + f"лінії потоку,   U∞ = {fs.u_inf:g} м/с"
     cols = (f"гвинт «{rotors[0].name}» зблизька" if rotors else "3D", "згори")
     return compose(grid, title=head, subtitle=f"засів: {seeded}",

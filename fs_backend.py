@@ -854,6 +854,11 @@ def ensure_foamdist(backend: Backend, local: Path = FOAMDIST_LOCAL) -> str:
     return ""
 
 
+def has_foamdist(backend: Backend) -> bool:
+    rc, _ = _run(ssh_argv(backend.host, f'test -x "{FOAMDIST_REMOTE}"'), 30)
+    return rc == 0
+
+
 def probe_dist(backend: Backend, hosts, key: str, user: str) -> list[dict]:
     """`foamdist probe` з сервера: по словнику на машину (з `hostname`)."""
     ms = _as_machines(hosts)
@@ -872,6 +877,121 @@ def probe_dist(backend: Backend, hosts, key: str, user: str) -> list[dict]:
             except ValueError:
                 pass
     return got
+
+
+# Пошук машин: що бачить СЕРВЕР (машини розподілу ходять саме від нього).
+# Кандидати — його локальні мережі (/24 навколо кожної адреси; мережі
+# docker/podman/tailscale пропускаємо: там не машини, а контейнери чи весь
+# світ) і хости з його ~/.ssh/config (там і назви, і користувачі). Порт 22
+# перевіряємо всіх разом, по секунді на кожен — уся мережа за ~2 с.
+_SCAN_SCRIPT = r'''
+nets=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}' \
+  | grep -vE '^(docker|br-|veth|virbr|podman|tailscale|cni|flannel|lxc|zt)' \
+  | awk '{print $2}')
+cands=""
+for n in $nets; do
+  ip=${n%/*}; base=${ip%.*}; echo "SELF $ip $(hostname -s)"
+  for i in $(seq 1 254); do cands="$cands $base.$i"; done
+done
+if [ -f ~/.ssh/config ]; then
+  for a in $(awk 'tolower($1)=="host" { for (i=2;i<=NF;i++) print $i }' \
+             ~/.ssh/config | grep -v '[*?!]' | sort -u); do
+    g=$(ssh -G "$a" 2>/dev/null)
+    h=$(printf '%s\n' "$g" | awk '$1=="hostname"{print $2}')
+    u=$(printf '%s\n' "$g" | awk '$1=="user"{print $2}')
+    echo "ALIAS $a $h $u"
+    case " $cands " in *" $h "*) ;; *) cands="$cands $h";; esac
+  done
+fi
+for ip in $cands; do
+  ( timeout 1 bash -c ": </dev/tcp/$ip/22" 2>/dev/null && echo "OPEN $ip" ) &
+done
+wait
+'''
+
+
+def parse_scan(text: str) -> dict:
+    """Вивід `_SCAN_SCRIPT` → {"self": [...], "open": [...], "alias": {адреса:
+    (назва, користувач)}}."""
+    out = {"self": [], "open": [], "alias": {}}
+    for line in text.splitlines():
+        bits = line.split()
+        if len(bits) >= 2 and bits[0] == "SELF":
+            out["self"].append(bits[1])
+            # Сервер себе у своєму ~/.ssh/config не має: назву каже сам.
+            if len(bits) >= 3:
+                out["alias"].setdefault(bits[1], (bits[2], ""))
+        elif len(bits) >= 2 and bits[0] == "OPEN":
+            if bits[1] not in out["open"]:
+                out["open"].append(bits[1])
+        elif len(bits) >= 3 and bits[0] == "ALIAS":
+            # Перша назва виграє: у config та сама адреса може мати кілька.
+            out["alias"].setdefault(bits[2], (bits[1], bits[3] if len(bits) > 3
+                                               else ""))
+    return out
+
+
+def scan_dist(backend: Backend, key: str, user: str) -> list[dict]:
+    """Знайти машини, на які сервер може піти: мережа + ~/.ssh/config, потім
+    `foamdist probe` усіх, у кого відкритий ssh. По словнику на машину:
+    addr, name, user (з config), self (це сам сервер), і поля probe."""
+    rc, out = _run(ssh_argv(backend.host, _SCAN_SCRIPT), 90)
+    if rc != 0 and "OPEN" not in out:
+        raise RuntimeError(out.strip()[-300:] or "сервер не відповів")
+    sc = parse_scan(out)
+    ms = []
+    for addr in sc["open"]:
+        name, u = sc["alias"].get(addr, ("", ""))
+        ms.append(DistMachine(addr=addr, name=name,
+                              user=u if u and u != user else ""))
+    got = {g.get("host"): g for g in probe_dist(backend, ms, key, user)} if ms else {}
+    found = []
+    for m in ms:
+        g = dict(got.get(m.addr) or {"ok": False, "error": "не відповіла"})
+        g.update(addr=m.addr, name=m.name or str(g.get("hostname") or ""),
+                 user=m.user, self=m.addr in sc["self"] or g.get("head") == "yes")
+        found.append(g)
+    return found
+
+
+def scan_to_machines(found: list[dict], existing: "list[DistMachine]") -> list:
+    """Знахідки → [(DistMachine, що про неї сказати, готова, уже в списку)].
+
+    Готова = ssh пускає, це Linux із ядрами і є образ OpenFOAM. Процесів
+    пропонуємо стільки, скільки ФІЗИЧНИХ ядер: більше на розвʼязувачі не
+    дає нічого, крім тісноти.
+    """
+    have = {m.addr for m in existing}
+    rows = []
+    for g in sorted(found, key=lambda g: (not g.get("self"), g.get("name") or "~",
+                                          g.get("addr", ""))):
+        cores = int(float(g.get("cores", 0) or 0))
+        threads = int(float(g.get("threads", 0) or 0))
+        m = DistMachine(addr=g["addr"], name=g.get("name", ""),
+                        user=g.get("user", ""),
+                        procs=cores or max(1, threads // 2) or 4)
+        if not g.get("ok"):
+            err = " ".join(str(g.get("error", "")).split())
+            if "Permission denied" in err:
+                why = "ssh не пускає з ключем сервера (інший користувач чи ключ)"
+            elif "Connection refused" in err or "timed out" in err:
+                why = "ssh не відповідає"
+            else:
+                why = f"не вдалося: {err[:120]}"
+            ready = False
+        elif cores <= 0:
+            why, ready = "ssh пускає, але це не схоже на Linux-машину", False
+        elif g.get("image") != "yes":
+            why = (f"{cores} ядер, але немає образу OpenFOAM "
+                   "(podman pull docker.io/opencfd/openfoam-run:2512)")
+            ready = False
+        else:
+            busy = f", навантаження {g.get('load')}" if g.get("load") is not None else ""
+            why = (f"{'сервер, ' if g.get('self') else ''}{cores} ядер / "
+                   f"{threads} потоків, {g.get('mem_gb', '?')} ГБ вільно{busy}")
+            ready = True
+        rows.append((m, why, ready, m.addr in have))
+    return rows
 
 
 def dist_weights(backend: Backend, hosts, key: str,
@@ -996,6 +1116,106 @@ def _mesh_store_command(key: str, par: bool) -> str:
         '| while read -r d; do rm -rf "$d"; done; true'
     )
     return cmd
+
+
+# Копія сховища на ЦЬОМУ компʼютері: звідси сітка йде у файл проєкту і з
+# проєкту — назад на сервер. Сервер не вічний (теку кейсу перезаписує кожен
+# прогін, сховище тримає лише MESH_KEEP останніх), а проєкт людина носить із
+# собою.
+LOCAL_MESH_STORE = Path(__file__).resolve().parent / "meshes"
+
+
+def _mesh_complete(d: Path) -> bool:
+    pm = Path(d) / "polyMesh"
+    return all(any((pm / f"{n}{z}").is_file() for z in ("", ".gz"))
+               for n in ("points", "faces", "owner", "neighbour", "boundary"))
+
+
+def local_mesh_dir(key: str) -> "Path | None":
+    """Тека сітки `key` на цьому компʼютері (у ній polyMesh/) або None."""
+    if not key:
+        return None
+    d = LOCAL_MESH_STORE / key
+    return d if _mesh_complete(d) else None
+
+
+def _store_argv(backend: Backend, script: str) -> "list[str] | None":
+    """argv, що виконує bash там, де лежить сховище сіток цього бекенда."""
+    if backend.kind == "ssh":
+        return ssh_argv(backend.host, script)
+    if backend.kind == "wsl":
+        return wsl_argv(backend.distro, script)
+    if backend.kind == "native":
+        return ["bash", "-c", script]
+    return None
+
+
+def remote_mesh_exists(backend: Backend, key: str) -> bool:
+    argv = _store_argv(backend, f'test -s "{MESH_STORE}/{key}/polyMesh/faces"')
+    return bool(argv) and _run(argv, 30)[0] == 0
+
+
+def fetch_mesh(backend: Backend, key: str) -> str:
+    """Сховище бекенда → LOCAL_MESH_STORE/key. "" — вийшло, інакше чому ні.
+
+    gzip на тому боці: сітка бінарна, але стискається приблизно вдвічі, а
+    канал до сервера буває ~2 МБ/с — це різниця між хвилиною і двома.
+    """
+    argv = _store_argv(backend, f'cd "{MESH_STORE}" && test -s "{key}/polyMesh/faces" '
+                                f'&& tar czf - "{key}"')
+    if argv is None:
+        return "цей бекенд не має сховища сіток"
+    LOCAL_MESH_STORE.mkdir(parents=True, exist_ok=True)
+    tmp = LOCAL_MESH_STORE / f".in-{key}.tgz"
+    part = LOCAL_MESH_STORE / f".in-{key}"
+    rc, err = _pipe(argv, stdout_path=tmp, timeout=3600)
+    try:
+        if rc != 0:
+            return f"сітку не забрано: {err.strip()[-200:] or f'код {rc}'}"
+        shutil.rmtree(part, ignore_errors=True)
+        part.mkdir()
+        with tarfile.open(tmp, "r:gz") as tar:
+            for m in tar.getmembers():
+                # Лише звичайні файли й теки під <ключ>/ — архів приходить із
+                # сервера, але розпаковувати «../» не годиться ніколи.
+                if (not (m.isfile() or m.isdir()) or m.name.startswith("/")
+                        or ".." in Path(m.name).parts
+                        or Path(m.name).parts[0] != key):
+                    return f"дивний запис в архіві сітки: {m.name}"
+            tar.extractall(part)
+        if not _mesh_complete(part / key):
+            return "в архіві сітки чогось бракує"
+        dst = LOCAL_MESH_STORE / key
+        shutil.rmtree(dst, ignore_errors=True)
+        os.replace(part / key, dst)
+        return ""
+    finally:
+        tmp.unlink(missing_ok=True)
+        shutil.rmtree(part, ignore_errors=True)
+
+
+def push_mesh(backend: Backend, key: str) -> str:
+    """LOCAL_MESH_STORE/key → сховище бекенда. "" — вийшло."""
+    src = local_mesh_dir(key)
+    if src is None:
+        return "на цьому компʼютері такої сітки немає"
+    argv = _store_argv(backend, (
+        f'S="{MESH_STORE}"; mkdir -p "$S" && d="$S/.in-$$" && mkdir -p "$d" && '
+        f'tar xzf - -C "$d" && test -s "$d/{key}/polyMesh/faces" && '
+        f'rm -rf "$S/{key}" && mv "$d/{key}" "$S/{key}"; rc=$?; rm -rf "$d"; '
+        'exit $rc'))
+    if argv is None:
+        return "цей бекенд не має сховища сіток"
+    tmp = LOCAL_MESH_STORE / f".out-{key}.tgz"
+    try:
+        with tarfile.open(tmp, "w:gz", compresslevel=6) as tar:
+            tar.add(src, arcname=key)
+        rc, err = _pipe(argv, stdin_path=tmp, timeout=3600)
+        if rc != 0:
+            return f"сітку не вивантажено: {err.strip()[-200:] or f'код {rc}'}"
+        return ""
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def build_steps(n_procs: int, backend: Backend, potential_init: bool,

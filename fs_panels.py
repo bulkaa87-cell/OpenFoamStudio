@@ -13,6 +13,7 @@ import fs_backend as be
 import fs_case as fc
 import fs_help as fshelp
 import fs_library as lib
+import fs_meshfix as meshfix
 import fs_physics as phys
 import fs_winfix as winfix
 
@@ -1197,6 +1198,16 @@ class GeometryPanel(Panel):
              "КРАЙНІЙ ЗАСІБ: перерізати модель наново по воксельній сітці. "
              "Оболонка виходить гарантовано замкнена, але дрібні деталі "
              "зникають, а тонкі кромки грубіють"),
+            # The grid has 2 columns: this position puts the button directly
+            # below «Полагодити як слайсер». It does the same repair steps
+            # in our Rust code.
+            ("meshfix", "meshfix",
+             "Ті самі 12 кроків, що й «Полагодити як слайсер», але на Rust "
+             "у самій програмі (rust/meshfix), без служби Windows: зшити "
+             "щілини до 0.01 мм, прибрати дублі, узгодити нормалі, закрити "
+             "всі дірки, обʼєднати тіла, що врізаються одне в одне, "
+             "прибрати вкладені й крихітні оболонки. На відміну від служби "
+             "не згущує сітку й не зсуває вершини."),
             ("Обгорнути (alpha wrap)…", "alphawrap",
              "Те саме обгортання, але поверхня ведеться по самій геометрії, "
              "а не по осях воксельної сітки — тому кромки лишаються "
@@ -1227,7 +1238,8 @@ class GeometryPanel(Panel):
             # підказці чесніша за живу, яка відповідає діалогом «нічого не
             # вийде». Обидва модулі дають однакові available()/why_not() —
             # саме для цього ця пара й заведена.
-            gate = {"winfix": winfix, "alphawrap": alphawrap}.get(key)
+            gate = {"winfix": winfix, "alphawrap": alphawrap,
+                    "meshfix": meshfix}.get(key)
             if gate is not None and not gate.available():
                 b.setEnabled(False)
                 b.setToolTip(gate.why_not())
@@ -3425,6 +3437,60 @@ class AdvisorPanel(Panel):
         self.btn_apply.setEnabled(bool(changes))
 
 
+class ScanDialog(QtWidgets.QDialog):
+    """Що знайшов «Знайти машини»: галочками — що додати до списку.
+
+    Готові (ssh пускає, є образ) позначені одразу; решту теж можна додати —
+    образ можна поставити й потім, — але без галочки, щоб не потрапили в
+    прогін випадково. Ті, що вже в списку, показано, але не додаються вдруге.
+    """
+
+    def __init__(self, rows: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Знайдені машини")
+        self._rows = rows
+        v = QtWidgets.QVBoxLayout(self)
+        n_ready = sum(1 for _m, _w, ready, known in rows if ready and not known)
+        v.addWidget(WrapLabel(
+            f"Знайдено машин із відкритим ssh: {len(rows)}. Нових готових: "
+            f"{n_ready}. Позначте, які додати."))
+        self.lst = QtWidgets.QListWidget()
+        for m, why, ready, known in rows:
+            title = f"{m.name} — {m.addr}" if m.name else m.addr
+            mark = "✓" if ready else "!"
+            text = f"{mark} {title}: {why}"
+            if known:
+                text += " (уже в списку)"
+            it = QtWidgets.QListWidgetItem(text)
+            if known:
+                it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEnabled)
+            else:
+                it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+                it.setCheckState(QtCore.Qt.Checked if ready
+                                 else QtCore.Qt.Unchecked)
+            it.setToolTip(text)
+            self.lst.addItem(it)
+        self.lst.setMinimumWidth(560)
+        v.addWidget(self.lst)
+        bb = QtWidgets.QDialogButtonBox()
+        self.btn_add = bb.addButton("Додати вибрані",
+                                    QtWidgets.QDialogButtonBox.AcceptRole)
+        bb.addButton("Скасувати", QtWidgets.QDialogButtonBox.RejectRole)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def selected(self) -> list:
+        out = []
+        for i, (m, _why, ready, known) in enumerate(self._rows):
+            it = self.lst.item(i)
+            if not known and it.checkState() == QtCore.Qt.Checked:
+                # Не готову додаємо вимкненою: у прогін вона піде, лише
+                # коли людина сама поставить їй галочку.
+                out.append(be.DistMachine(**{**m.to_dict(), "on": ready}))
+        return out
+
+
 class RunPanel(Panel):
     detect_requested = QtCore.Signal()
     install_requested = QtCore.Signal()
@@ -3541,8 +3607,17 @@ class RunPanel(Panel):
         self.btn_m_add = QtWidgets.QPushButton("+ Додати машину")
         self.btn_m_del = QtWidgets.QPushButton("− Прибрати")
         mrow = QtWidgets.QHBoxLayout()
+        # ЗНАЙТИ МАШИНИ: сервер сам обходить свою мережу і ~/.ssh/config,
+        # а вписувати адреси руками лишається для того, чого він не бачить.
+        self.btn_dist_scan = QtWidgets.QPushButton("Знайти машини…")
+        self.btn_dist_scan.setToolTip(
+            "Сервер перебирає свою локальну мережу й хости зі свого "
+            "~/.ssh/config, шукає машини з відкритим ssh і перевіряє, чи "
+            "пускає ключ і чи є образ OpenFOAM. Знайдені можна додати "
+            "галочками. Займає кілька секунд.")
         mrow.addWidget(self.btn_m_add)
         mrow.addWidget(self.btn_m_del)
+        mrow.addWidget(self.btn_dist_scan)
         mrow.addStretch(1)
         self.box_m = QtWidgets.QGroupBox("Вибрана машина")
         ml = QtWidgets.QFormLayout(self.box_m)

@@ -352,6 +352,13 @@ def _region_ids(mesh: pv.PolyData) -> tuple[int, np.ndarray]:
     Тому кожній грані ще до фільтра чіпляємо її власний номер (cell_data
     фільтр переносить чесно) і вертаємо результат у вхідний порядок.
     """
+    rs = _rust_mesh()
+    arrays = _pure_triangles(mesh) if rs is not None else None
+    if arrays is not None:
+        # Rust: ті самі частини (грані зі спільною вершиною) і та сама
+        # нумерація — за першою гранню, як у VTK; уже у вхідному порядку.
+        r = rs.mesh_check(*arrays)
+        return int(r["n_regions"]), np.asarray(r["regions"], dtype=np.int64)
     zero = np.zeros(int(mesh.n_cells), dtype=np.int64)
     if int(mesh.GetNumberOfPolys()) != int(mesh.n_cells):
         # У сітці є ще й точкові або лінійні комірки: нумерація граней і
@@ -536,10 +543,22 @@ def projected_areas(mesh: pv.PolyData,
     voxel = min(max(voxel, span / 600.0), span / 40.0)
 
     origin, dims = _voxel_grid(mesh, voxel, pad=2)
-    shell = _shell_voxels(mesh, origin, dims, voxel)
+    rs = _rust_mesh()
+    arrays = _pure_triangles(mesh) if rs is not None else None
+    if arrays is not None:
+        # Той самий растр, що й vtkVoxelModeller (точка сітки на оболонці,
+        # якщо до трикутника ≤ max_dist), але одразу три проєкції.
+        span_grid = max((d - 1) * voxel for d in dims)
+        max_dist = min(1.0, voxel / span_grid) * span_grid if span_grid > 0 else voxel
+        flats = [np.asarray(f) > 0 for f in rs.shell_projections(
+            arrays[0], arrays[1], tuple(float(v) for v in origin),
+            tuple(int(v) for v in dims), float(voxel), float(max_dist))]
+    else:
+        shell = _shell_voxels(mesh, origin, dims, voxel)
+        flats = [shell.any(axis=axis) for axis in range(3)]
     out = []
     for axis in range(3):
-        flat = shell.any(axis=axis)
+        flat = flats[axis]
         if not flat.any():
             out.append(0.0)
             continue
@@ -669,7 +688,39 @@ def _edge_stats(mesh: pv.PolyData) -> tuple[float, float, float, float]:
             short)
 
 
+def _rust_mesh():
+    """foamrs, якщо вміє перевірку геометрії (старий .pyd може не вміти)."""
+    try:
+        import fs_fast
+    except ImportError:
+        return None
+    rs = getattr(fs_fast, "_rs", None)
+    return rs if rs is not None and hasattr(rs, "mesh_check") else None
+
+
+def _pure_triangles(mesh: pv.PolyData):
+    """(points float64 (N,3), tris int64 (M,3)), якщо сітка — самі
+    трикутники; інакше None (тоді лишається шлях VTK/numpy)."""
+    if mesh.n_cells == 0 or int(mesh.GetNumberOfPolys()) != int(mesh.n_cells):
+        return None
+    faces = _tri_faces(mesh)
+    if faces is None or faces.shape[0] != mesh.n_cells:
+        return None
+    return (np.ascontiguousarray(mesh.points, dtype=np.float64),
+            np.ascontiguousarray(faces, dtype=np.int64))
+
+
 def diagnose(mesh: pv.PolyData) -> Diagnosis:
+    """Повна перевірка геометрії.
+
+    На Rust (foamrs.mesh_check), якщо він є: ті самі числа за один прохід
+    (250 тис. трикутників — десятки мілісекунд замість ~1.4 с, а
+    відкриття проєкту перевіряло сцену кілька разів поспіль).
+    """
+    rs = _rust_mesh()
+    arrays = _pure_triangles(mesh) if rs is not None else None
+    if arrays is not None:
+        return _diagnose_rust(mesh, rs, *arrays)
     d = Diagnosis()
     d.n_triangles = int(mesh.n_cells)
     d.n_points = int(mesh.n_points)
@@ -701,6 +752,35 @@ def diagnose(mesh: pv.PolyData) -> Diagnosis:
     if d.open_edges:
         d.hole_sizes = _hole_sizes(mesh)
 
+    _add_notes(d)
+    return d
+
+
+def _diagnose_rust(mesh, rs, pts, tris) -> Diagnosis:
+    d = Diagnosis()
+    d.n_triangles = int(mesh.n_cells)
+    d.n_points = int(mesh.n_points)
+    d.bounds = tuple(float(x) for x in mesh.bounds)
+    r = rs.mesh_check(pts, tris)
+    d.open_edges = int(r["open_edges"])
+    d.non_manifold_edges = int(r["non_manifold_edges"])
+    d.parts = int(r["n_regions"])
+    regions = np.asarray(r["regions"])
+    d.area = float(r["area"])
+    d.degenerate = int(r["degenerate"])
+    vols = np.asarray(r["part_volumes"])
+    bad = np.where(vols < 0)[0]
+    d.inverted_parts = int(bad.size)
+    d.inverted_cells = np.isin(regions, bad) if bad.size else None
+    d.flipped_faces = int(d.inverted_cells.sum()) if bad.size else 0
+    d.bad_winding = int(r["bad_winding"])
+    d.projected = projected_areas(mesh)
+    d.signed_volume = float(r["signed_volume"])
+    d.volume = abs(d.signed_volume)
+    d.min_edge, d.max_edge, d.median_edge, d.short_edge = (
+        float(x) for x in r["edge_stats"])
+    if d.open_edges:
+        d.hole_sizes = [float(x) for x in r["hole_sizes"]]
     _add_notes(d)
     return d
 

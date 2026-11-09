@@ -1,0 +1,31 @@
+[package]
+name = "meshfix"
+version = "0.1.0"
+edition = "2021"
+description = "Mesh repair for OpenFOAM Studio: the steps of the Windows 3D-print repair, in Rust (see stages.rs)"
+publish = false
+
+[lib]
+name = "meshfix"
+crate-type = ["cdylib", "rlib"]
+
+# The Python module is a feature, so that `cargo test --no-default-features`
+# can link the tests without Python.
+[features]
+default = ["python"]
+python = ["dep:pyo3", "dep:numpy"]
+
+[dependencies]
+robust = "1"
+spade = "2"
+rayon = "1"
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"], optional = true }
+numpy = { version = "0.30", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(meshfix_debug)"] }

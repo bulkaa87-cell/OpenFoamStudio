@@ -40,8 +40,12 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod bench;
+mod coded;
 
 const IMAGE: &str = "docker.io/opencfd/openfoam-run:2512";
+/// The same OpenFOAM build with a compiler: only for the compile pass of
+/// coded entries (coded.rs).
+const IMAGE_DEV: &str = "docker.io/opencfd/openfoam-dev:2512";
 const BASHRC: &str = "/usr/lib/openfoam/openfoam2512/etc/bashrc";
 const LABEL: &str = "foamdist=1";
 const HWLOC: &str = "HWLOC_COMPONENTS=-gl,-opencl,-cuda,-nvml,-rsmi,-levelzero";
@@ -606,6 +610,54 @@ fn run(o: RunOpts) -> ExitCode {
             "{have} processor dirs, but {total} ranks: decompose for {total}"));
     }
 
+    // 2b. coded entries: compile them HERE, before the pieces go out
+    //     (see coded.rs — the run image has no compiler).
+    if coded::has_coded(case) {
+        st.set("phase", "compile");
+        let exists = Command::new(&o.engine.exe).args(["image", "inspect", IMAGE_DEV])
+            .stdout(Stdio::null()).stderr(Stdio::null()).status()
+            .map(|s| s.success()).unwrap_or(false);
+        if !exists {
+            return fail(&mut st, &mut log, &format!(
+                "the case has coded entries (coded function object, codedFixedValue, \
+                 #codeStream): they need a compiler — pull it once on this machine: \
+                 {} pull {IMAGE_DEV}", o.engine.exe));
+        }
+        let t0 = Instant::now();
+        let start = coded::latest_time(&case.join("processor0")).unwrap_or_else(|| "0".into());
+        let shadow = match coded::make_shadow(case, total) {
+            Ok(s) => s,
+            Err(e) => return fail(&mut st, &mut log, &format!("compile pass: {e}")),
+        };
+        let c = o.engine.run(IMAGE_DEV, case, None, &[],
+                             &coded::compile_script(&shadow, &o.solver, total, &start));
+        let out = run_ok(c).unwrap_or_else(|e| e);
+        let built = coded::libs(case);
+        let compile_log = fs::read_to_string(case.join(&shadow).join("log.compile"))
+            .unwrap_or_default();
+        let log_tail = compile_log.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev()
+            .collect::<Vec<_>>().join("\n");
+        if !compile_log.is_empty() {
+            let _ = fs::write(case.join("log.foamdist-compile"), &compile_log);
+        }
+        let _ = fs::remove_dir_all(case.join(&shadow));
+        if built > 0 {
+            say(&mut log, &format!("compile pass: {built} coded librar{} in {:.1} s",
+                                   if built == 1 { "y" } else { "ies" },
+                                   t0.elapsed().as_secs_f64()));
+        } else if coded::ended_clean(&out, &compile_log) {
+            // The solver ended normally with nothing built: no coded entry is
+            // active in this step (an active one that fails to build stops
+            // the solver). Nothing to send out, the run can go on.
+            say(&mut log, &format!("compile pass: nothing to compile, the solver ended \
+                                    normally ({:.1} s)", t0.elapsed().as_secs_f64()));
+        } else {
+            return fail(&mut st, &mut log, &format!(
+                "compile pass built no library ({}); log.foamdist-compile:\n{log_tail}",
+                out.trim()));
+        }
+    }
+
     // 3. distribute: each remote machine gets the case skeleton and ONLY its
     //    pieces (OpenMPI fills the hosts in hostfile order: --map-by slot).
     st.set("phase", "distribute");
@@ -618,6 +670,10 @@ fn run(o: RunOpts) -> ExitCode {
                 "mkdir -p {r} && rm -rf {r}/processor*", r = sh_quote(&remote))))?;
             let mut src: Vec<String> = vec!["system".into(), "constant".into(),
                                             "foamdist-agent.sh".into()];
+            // Coded libraries built by the compile pass (coded.rs).
+            if case.join("dynamicCode").is_dir() {
+                src.push("dynamicCode".into());
+            }
             for r in h.first_rank..h.first_rank + h.slots {
                 src.push(format!("processor{r}"));
             }
