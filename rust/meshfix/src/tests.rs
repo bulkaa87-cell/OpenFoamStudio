@@ -924,3 +924,174 @@ fn open_wall_end_gets_a_strip() {
     }
 }
 
+
+// ---- contacts in any plane (planar::overlay_contacts) --------------------
+
+fn cuboid(lo: Vec3, hi: Vec3) -> Mesh {
+    let mut m = cube(1.0, [0.0; 3]);
+    for p in &mut m.vertices {
+        for k in 0..3 {
+            p[k] = lo[k] + p[k] * (hi[k] - lo[k]);
+        }
+    }
+    m
+}
+
+/// Turn all vertices by az about z, then by ax about x (degrees).
+fn rotate(m: &mut Mesh, az: f64, ax: f64) {
+    let (a, b) = (az.to_radians(), ax.to_radians());
+    for p in &mut m.vertices {
+        let q = [p[0] * a.cos() - p[1] * a.sin(), p[0] * a.sin() + p[1] * a.cos(), p[2]];
+        *p = [q[0], q[1] * b.cos() - q[2] * b.sin(), q[1] * b.sin() + q[2] * b.cos()];
+    }
+}
+
+#[test]
+fn contact_overlay_tilted_glued_boxes() {
+    // Box b sits on box a with a gap of 2e-5 and hangs over one side. All
+    // turned, so that the contact is not in an axis plane.
+    let a = cuboid([0.0; 3], [10.0; 3]);
+    let b = cuboid([2.0, 3.0, 10.0 + 2e-5], [8.0, 12.0, 15.0]);
+    let mut m = join(&a, &b);
+    rotate(&mut m, 30.0, 20.0);
+    let r = planar::overlay_contacts(&mut m);
+    assert!(r.changed >= 1, "{r:?}");
+    let i = mesh_info(&m);
+    assert_eq!(m.defect_edges(), 0, "{i:?} {r:?}");
+    assert!(i.is_oriented(), "{i:?}");
+    assert_eq!(i.shells, 1, "{i:?}");
+    let v = volume(&m);
+    assert!((v - 1270.0).abs() < 1e-2, "volume {v}");
+}
+
+/// Closed box with an n x n grid on the top and the bottom, walls in strips.
+/// The grid diagonals go one way when `flip` is false, the other way else.
+fn grid_box(lo: Vec3, hi: Vec3, n: usize, flip: bool) -> Mesh {
+    let mut v = Vec::new();
+    for z in [lo[2], hi[2]] {
+        for j in 0..=n {
+            for i in 0..=n {
+                v.push([lo[0] + (hi[0] - lo[0]) * i as f64 / n as f64, lo[1] + (hi[1] - lo[1]) * j as f64 / n as f64, z]);
+            }
+        }
+    }
+    let id = |l: usize, i: usize, j: usize| (l * (n + 1) * (n + 1) + j * (n + 1) + i) as u32;
+    let mut t = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let q = [id(1, i, j), id(1, i + 1, j), id(1, i + 1, j + 1), id(1, i, j + 1)];
+            let tr = if flip { [[q[0], q[1], q[3]], [q[1], q[2], q[3]]] } else { [[q[0], q[1], q[2]], [q[0], q[2], q[3]]] };
+            for f in tr {
+                t.push(f); // top: normal +z
+                t.push([f[0] - id(1, 0, 0), f[2] - id(1, 0, 0), f[1] - id(1, 0, 0)]); // bottom: -z
+            }
+        }
+    }
+    // Ring of the grid boundary, counterclockwise seen from +z.
+    let mut ring = Vec::new();
+    for i in 0..n {
+        ring.push((i, 0));
+    }
+    for j in 0..n {
+        ring.push((n, j));
+    }
+    for i in (1..=n).rev() {
+        ring.push((i, n));
+    }
+    for j in (1..=n).rev() {
+        ring.push((0, j));
+    }
+    for k in 0..ring.len() {
+        let (a, b) = (ring[k], ring[(k + 1) % ring.len()]);
+        let (b0, b1, t0, t1) = (id(0, a.0, a.1), id(0, b.0, b.1), id(1, a.0, a.1), id(1, b.0, b.1));
+        t.push([b0, b1, t1]);
+        t.push([b0, t1, t0]);
+    }
+    Mesh::new(v, t)
+}
+
+#[test]
+fn contact_overlay_fine_caps_with_noise() {
+    // Two grid boxes glued on caps with other grids, b turned by 0.3 deg in
+    // the plane, its bottom vertices moved by up to 3e-5 off the plane, and
+    // all turned out of the axis planes. After the overlay and the winding
+    // Wrap the result is one closed body with the volume of both.
+    let a = grid_box([0.0; 3], [10.0; 3], 7, false);
+    let mut b = grid_box([2.0, 3.0, 10.0], [8.0, 12.0, 15.0], 5, true);
+    let (s, c) = (0.3f64.to_radians().sin(), 0.3f64.to_radians().cos());
+    let mut h = 7u64;
+    for p in &mut b.vertices {
+        let q = [p[0] - 5.0, p[1] - 7.5];
+        *p = [5.0 + q[0] * c - q[1] * s, 7.5 + q[0] * s + q[1] * c, p[2]];
+        if p[2] == 10.0 {
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            p[2] += 3e-5 * ((h >> 11) as f64 / (1u64 << 53) as f64);
+        }
+    }
+    let mut m = join(&a, &b);
+    rotate(&mut m, 25.0, 35.0);
+    let mut o = m.clone();
+    let r = planar::overlay_contacts(&mut o);
+    assert!(r.changed >= 1, "{r:?}");
+    if o.defect_edges() > 0 {
+        for (&(x, y), fs) in &o.edge_faces() {
+            if fs.len() != 2 {
+                println!("edge {x}-{y} {:?} {:?}", o.vertices[x as usize], o.vertices[y as usize]);
+                for &f in fs {
+                    println!("   face {f} {:?} {:?}", o.triangles[f as usize], o.tri_pos(f as usize));
+                }
+            }
+        }
+    }
+    assert_eq!(o.defect_edges(), 0, "{:?} {r:?}", mesh_info(&o));
+    let (_, rep) = wrap_winding(&mut m);
+    assert!(!rep.panicked);
+    let i = mesh_info(&m);
+    assert!(i.is_closed() && i.is_oriented(), "{i:?}");
+    assert_eq!(i.shells, 1, "{i:?}");
+    let v = volume(&m);
+    assert!((v - 1270.0).abs() < 0.05, "volume {v}");
+}
+
+#[test]
+fn flap_on_an_edge_goes() {
+    // A closed cube with one more face on its edge 0-1 (a flap): the flap
+    // goes, the cube stays closed.
+    let mut m = cube(10.0, [0.0; 3]);
+    m.vertices.push([5.0, -5.0, -5.0]);
+    m.triangles.push([0, 1, 8]);
+    assert!(m.defect_edges() > 0);
+    assert_eq!(remove_flaps(&mut m), 1);
+    assert_eq!(m.defect_edges(), 0);
+    assert_eq!(m.triangles.len(), 12);
+}
+
+#[test]
+fn seams_are_cut_out_and_filled() {
+    // A box with a grid of 6 x 6 on the top: two top faces in the middle
+    // go (a hole), and a flap hangs on one rim edge. The cut out and fill
+    // closes it with the same volume.
+    let mut m = grid_box([0.0; 3], [10.0; 3], 6, false);
+    let mid: Vec<usize> = (0..m.triangles.len())
+        .filter(|&f| {
+            let [a, b, c] = m.tri_pos(f);
+            let g = scale(add(add(a, b), c), 1.0 / 3.0);
+            g[2] == 10.0 && g[0] > 5.0 - 1e-9 && g[0] < 5.0 + 10.0 / 6.0 && g[1] > 5.0 - 1e-9 && g[1] < 5.0 + 10.0 / 6.0
+        })
+        .collect();
+    assert_eq!(mid.len(), 2);
+    let keep: Vec<bool> = (0..m.triangles.len()).map(|f| !mid.contains(&f)).collect();
+    m.retain_faces(&keep);
+    let (a, b) = {
+        let p = |x: Vec3| m.vertices.iter().position(|v| *v == x).unwrap() as u32;
+        (p([5.0, 5.0, 10.0]), p([5.0 + 10.0 / 6.0, 5.0, 10.0]))
+    };
+    m.vertices.push([6.0, 4.0, 14.0]);
+    let c = (m.vertices.len() - 1) as u32;
+    m.triangles.push([a, b, c]);
+    assert!(m.defect_edges() > 0);
+    excise_seams_for_test(&mut m);
+    let i = mesh_info(&m);
+    assert!(i.is_closed() && i.is_oriented(), "{i:?}");
+    assert!((volume(&m) - 1000.0).abs() < 1e-6, "volume {}", volume(&m));
+}

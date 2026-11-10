@@ -5,7 +5,7 @@
 use crate::math::*;
 use crate::mesh::*;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 // ---- Stitch ------------------------------------------------------------
 
@@ -436,7 +436,7 @@ pub fn close_all_holes_checked(mesh: &mut Mesh) -> usize {
     let base_nf = mesh.triangles.len();
     let base_nv = mesh.vertices.len();
     let mut choice = vec![0usize; loops.len()];
-    for _ in 0..3 {
+    for _ in 0..4 {
         mesh.triangles.truncate(base_nf);
         mesh.vertices.truncate(base_nv);
         let mut owner: Vec<usize> = Vec::new();
@@ -475,6 +475,16 @@ pub fn close_all_holes_checked(mesh: &mut Mesh) -> usize {
             }
         }
         if !changed {
+            // A fill that crosses with each triangulation is not used: the
+            // hole stays for the steps after this one.
+            if bad.iter().any(|&b| b) && std::env::var_os("MESHFIX_KEEP_BAD_FILL").is_none() {
+                let mut i = 0;
+                mesh.triangles.retain(|_| {
+                    let k = i < base_nf || !bad[owner[i - base_nf]];
+                    i += 1;
+                    k
+                });
+            }
             break;
         }
     }
@@ -534,6 +544,13 @@ pub fn wrap_winding(mesh: &mut Mesh) -> (usize, crate::arrange::ArrangeReport) {
         if std::env::var_os("MESHFIX_TIMING").is_some() {
             eprintln!("winding planar {pr:?}\n  before {i0:?}\n  after {:?}", crate::mesh_info(mesh));
         }
+        // Contacts in other planes (any orientation).
+        if std::env::var_os("MESHFIX_NO_CONTACT").is_none() {
+            let cr = crate::planar::overlay_contacts(mesh);
+            if std::env::var_os("MESHFIX_TIMING").is_some() {
+                eprintln!("winding contacts {cr:?}\n  after {:?}", crate::mesh_info(mesh));
+            }
+        }
     }
     crate::union::dbg_time("winding planar", t);
     if let Some(p) = std::env::var_os("MESHFIX_DUMP_PLANAR") {
@@ -544,6 +561,137 @@ pub fn wrap_winding(mesh: &mut Mesh) -> (usize, crate::arrange::ArrangeReport) {
     if let Some(p) = std::env::var_os("MESHFIX_DUMP_UNION") {
         let _ = mesh.write_obj(std::path::Path::new(&p));
     }
+    winding_post(mesh);
+    if let Some(p) = std::env::var_os("MESHFIX_DUMP_WRAP") {
+        let _ = mesh.write_obj(std::path::Path::new(&p));
+    }
+    if std::env::var_os("MESHFIX_TIMING").is_some() {
+        eprintln!("winding report {rep:?}");
+        eprintln!("winding after {:?}", crate::mesh_info(mesh));
+    }
+    (rep.removed_patches, rep)
+}
+
+#[cfg(test)]
+pub(crate) fn excise_seams_for_test(mesh: &mut Mesh) {
+    excise_seams(mesh)
+}
+
+/// Cut out and fill the seams (open and non-manifold edges), with 1 to 4
+/// vertex rings around them. Each pass is kept only when it gives fewer
+/// open + non-manifold edges.
+fn excise_seams(mesh: &mut Mesh) {
+    for rings in 1..=4 {
+        let d0 = mesh.defect_edges();
+        if d0 == 0 {
+            break;
+        }
+        let seed: Vec<Vec3> = defect_groups(mesh).concat();
+        let before = mesh.clone();
+        excise_and_fill(mesh, rings, &seed);
+        let d1 = mesh.defect_edges();
+        if std::env::var_os("MESHFIX_TIMING").is_some() {
+            eprintln!("winding excise {} vertices, {rings} rings: defects {d0} -> {d1}", seed.len());
+        }
+        if d1 >= d0 {
+            *mesh = before;
+        }
+    }
+}
+
+/// Groups of the vertices on open and non-manifold edges (joined by such
+/// edges). Positions, so that the groups stay valid when ids change.
+pub fn defect_groups(mesh: &Mesh) -> Vec<Vec<Vec3>> {
+    let ef = mesh.edge_faces();
+    let mut par: HashMap<u32, u32> = HashMap::new();
+    fn root(par: &mut HashMap<u32, u32>, mut x: u32) -> u32 {
+        while let Some(&p) = par.get(&x) {
+            if p == x {
+                break;
+            }
+            x = p;
+        }
+        x
+    }
+    let mut edges: Vec<EdgeKey> = ef.iter().filter(|(_, fs)| fs.len() != 2).map(|(&e, _)| e).collect();
+    edges.sort_unstable();
+    for &(a, b) in &edges {
+        par.entry(a).or_insert(a);
+        par.entry(b).or_insert(b);
+        let (ra, rb) = (root(&mut par, a), root(&mut par, b));
+        if ra != rb {
+            par.insert(ra.max(rb), ra.min(rb));
+        }
+    }
+    let mut groups: HashMap<u32, Vec<Vec3>> = HashMap::new();
+    let mut keys: Vec<u32> = par.keys().copied().collect();
+    keys.sort_unstable();
+    for v in keys {
+        let r = root(&mut par, v);
+        groups.entry(r).or_default().push(mesh.vertices[v as usize]);
+    }
+    let mut out: Vec<(u32, Vec<Vec3>)> = groups.into_iter().collect();
+    out.sort_by_key(|x| x.0);
+    out.into_iter().map(|x| x.1).collect()
+}
+
+/// Remove the faces within `rings` vertex rings of the vertices at the
+/// positions `seed`, then split, remove flaps and fill the holes.
+pub fn excise_and_fill(mesh: &mut Mesh, rings: usize, seed: &[Vec3]) {
+    let want: HashSet<[u64; 3]> = seed.iter().map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]).collect();
+    let mut mark: Vec<bool> = mesh.vertices.iter().map(|p| want.contains(&[p[0].to_bits(), p[1].to_bits(), p[2].to_bits()])).collect();
+    let mut drop = vec![false; mesh.triangles.len()];
+    for _ in 0..rings {
+        for (f, t) in mesh.triangles.iter().enumerate() {
+            if t.iter().any(|&x| mark[x as usize]) {
+                drop[f] = true;
+            }
+        }
+        for (f, t) in mesh.triangles.iter().enumerate() {
+            if drop[f] {
+                for &x in t {
+                    mark[x as usize] = true;
+                }
+            }
+        }
+    }
+    let keep: Vec<bool> = drop.iter().map(|&d| !d).collect();
+    mesh.retain_faces(&keep);
+    split_nonmanifold(mesh);
+    remove_flaps(mesh);
+    close_all_holes_checked(mesh);
+    split_nonmanifold(mesh);
+}
+
+/// Remove flaps: faces with two open edges whose third edge has more than
+/// two faces (a piece of a sheet that hangs on a seam). Repeats while it
+/// finds some. Returns the number of faces removed.
+pub fn remove_flaps(mesh: &mut Mesh) -> usize {
+    let mut total = 0;
+    for _ in 0..8 {
+        let ef = mesh.edge_faces();
+        let keep: Vec<bool> = mesh
+            .triangles
+            .iter()
+            .map(|t| {
+                let n: Vec<usize> = (0..3).map(|i| ef[&ekey(t[i], t[(i + 1) % 3])].len()).collect();
+                !(n.iter().filter(|&&c| c == 1).count() == 2 && n.iter().any(|&c| c > 2))
+            })
+            .collect();
+        let n = keep.iter().filter(|&&k| !k).count();
+        if n == 0 {
+            break;
+        }
+        mesh.retain_faces(&keep);
+        total += n;
+    }
+    total
+}
+
+/// The steps after the winding union: voids, seams (split, fill, seal,
+/// cut out and fill), inverted parts, nested shells.
+pub fn winding_post(mesh: &mut Mesh) {
+    let t0 = std::time::Instant::now();
     // A closed shell with a negative volume is a void inside the body. The
     // Windows Wrap fills such voids; so does this step.
     let voids = remove_voids(mesh);
@@ -573,6 +721,7 @@ pub fn wrap_winding(mesh: &mut Mesh) -> (usize, crate::arrange::ArrangeReport) {
                     }
                 }
                 2 => {
+                    remove_flaps(mesh);
                     close_all_holes_checked(mesh);
                 }
                 _ => {
@@ -587,10 +736,16 @@ pub fn wrap_winding(mesh: &mut Mesh) -> (usize, crate::arrange::ArrangeReport) {
             if std::env::var_os("MESHFIX_TIMING").is_some() {
                 eprintln!("winding post {k}: {:?}", crate::mesh_info(mesh));
             }
+            crate::union::dbg_time("winding post step", t0);
         }
-        // Seams that the steps above cannot close: the seal of the stitch
-        // approach (split by turn order, orient, bridge, weld, fill). It is
-        // kept only when it gives fewer open + non-manifold edges.
+        // Seams that the steps above cannot close. First: cut out the faces
+        // near all of them (1 to 4 rings) and fill again; the hole fill does
+        // not keep a fill that crosses a face. Kept only with fewer open +
+        // non-manifold edges. Then, if seams are left, the seal of the
+        // stitch approach (split by turn order, orient, bridge, weld, fill)
+        // and the cut out again.
+        excise_seams(mesh);
+        crate::union::dbg_time("winding excise", t0);
         if mesh.defect_edges() > 0 && std::env::var_os("MESHFIX_NO_SEAL").is_none() {
             let before = mesh.clone();
             let d0 = mesh.defect_edges();
@@ -601,15 +756,16 @@ pub fn wrap_winding(mesh: &mut Mesh) -> (usize, crate::arrange::ArrangeReport) {
             if std::env::var_os("MESHFIX_TIMING").is_some() {
                 eprintln!("winding seal {r:?}: {:?}", crate::mesh_info(mesh));
             }
+            excise_seams(mesh);
         }
+
         remove_voids(mesh);
         remove_inverted_parts(mesh, 1e-3);
+        // A closed shell inside another one (a pocket between bodies that
+        // the overlay of contacts closed) goes, as in the Windows Wrap.
+        remove_nested_with(mesh, true);
     }
-    if std::env::var_os("MESHFIX_TIMING").is_some() {
-        eprintln!("winding report {rep:?}");
-        eprintln!("winding after {:?}", crate::mesh_info(mesh));
-    }
-    (rep.removed_patches, rep)
+    crate::union::dbg_time("winding post done", t0);
 }
 
 /// Crossing face pairs in `after` with at least one face that is not in
@@ -752,6 +908,13 @@ fn orient_shells(mesh: &mut Mesh) {
 
 /// Remove each closed shell that is fully inside another closed shell.
 fn remove_nested(mesh: &mut Mesh) -> usize {
+    remove_nested_with(mesh, false)
+}
+
+/// remove_nested. With `mostly`, a small closed shell (volume below 1e-4 of
+/// the other shell) with 3/4 of its samples inside also goes: a small body
+/// that was not joined and sticks out of the surface by a sliver.
+fn remove_nested_with(mesh: &mut Mesh, mostly: bool) -> usize {
     let ef = mesh.edge_faces();
     let shells = components(mesh, &ef);
     let closed: Vec<bool> = shells.iter().map(|s| shell_closed(mesh, &ef, s)).collect();
@@ -780,7 +943,9 @@ fn remove_nested(mesh: &mut Mesh) -> usize {
             }
             // Winding number of shell j (fast tree sum): 1 inside, 0 outside.
             let fwn = trees.entry(j).or_insert_with(|| crate::union::Fwn::new(mesh, &shells[j]));
-            if pts.iter().all(|&p| fwn.eval(p, None) > 0.5) {
+            let inside = pts.iter().filter(|&&p| fwn.eval(p, None) > 0.5).count();
+            let small = || shell_volume(mesh, &shells[i]).abs() < 1e-4 * shell_volume(mesh, &shells[j]).abs();
+            if inside == pts.len() || (mostly && inside * 4 >= pts.len() * 3 && small()) {
                 drop[i] = true;
                 break;
             }
@@ -1269,7 +1434,7 @@ pub fn prepare_for_export(mesh: &mut Mesh, tol: f64) -> usize {
     // to the midpoint or to an end), then the last cleanup below.
     n += remove_zero_area_with(mesh, wrap_mode_winding());
     if wrap_mode_winding() {
-        n += remove_zero_area_final(mesh) + remove_inverted_parts(mesh, 1e-3);
+        n += remove_zero_area_final(mesh) + remove_micro_clusters(mesh) + remove_inverted_parts(mesh, 1e-3);
     }
     n
 }
@@ -1438,6 +1603,251 @@ fn collapse_keeps_normals_lim(mesh: &Mesh, vf: &VertexFaces, a: u32, b: u32, to:
 
 /// Zero-area limit of the program's «Вироджені» counter (fs_geometry.diagnose):
 /// area < max(mean area * 1e-10, 1e-24).
+/// Faces of zero area that the collapses above cannot remove: a small
+/// cluster of them at a corner where several surfaces meet. All vertices of
+/// such a cluster (joined by zero-area faces) go to the vertex with the
+/// most faces. Kept only when it gives no more open + non-manifold edges
+/// and no new crossing: first all clusters at once, else each alone.
+/// Returns the number of clusters removed.
+/// Move the vertices `g` to the vertex `r` (faces of zero area go), and keep
+/// it only when the edges around do not get more open or non-manifold edges
+/// and no moved face crosses a face. Local checks only.
+fn try_collapse(mesh: &mut Mesh, g: &[u32], r: u32) -> bool {
+    let gs: HashSet<u32> = g.iter().copied().collect();
+    let fs: Vec<usize> = (0..mesh.triangles.len()).filter(|&f| mesh.triangles[f].iter().any(|x| gs.contains(x))).collect();
+    let old: Vec<[u32; 3]> = fs.iter().map(|&f| mesh.triangles[f]).collect();
+    let bad_edges = |m: &Mesh, keep: &dyn Fn(u32) -> bool| {
+        let mut cnt: HashMap<EdgeKey, u32> = HashMap::new();
+        for &f in &fs {
+            let t = m.triangles[f];
+            if t[0] == t[1] || t[1] == t[2] || t[2] == t[0] {
+                continue;
+            }
+            for i in 0..3 {
+                let e = ekey(t[i], t[(i + 1) % 3]);
+                if keep(e.0) || keep(e.1) {
+                    *cnt.entry(e).or_default() += 1;
+                }
+            }
+        }
+        cnt.values().filter(|&&c| c != 2).count()
+    };
+    let d0 = bad_edges(mesh, &|x| gs.contains(&x));
+    for &f in &fs {
+        for x in mesh.triangles[f].iter_mut() {
+            if gs.contains(x) {
+                *x = r;
+            }
+        }
+    }
+    let d1 = bad_edges(mesh, &|x| x == r);
+    let mut good = d1 <= d0;
+    if good {
+        // Crossings of the moved faces with the faces near them.
+        let act: Vec<usize> = fs
+            .iter()
+            .zip(&old)
+            .filter(|&(&f, o)| {
+                let t = mesh.triangles[f];
+                t != *o && t[0] != t[1] && t[1] != t[2] && t[2] != t[0]
+            })
+            .map(|(&f, _)| f)
+            .collect();
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for &f in &act {
+            for p in mesh.tri_pos(f) {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+        let is_act: HashSet<usize> = act.iter().copied().collect();
+        let mut sub_f: Vec<usize> = act.clone();
+        for f in 0..mesh.triangles.len() {
+            if is_act.contains(&f) || fs.binary_search(&f).is_ok() {
+                continue;
+            }
+            let p = mesh.tri_pos(f);
+            let out = (0..3).any(|k| p.iter().all(|q| q[k] < lo[k]) || p.iter().all(|q| q[k] > hi[k]));
+            if !out {
+                sub_f.push(f);
+            }
+        }
+        let mut vid: HashMap<u32, u32> = HashMap::new();
+        let mut sv: Vec<Vec3> = Vec::new();
+        let mut st: Vec<[u32; 3]> = Vec::new();
+        for &f in &sub_f {
+            let t = mesh.triangles[f].map(|x| {
+                *vid.entry(x).or_insert_with(|| {
+                    sv.push(mesh.vertices[x as usize]);
+                    (sv.len() - 1) as u32
+                })
+            });
+            st.push(t);
+        }
+        let sub = Mesh::new(sv, st);
+        let mask: Vec<bool> = (0..sub_f.len()).map(|i| i < act.len()).collect();
+        good = crate::alphawrap::crossing_pairs_opt(&sub, Some(&mask), false).is_empty();
+    }
+    if std::env::var_os("MESHFIX_TIMING").is_some() {
+        eprintln!("micro cluster {} vertices, rep {r}: bad edges {d0} -> {d1}, kept {good}", g.len());
+    }
+    if good {
+        mesh.drop_collapsed();
+    } else {
+        for (&f, t) in fs.iter().zip(old) {
+            mesh.triangles[f] = t;
+        }
+    }
+    good
+}
+
+pub fn remove_micro_clusters(mesh: &mut Mesh) -> usize {
+    let limit = zero_area_limit(mesh);
+    let bad: Vec<usize> = (0..mesh.triangles.len())
+        .filter(|&f| {
+            let [a, b, c] = mesh.tri_pos(f);
+            tri_area(a, b, c) < limit
+        })
+        .collect();
+    if bad.is_empty() {
+        return 0;
+    }
+    let nv = mesh.vertices.len();
+    let mut par: Vec<u32> = (0..nv as u32).collect();
+    fn root(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x {
+            p[x as usize] = p[p[x as usize] as usize];
+            x = p[x as usize];
+        }
+        x
+    }
+    let mut inb = vec![false; nv];
+    for &f in &bad {
+        let t = mesh.triangles[f];
+        for &x in &t {
+            inb[x as usize] = true;
+        }
+        for k in 1..3 {
+            let (a, b) = (root(&mut par, t[0]), root(&mut par, t[k]));
+            if a != b {
+                par[a.max(b) as usize] = a.min(b);
+            }
+        }
+    }
+    let mut valence = vec![0u32; nv];
+    for t in &mesh.triangles {
+        for &x in t {
+            valence[x as usize] += 1;
+        }
+    }
+    let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+    for v in 0..nv as u32 {
+        if inb[v as usize] {
+            let r = root(&mut par, v);
+            groups.entry(r).or_default().push(v);
+        }
+    }
+    let mut groups: Vec<Vec<u32>> = groups.into_values().collect();
+    groups.sort_by_key(|g| g[0]);
+    let best = |g: &Vec<u32>| *g.iter().max_by_key(|&&v| (valence[v as usize], std::cmp::Reverse(v))).unwrap();
+    let apply = |mesh: &mut Mesh, gs: &[(Vec<u32>, u32)]| {
+        let mut remap: Vec<u32> = (0..mesh.vertices.len() as u32).collect();
+        for (g, r) in gs {
+            let r = *r;
+            for &v in g {
+                remap[v as usize] = r;
+            }
+        }
+        for t in &mut mesh.triangles {
+            for x in t.iter_mut() {
+                *x = remap[*x as usize];
+            }
+        }
+        mesh.drop_collapsed();
+    };
+    let ok = |before: &Mesh, after: &Mesh| after.defect_edges() <= before.defect_edges() && new_crossings(before, after) == 0;
+    let before = mesh.clone();
+    let all: Vec<(Vec<u32>, u32)> = groups.iter().map(|g| (g.clone(), best(g))).collect();
+    apply(mesh, &all);
+    let mut n = groups.len();
+    if !ok(&before, mesh) {
+        *mesh = before;
+        n = 0;
+        // Each cluster alone; the vertex with the most faces first, then
+        // the other vertices of the cluster.
+        for g in &groups {
+            let b0 = best(g);
+            let mut tries: Vec<(Vec<u32>, u32)> = vec![(g.clone(), b0)];
+            tries.extend(g.iter().copied().filter(|&v| v != b0).take(7).map(|r| (g.clone(), r)));
+            // Then one edge of the group at a time, to each end.
+            for i in 0..g.len().min(8) {
+                for j in i + 1..g.len().min(8) {
+                    tries.push((vec![g[i], g[j]], g[i]));
+                    tries.push((vec![g[i], g[j]], g[j]));
+                }
+            }
+            for (g, r) in tries {
+                if try_collapse(mesh, &g, r) {
+                    n += 1;
+                    break;
+                }
+            }
+        }
+    }
+    // Clusters that no collapse can remove: cut out 1 to 3 rings around
+    // them and fill the hole again.
+    let tiny_pos: Vec<Vec<Vec3>> = groups
+        .iter()
+        .filter(|g| g.iter().all(|&v| (v as usize) < mesh.vertices.len()))
+        .map(|g| g.iter().map(|&v| mesh.vertices[v as usize]).collect())
+        .collect();
+    let count_tiny = |m: &Mesh| {
+        let l = zero_area_limit(m);
+        (0..m.triangles.len())
+            .filter(|&f| {
+                let [a, b, c] = m.tri_pos(f);
+                tri_area(a, b, c) < l
+            })
+            .count()
+    };
+    for pos in tiny_pos {
+        let t0 = count_tiny(mesh);
+        if t0 == 0 {
+            break;
+        }
+        let want: HashSet<[u64; 3]> = pos.iter().map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]).collect();
+        // Still a vertex of a tiny face?
+        let l = zero_area_limit(mesh);
+        let still = (0..mesh.triangles.len()).any(|f| {
+            let [a, b, c] = mesh.tri_pos(f);
+            tri_area(a, b, c) < l && [a, b, c].iter().any(|p| want.contains(&[p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]))
+        });
+        if !still {
+            continue;
+        }
+        for rings in 1..=3 {
+            let b = mesh.clone();
+            excise_and_fill(mesh, rings, &pos);
+            let good = ok(&b, mesh) && count_tiny(mesh) < t0;
+            if std::env::var_os("MESHFIX_TIMING").is_some() {
+                eprintln!("micro cluster at {:?}: cut out {rings} rings: {}", pos[0], if good { "kept" } else { "undone" });
+            }
+            if good {
+                n += 1;
+                break;
+            }
+            *mesh = b;
+        }
+    }
+    if n > 0 {
+        mesh.compact();
+    }
+    n
+}
+
 pub fn zero_area_limit(mesh: &Mesh) -> f64 {
     let n = mesh.triangles.len();
     if n == 0 {

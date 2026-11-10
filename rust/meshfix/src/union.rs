@@ -92,10 +92,21 @@ fn face_box(m: &Mesh, f: usize) -> (Vec3, Vec3) {
 /// Pairs of faces whose boxes overlap. Each pair comes one time: from the
 /// grid cell that holds the low corner of the box overlap.
 pub(crate) fn candidate_pairs(m: &Mesh, faces: &[u32]) -> Vec<(u32, u32)> {
+    candidate_pairs_pad(m, faces, 0.0)
+}
+
+/// candidate_pairs with each box made larger by `pad` on all sides.
+pub(crate) fn candidate_pairs_pad(m: &Mesh, faces: &[u32], pad: f64) -> Vec<(u32, u32)> {
     if faces.len() < 2 {
         return Vec::new();
     }
-    let boxes: Vec<(Vec3, Vec3)> = faces.iter().map(|&f| face_box(m, f as usize)).collect();
+    let boxes: Vec<(Vec3, Vec3)> = faces
+        .iter()
+        .map(|&f| {
+            let (lo, hi) = face_box(m, f as usize);
+            (sub(lo, [pad; 3]), add(hi, [pad; 3]))
+        })
+        .collect();
     let mut glo = [f64::INFINITY; 3];
     let mut ghi = [f64::NEG_INFINITY; 3];
     let mut mean = 0.0;
@@ -1089,6 +1100,7 @@ pub(crate) struct Fwn {
     nodes: Vec<FwnNode>,
     order: Vec<u32>,
     tri: Vec<[Vec3; 3]>,
+    beta: f64,
 }
 
 const FWN_LEAF: usize = 8;
@@ -1096,8 +1108,14 @@ const FWN_BETA: f64 = 3.0;
 
 impl Fwn {
     pub(crate) fn new(mesh: &Mesh, faces: &[u32]) -> Self {
+        Self::with_beta(mesh, faces, FWN_BETA)
+    }
+
+    /// The tree with another accuracy: a node is summed as one dipole when
+    /// the point is farther than `beta` times its radius.
+    pub(crate) fn with_beta(mesh: &Mesh, faces: &[u32], beta: f64) -> Self {
         let tri: Vec<[Vec3; 3]> = faces.iter().map(|&f| mesh.tri_pos(f as usize)).collect();
-        let mut s = Fwn { nodes: Vec::new(), order: (0..faces.len() as u32).collect(), tri };
+        let mut s = Fwn { nodes: Vec::new(), order: (0..faces.len() as u32).collect(), tri, beta };
         if !faces.is_empty() {
             let n = s.order.len();
             s.build(0, n);
@@ -1165,7 +1183,7 @@ impl Fwn {
             let d = sub(nd.c, p);
             let l = norm(d);
             let inside_box = (0..3).all(|k| p[k] >= nd.lo[k] && p[k] <= nd.hi[k]);
-            if !inside_box && l > FWN_BETA * nd.r {
+            if !inside_box && l > self.beta * nd.r {
                 w += dot(nd.n, d) / (l * l * l);
                 continue;
             }

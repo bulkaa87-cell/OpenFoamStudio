@@ -335,6 +335,14 @@ fn arrange(mesh: &mut Mesh) -> ArrangeReport {
     }
     let nv0 = mesh.vertices.len();
     let orig = mesh.vertices.clone();
+    // Faces of contacts that the overlay left (planar.rs): their pieces are
+    // not joined into one patch with the pieces of other faces.
+    let left = crate::planar::CONTACT_LEFT.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let contact_src: Vec<bool> = if left.is_empty() || std::env::var_os("MESHFIX_NO_LEFT").is_some() {
+        vec![false; nf]
+    } else {
+        (0..nf).map(|f| left.contains(&crate::planar::face_key(mesh, f))).collect()
+    };
     // Axis planes: a coordinate value that many vertices share (a symmetry
     // plane, a section cut between two parts). The small move keeps such a
     // coordinate, so that faces in that plane stay exactly coplanar: two
@@ -630,6 +638,9 @@ fn arrange(mesh: &mut Mesh) -> ArrangeReport {
         if leaky[src[f as usize] as usize] || leaky[src[g as usize] as usize] {
             continue;
         }
+        if contact_src[src[f as usize] as usize] != contact_src[src[g as usize] as usize] {
+            continue;
+        }
         if directed(&tris[f as usize], *a, *b) == directed(&tris[g as usize], *a, *b) {
             continue;
         }
@@ -665,7 +676,10 @@ fn arrange(mesh: &mut Mesh) -> ArrangeReport {
     // number of the bodies, and its walls go. MESHFIX_SIDE_EPS=0: no side
     // samples.
     let side_eps = std::env::var("MESHFIX_SIDE_EPS").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(SIDE_EPS);
-    let fwn = Fwn::new(&jm, &all);
+    // beta 2 (as in Barill et al. 2018): about half the time of beta 3 on
+    // delta, with the same labels in the bench.
+    let beta = std::env::var("MESHFIX_FWN_BETA").ok().and_then(|x| x.parse::<f64>().ok()).unwrap_or(ARRANGE_FWN_BETA);
+    let fwn = Fwn::with_beta(&jm, &all, beta);
     let src_unit: Vec<Option<Vec3>> = (0..nf)
         .map(|f| {
             let [a, b, c] = jm.tri_pos(f);
@@ -1062,6 +1076,8 @@ const SAMPLES: usize = 8;
 const SIDE_EPS: f64 = 2e-3;
 /// Side samples of a patch that is not clearly in or out.
 const EPS_SAMPLES: usize = 4;
+/// Accuracy of the winding number tree in the labels (see Fwn::with_beta).
+const ARRANGE_FWN_BETA: f64 = 2.0;
 /// Default weight of an open seam: cost per unit of edge length, in units
 /// of area (normalized model units).
 const LAMBDA: f64 = 1.0;
