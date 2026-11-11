@@ -1,0 +1,6 @@
+{
+ "архів обрізаний": "the archive is truncated",
+ "запис {name} виріс понад 4 ГБ": "entry {name} became larger than 4 GB",
+ "поганий заголовок запису {name}": "bad header of entry {name}",
+ "файл {path} змінився під час запису": "file {path} changed while it was written"
+}

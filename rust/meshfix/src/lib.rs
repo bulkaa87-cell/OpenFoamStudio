@@ -90,6 +90,40 @@ impl Stage {
     }
 }
 
+/// What `repair` does. The menu of the «Полагодити» button selects it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Method {
+    /// The 12 steps, then the fallbacks when the mesh is not clean.
+    #[default]
+    Pipeline,
+    /// Only the alpha wrap of the input (alphawrap.rs), no 12 steps. The
+    /// result is used when it has faces, also when it is not clean.
+    AlphaWrap,
+    /// The steps up to CloseAllHoles, then the volumetric remesh
+    /// (volume.rs). The result is used when it has faces and keeps more
+    /// than 30 % of the volume.
+    Volume,
+}
+
+impl Method {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "meshfix" | "pipeline" => Some(Method::Pipeline),
+            "alphawrap" => Some(Method::AlphaWrap),
+            "volume" => Some(Method::Volume),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Method::Pipeline => "meshfix",
+            Method::AlphaWrap => "alphawrap",
+            Method::Volume => "volume",
+        }
+    }
+}
+
 /// Tolerances in normalized units (the largest extent is 5..400 units,
 /// see `repair`). Black-box tests confirmed stitch and tiny-shell values.
 #[derive(Clone, Debug)]
@@ -114,6 +148,12 @@ pub struct RepairOptions {
     pub volume_fallback: bool,
     /// Stop after this step (for tests and diagnosis). None = all steps.
     pub stop_after: Option<Stage>,
+    /// Pipeline (default), or one forced method (see `Method`).
+    pub method: Method,
+    /// Cells of the volumetric remesh along the largest extent. None = the
+    /// default of `VolumeOptions` (2048). A small value is for tests: the
+    /// default grid on a compact model takes minutes.
+    pub volume_cells: Option<usize>,
 }
 
 impl Default for RepairOptions {
@@ -132,6 +172,8 @@ impl Default for RepairOptions {
             wrap_offset: None,
             volume_fallback: true,
             stop_after: None,
+            method: Method::Pipeline,
+            volume_cells: None,
         }
     }
 }
@@ -289,7 +331,18 @@ pub fn repair(
     mesh.compact();
     let before = mesh_info(mesh);
     let input_norm = mesh.clone();
-    let (mut out, union_rep, mut undone, pre_wrap) = pipeline(mesh, opts, &mut progress);
+    let forced = opts.method;
+    let (mut out, union_rep, mut undone, pre_wrap) = match forced {
+        Method::Pipeline => pipeline(mesh, opts, &mut progress),
+        // The wrap reads only the input: the 12 steps are not necessary.
+        Method::AlphaWrap => (Vec::new(), union::UnionReport::default(), Vec::new(), None),
+        // The remesh source is the mesh after CloseAllHoles, as for the
+        // fallback. The steps after it (the union) are not necessary.
+        Method::Volume => {
+            let o2 = RepairOptions { stop_after: Some(Stage::CloseAllHoles), volume_fallback: true, ..opts.clone() };
+            pipeline(mesh, &o2, &mut progress)
+        }
+    };
     let mut fallback = None;
     let mut wrap_rep = None;
     let mut vol_rep = None;
@@ -301,7 +354,12 @@ pub fn repair(
     // An empty result (a flat plate: Windows gives no triangles too) gets
     // no fallback.
     let run_fallbacks = run_fallbacks && !mesh.triangles.is_empty();
-    if run_fallbacks && opts.alpha_wrap && (opts.alpha_wrap_force || !is_clean(mesh)) {
+    let want_wrap = match forced {
+        Method::AlphaWrap => true,
+        Method::Volume => false,
+        Method::Pipeline => run_fallbacks && opts.alpha_wrap && (opts.alpha_wrap_force || !is_clean(mesh)),
+    };
+    if want_wrap && !mesh.triangles.is_empty() {
         let t0 = Instant::now();
         let wo = wrap_params(&input_norm, opts, s);
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| alphawrap::wrap(&input_norm, &wo))).ok();
@@ -310,7 +368,10 @@ pub fn repair(
         if let Some((w, r)) = res {
             if let Some(w) = w {
                 faces = w.triangles.len();
-                if fallback_ok(&w, &before) {
+                // A forced wrap is used also when it is not clean: the
+                // guard of fs_meshfix compares the counts with the input.
+                let ok = if forced == Method::AlphaWrap { faces > 0 } else { fallback_ok(&w, &before) };
+                if ok {
                     *mesh = w;
                     used = true;
                     fallback = Some(Stage::AlphaWrap);
@@ -325,9 +386,11 @@ pub fn repair(
         progress(Stage::AlphaWrap, faces);
     }
     let vol_mode = std::env::var("MESHFIX_VOL").unwrap_or_default();
-    let want_vol = match vol_mode.as_str() {
-        "0" | "off" => false,
-        "force" => true,
+    let want_vol = match (forced, vol_mode.as_str()) {
+        (Method::Volume, _) => true,
+        (Method::AlphaWrap, _) => false,
+        (_, "0" | "off") => false,
+        (_, "force") => true,
         _ => run_fallbacks && opts.volume_fallback && !is_clean(mesh),
     };
     if want_vol && !mesh.triangles.is_empty() {
@@ -342,7 +405,10 @@ pub fn repair(
             (_, Some(p)) => p,
             _ => &*mesh,
         };
-        let vo = volume::VolumeOptions::from_env();
+        let mut vo = volume::VolumeOptions::from_env();
+        if let Some(c) = opts.volume_cells {
+            vo.cells = c;
+        }
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| volume::remesh(src, &vo))).ok().flatten();
         let mut used = false;
         let mut faces = 0;
@@ -356,7 +422,8 @@ pub fn repair(
             let (v_new, v_src) = (signed_volume(&vm), signed_volume(src).abs());
             rep.volume_ratio = if v_src > 0.0 { v_new / v_src } else { 1.0 };
             faces = vm.triangles.len();
-            if fallback_ok(&vm, &before) && rep.volume_ratio > 0.3 {
+            let ok = if forced == Method::Volume { faces > 0 } else { fallback_ok(&vm, &before) };
+            if ok && rep.volume_ratio > 0.3 {
                 *mesh = vm;
                 used = true;
                 fallback = Some(Stage::VolumeRemesh);

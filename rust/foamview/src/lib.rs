@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroIsize;
 
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use wgpu::util::DeviceExt;
@@ -27,6 +27,12 @@ mod cpu;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const ATLAS: u32 = 1024;
 const TRIAD_PX: u32 = 110;
+// Colours in the colour table of a layer (shaders.wgsl: LUT_N, Layer.lut).
+const LUT_N: usize = 256;
+// A value that is not a number goes to the GPU as this: the shader shows
+// the NaN colour for |s| > 1e30. (A NaN test in the shader is not safe:
+// some compilers remove `s != s`.)
+const NAN_MARK: f32 = 3.0e38;
 // Suffix of the layer that holds the shadow of a text layer.
 const SHADOW: &str = "\u{0}shadow";
 
@@ -45,6 +51,16 @@ struct Globals {
 struct LayerU {
     color: [f32; 4],
     params: [f32; 4],
+    // Scalar layers: low end, 1 / (high - low), colours in lut, 1 = viewport
+    // fractions (colour bar).
+    scal: [f32; 4],
+    nan: [f32; 4],
+    lut: [[f32; 4]; LUT_N],
+}
+
+/// The uniform of a layer without a field (one colour).
+fn lu(color: [f32; 4], params: [f32; 4]) -> LayerU {
+    LayerU { color, params, scal: [0.0, 1.0, 1.0, 0.0], nan: [0.0; 4], lut: [[0.0; 4]; LUT_N] }
 }
 
 #[repr(C)]
@@ -69,11 +85,62 @@ enum Geom {
     Tri { vbuf: wgpu::Buffer, ibuf: wgpu::Buffer, count: u32 },
     Seg { buf: wgpu::Buffer, count: u32 },
     Text { buf: wgpu::Buffer, count: u32 },
+    // Triangles coloured by a field (see STri).
+    STri(STri),
+    // Segments coloured by a field: one scalar at each end (sbuf: 2 floats
+    // per segment).
+    SSeg { buf: wgpu::Buffer, sbuf: wgpu::Buffer, count: u32 },
+}
+
+/// Triangles with a scalar per vertex.
+///  * Indexed — point data: shared vertices, one scalar per point. The index
+///    buffer is split into parts that fit the buffer limit.
+///  * Flat — cell data: three own vertices per triangle with the scalar of
+///    the triangle, in parts of whole triangles that fit the buffer limit.
+enum STri {
+    Indexed { vbuf: wgpu::Buffer, sbuf: wgpu::Buffer, nbuf: Option<wgpu::Buffer>,
+              parts: Vec<(wgpu::Buffer, u32)>, n_points: usize },
+    Flat { parts: Vec<FlatPart>, n_tris: usize },
+}
+
+struct FlatPart {
+    vbuf: wgpu::Buffer,
+    sbuf: wgpu::Buffer,
+    first: usize,         // first triangle of this part
+    tris: usize,
+}
+
+/// Values for the GPU: NaN and infinity become NAN_MARK.
+fn marked(v: impl Iterator<Item = f32>) -> Vec<f32> {
+    v.map(|x| if x.is_finite() { x } else { NAN_MARK }).collect()
+}
+
+/// The uniform of a layer with a field. lut: (K, 3|4) floats, K <= LUT_N.
+fn scalar_uniform(lut: &numpy::ndarray::ArrayView2<'_, f32>, clim: (f32, f32), opacity: f32,
+                  nan: (f32, f32, f32, f32), params: [f32; 4], screen: bool)
+                  -> PyResult<LayerU> {
+    let k = lut.nrows();
+    if k == 0 || k > LUT_N || !(lut.ncols() == 3 || lut.ncols() == 4) {
+        return Err(PyValueError::new_err(format!("lut (K,3|4), 1 <= K <= {LUT_N}")));
+    }
+    let mut table = [[0.0f32; 4]; LUT_N];
+    for (i, row) in lut.rows().into_iter().enumerate() {
+        table[i] = [row[0], row[1], row[2], if row.len() > 3 { row[3] } else { 1.0 }];
+    }
+    let span = clim.1 - clim.0;
+    let inv = if span.abs() > f32::MIN_POSITIVE && span.is_finite() { 1.0 / span } else { 0.0 };
+    let mut u = lu([1.0, 1.0, 1.0, opacity], params);
+    u.scal = [clim.0, inv, k as f32, if screen { 1.0 } else { 0.0 }];
+    u.nan = [nan.0, nan.1, nan.2, nan.3];
+    u.lut = table;
+    Ok(u)
 }
 
 struct Layer {
     geom: Geom,
     pass: Pass,
+    // The uniform as it is on the GPU: set_colormap changes a part of it.
+    u: Box<LayerU>,
     ubuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
     visible: bool,
@@ -107,6 +174,11 @@ struct Pipelines {
     line: wgpu::RenderPipeline,
     line_overlay: wgpu::RenderPipeline,
     text: wgpu::RenderPipeline,
+    s_opaque: wgpu::RenderPipeline,
+    s_overlay: wgpu::RenderPipeline,
+    s_transparent: wgpu::RenderPipeline,
+    s_line: wgpu::RenderPipeline,
+    s_line_overlay: wgpu::RenderPipeline,
 }
 
 struct Targets {
@@ -288,7 +360,9 @@ impl Renderer {
         let visible = self.layers.get(name).map_or(true, |l| l.visible);
         let (ubuf, bind) = self.layer_bind(u);
         self.counter += 1;
-        self.layers.insert(name.to_string(), Layer { geom, pass, ubuf, bind, visible, order: self.counter });
+        self.layers.insert(name.to_string(),
+                           Layer { geom, pass, u: Box::new(u), ubuf, bind, visible,
+                                   order: self.counter });
     }
 
     fn glyph(&mut self, c: char, px: u32) -> Option<GlyphInfo> {
@@ -334,7 +408,8 @@ impl Renderer {
         Some(g)
     }
 
-    fn layout_text(&mut self, anchor: [f32; 4], text: &str, px: u32, center: bool,
+    /// align: 0 = text starts at the anchor, 0.5 = centred, 1 = ends there.
+    fn layout_text(&mut self, anchor: [f32; 4], text: &str, px: u32, align: f32,
                    offset: (f32, f32)) -> Vec<Glyph> {
         let ascent = self.font.as_ref()
             .and_then(|f| f.horizontal_line_metrics(px as f32))
@@ -349,7 +424,7 @@ impl Renderer {
             let glyphs: Vec<(char, Option<GlyphInfo>)> =
                 line.chars().map(|c| (c, self.glyph(c, px))).collect();
             let width: f32 = glyphs.iter().map(|(_, g)| g.map_or(px as f32 * 0.5, |g| g.advance)).sum();
-            let mut pen = if center { -width / 2.0 } else { 0.0 } + offset.0;
+            let mut pen = -width * align + offset.0;
             let base = ascent + li as f32 * line_h + offset.1;
             for (_, g) in glyphs {
                 if let Some(g) = g {
@@ -367,6 +442,35 @@ impl Renderer {
             }
         }
         out
+    }
+
+    /// Scalars of segments as pairs (both ends): 2M values as they are, M
+    /// values (one per segment) twice.
+    fn pairs(sv: Vec<f32>, m: usize) -> PyResult<Vec<f32>> {
+        if sv.len() == 2 * m {
+            Ok(marked(sv.into_iter()))
+        } else if sv.len() == m {
+            Ok(marked(sv.into_iter().flat_map(|x| [x, x])))
+        } else {
+            Err(PyValueError::new_err(format!(
+                "scalars: {} (two per segment) or {m} values, not {}", 2 * m, sv.len())))
+        }
+    }
+
+    /// The largest buffer to make: the device limit, but not more than
+    /// 256 MiB (a big mesh goes in parts).
+    fn max_buffer(&self) -> u64 {
+        self.device.limits().max_buffer_size.clamp(1 << 16, 1 << 28)
+    }
+
+    fn vbuf(&self, label: &str, data: &[f32], dst: bool) -> wgpu::Buffer {
+        let mut usage = wgpu::BufferUsages::VERTEX;
+        if dst {
+            usage |= wgpu::BufferUsages::COPY_DST;
+        }
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data), usage,
+        })
     }
 
     fn check(&self) -> PyResult<()> {
@@ -520,22 +624,23 @@ impl Renderer {
                 label: Some("triad"), contents: bytemuck::cast_slice(&seg),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-            let (ubuf, bind) = self.layer_bind(LayerU { color: [c[0], c[1], c[2], 1.0],
-                                                        params: [0.0, 0.0, 3.0 * self.scale, 0.0] });
-            out.push(Layer { geom: Geom::Seg { buf, count: 1 }, pass: Pass::Line, ubuf, bind,
+            let (ubuf, bind) = self.layer_bind(lu([c[0], c[1], c[2], 1.0],
+                                                  [0.0, 0.0, 3.0 * self.scale, 0.0]));
+            let u = Box::new(lu([c[0], c[1], c[2], 1.0], [0.0, 0.0, 3.0 * self.scale, 0.0]));
+            out.push(Layer { geom: Geom::Seg { buf, count: 1 }, pass: Pass::Line, u, ubuf, bind,
                              visible: true, order: 0 });
             let px = (15.0 * self.scale).round() as u32;
             let glyphs = self.layout_text([d[0] * 0.95, d[1] * 0.95, d[2] * 0.95, 0.0], name, px,
-                                          true, (0.0, -8.0 * self.scale));
+                                          0.5, (0.0, -8.0 * self.scale));
             if !glyphs.is_empty() {
                 let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("triad text"), contents: bytemuck::cast_slice(&glyphs),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                let (ubuf, bind) = self.layer_bind(LayerU { color: [c[0], c[1], c[2], 1.0],
-                                                            params: [0.0; 4] });
+                let (ubuf, bind) = self.layer_bind(lu([c[0], c[1], c[2], 1.0], [0.0; 4]));
+                let u = Box::new(lu([c[0], c[1], c[2], 1.0], [0.0; 4]));
                 out.push(Layer { geom: Geom::Text { buf, count: glyphs.len() as u32 },
-                                 pass: Pass::Text, ubuf, bind, visible: true, order: 0 });
+                                 pass: Pass::Text, u, ubuf, bind, visible: true, order: 0 });
             }
         }
         self.triad = out;
@@ -563,6 +668,40 @@ fn draw_layer<'a>(rp: &mut wgpu::RenderPass<'a>, p: &'a Pipelines, l: &'a Layer)
         Geom::Text { buf, count } => {
             rp.set_pipeline(&p.text);
             rp.set_vertex_buffer(0, buf.slice(..));
+            rp.draw(0..6, 0..*count);
+        }
+        Geom::STri(st) => {
+            rp.set_pipeline(match l.pass {
+                Pass::Overlay => &p.s_overlay,
+                Pass::Transparent => &p.s_transparent,
+                _ => &p.s_opaque,
+            });
+            match st {
+                STri::Indexed { vbuf, sbuf, nbuf, parts, .. } => {
+                    rp.set_vertex_buffer(0, vbuf.slice(..));
+                    rp.set_vertex_buffer(1, sbuf.slice(..));
+                    // Without normals the slot gets the positions again
+                    // (the shader then uses the face normal).
+                    rp.set_vertex_buffer(2, nbuf.as_ref().unwrap_or(vbuf).slice(..));
+                    for (ibuf, count) in parts {
+                        rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..*count, 0, 0..1);
+                    }
+                }
+                STri::Flat { parts, .. } => {
+                    for part in parts {
+                        rp.set_vertex_buffer(0, part.vbuf.slice(..));
+                        rp.set_vertex_buffer(1, part.sbuf.slice(..));
+                        rp.set_vertex_buffer(2, part.vbuf.slice(..));
+                        rp.draw(0..(part.tris * 3) as u32, 0..1);
+                    }
+                }
+            }
+        }
+        Geom::SSeg { buf, sbuf, count } => {
+            rp.set_pipeline(if l.pass == Pass::LineOverlay { &p.s_line_overlay } else { &p.s_line });
+            rp.set_vertex_buffer(0, buf.slice(..));
+            rp.set_vertex_buffer(1, sbuf.slice(..));
             rp.draw(0..6, 0..*count);
         }
     }
@@ -760,8 +899,42 @@ impl Renderer {
             array_stride: 48, step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4],
         })];
+        let spos = [
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 12, step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 4, step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![1 => Float32],
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 12, step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![2 => Float32x3],
+            }),
+        ];
+        let sseg = [
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 24, step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 8, step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![2 => Float32x2],
+            }),
+        ];
         use wgpu::CompareFunction as C;
         let pipes = Pipelines {
+            s_opaque: pipeline(&device, &layout, &module, format, samples, "vs_scalar", "fs_scalar",
+                               &spos, false, true, C::Less, false),
+            s_overlay: pipeline(&device, &layout, &module, format, samples, "vs_scalar",
+                                "fs_scalar", &spos, true, true, C::LessEqual, true),
+            s_transparent: pipeline(&device, &layout, &module, format, samples, "vs_scalar",
+                                    "fs_scalar", &spos, true, false, C::Less, false),
+            s_line: pipeline(&device, &layout, &module, format, samples, "vs_sline", "fs_sline",
+                             &sseg, true, true, C::LessEqual, false),
+            s_line_overlay: pipeline(&device, &layout, &module, format, samples, "vs_sline",
+                                     "fs_sline", &sseg, true, true, C::LessEqual, true),
             bg: pipeline(&device, &layout, &module, format, samples, "vs_bg", "fs_bg", &[],
                          false, false, C::Always, false),
             opaque: pipeline(&device, &layout, &module, format, samples, "vs_surface", "fs_surface",
@@ -826,7 +999,7 @@ impl Renderer {
             font, bg: ([0.23, 0.25, 0.29, 1.0], [0.13, 0.15, 0.17, 1.0]), counter: 0, info,
         };
         r.configure();
-        r.default_bind = Some(r.layer_bind(LayerU { color: [0.0; 4], params: [0.0; 4] }));
+        r.default_bind = Some(r.layer_bind(lu([0.0; 4], [0.0; 4])));
         r.build_triad();
         Ok(r)
     }
@@ -914,8 +1087,7 @@ impl Renderer {
             _ => Pass::Opaque,
         };
         self.put(name, Geom::Tri { vbuf, ibuf, count: tv.len() as u32 }, pass,
-                 LayerU { color: rgba(color),
-                          params: [if lighting { 1.0 } else { 0.0 }, specular, 0.0, 0.0] });
+                 lu(rgba(color), [if lighting { 1.0 } else { 0.0 }, specular, 0.0, 0.0]));
         Ok(())
     }
 
@@ -937,27 +1109,30 @@ impl Renderer {
         });
         self.put(name, Geom::Seg { buf, count: s.nrows() as u32 },
                  if overlay { Pass::LineOverlay } else { Pass::Line },
-                 LayerU { color: rgba(color),
-                          params: [0.0, 0.0, (width * self.scale).max(1.0), 0.0] });
+                 lu(rgba(color), [0.0, 0.0, (width * self.scale).max(1.0), 0.0]));
         Ok(())
     }
 
     /// Text. anchors: world points, or pixels from the top-left (screen=True).
+    /// `viewport`: anchors are fractions of the viewport from the
+    /// bottom-left corner (as VTK viewport coordinates): they follow a resize.
     #[pyo3(signature = (name, anchors, texts, color, size=14, screen=false, center=false,
-                        offset=(0.0, 0.0)))]
+                        offset=(0.0, 0.0), viewport=false, right=false))]
     #[allow(clippy::too_many_arguments)]
     fn set_labels(&mut self, name: &str, anchors: Vec<(f32, f32, f32)>, texts: Vec<String>,
                   color: (f32, f32, f32, f32), size: u32, screen: bool, center: bool,
-                  offset: (f32, f32)) -> PyResult<()> {
+                  offset: (f32, f32), viewport: bool, right: bool) -> PyResult<()> {
         if anchors.len() != texts.len() {
             return Err(PyValueError::new_err("one text per anchor"));
         }
         let mut glyphs = Vec::new();
         for (a, t) in anchors.iter().zip(&texts) {
-            let anchor = [a.0, a.1, a.2, if screen { 1.0 } else { 0.0 }];
+            let kind = if viewport { 2.0 } else if screen { 1.0 } else { 0.0 };
+            let anchor = [a.0, a.1, a.2, kind];
             let px = ((size as f32) * self.scale).round().max(6.0) as u32;
             let off = (offset.0 * self.scale, offset.1 * self.scale);
-            glyphs.extend(self.layout_text(anchor, t, px, center, off));
+            let align = if center { 0.5 } else if right { 1.0 } else { 0.0 };
+            glyphs.extend(self.layout_text(anchor, t, px, align, off));
         }
         if glyphs.is_empty() {
             self.remove(name);
@@ -974,13 +1149,201 @@ impl Renderer {
         });
         let sname = format!("{name}{SHADOW}");
         self.put(&sname, Geom::Text { buf: sbuf, count: shadow.len() as u32 }, Pass::Text,
-                 LayerU { color: [0.0, 0.0, 0.0, 0.8 * color.3], params: [0.0; 4] });
+                 lu([0.0, 0.0, 0.0, 0.8 * color.3], [0.0; 4]));
         let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(name), contents: bytemuck::cast_slice(&glyphs),
             usage: wgpu::BufferUsages::VERTEX,
         });
         self.put(name, Geom::Text { buf, count: glyphs.len() as u32 }, Pass::Text,
-                 LayerU { color: rgba(color), params: [0.0; 4] });
+                 lu(rgba(color), [0.0; 4]));
+        Ok(())
+    }
+
+    /// Triangles coloured by a field (the «Результати» tab, animation).
+    /// points (N,3) f32, tris (M,3) u32; scalars f32: N values (point data)
+    /// or M values with cell=True (one per triangle). lut (K,3|4) colours,
+    /// K <= 256, spread evenly over clim (lo, hi) as in a VTK lookup table.
+    /// normals (N,3): smooth shading (point data only). screen: x, y of the
+    /// points are fractions of the viewport from the bottom-left corner,
+    /// drawn in front of the scene (a colour bar).
+    /// ambient: the light on a face seen edge-on, 0..1 (0 = 0.18, as plain
+    /// surfaces).
+    #[pyo3(signature = (name, points, tris, scalars, lut, clim, cell=false, normals=None,
+                        opacity=1.0, nan_color=(0.66, 0.66, 0.66, 1.0), mode="opaque",
+                        lighting=true, specular=0.0, screen=false, ambient=0.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn set_scalar_triangles(&mut self, name: &str, points: PyReadonlyArray2<'_, f32>,
+                            tris: PyReadonlyArray2<'_, u32>, scalars: PyReadonlyArray1<'_, f32>,
+                            lut: PyReadonlyArray2<'_, f32>, clim: (f32, f32), cell: bool,
+                            normals: Option<PyReadonlyArray2<'_, f32>>, opacity: f32,
+                            nan_color: (f32, f32, f32, f32), mode: &str, lighting: bool,
+                            specular: f32, screen: bool, ambient: f32) -> PyResult<()> {
+        self.check()?;
+        let p = points.as_array();
+        let t = tris.as_array();
+        if p.ncols() != 3 || t.ncols() != 3 {
+            return Err(PyValueError::new_err("points (N,3), tris (M,3)"));
+        }
+        let (n, m) = (p.nrows(), t.nrows());
+        let sv: Vec<f32> = scalars.as_array().iter().copied().collect();
+        let want = if cell { m } else { n };
+        if sv.len() != want {
+            return Err(PyValueError::new_err(format!(
+                "scalars: {want} values ({}), not {}", if cell { "one per triangle" }
+                else { "one per point" }, sv.len())));
+        }
+        if t.iter().any(|&i| i as usize >= n) {
+            return Err(PyValueError::new_err("triangle index out of range"));
+        }
+        if n == 0 || m == 0 {
+            self.remove(name);
+            return Ok(());
+        }
+        let nv: Option<Vec<f32>> = match &normals {
+            Some(a) if !cell => {
+                let a = a.as_array();
+                if a.nrows() != n || a.ncols() != 3 {
+                    return Err(PyValueError::new_err("normals (N,3), one per point"));
+                }
+                Some(a.iter().copied().collect())
+            }
+            _ => None,
+        };
+        let params = [if lighting { 1.0 } else { 0.0 }, specular, ambient.clamp(0.0, 1.0),
+                      if nv.is_some() { 1.0 } else { 0.0 }];
+        let u = scalar_uniform(&lut.as_array(), clim, opacity, nan_color, params, screen)?;
+        let maxb = self.max_buffer() as usize;
+        let geom = if !cell {
+            if n * 12 > maxb {
+                return Err(PyValueError::new_err(format!(
+                    "{n} points do not fit one GPU buffer ({maxb} bytes)")));
+            }
+            let pv: Vec<f32> = p.iter().copied().collect();
+            let vbuf = self.vbuf(name, &pv, false);
+            let sbuf = self.vbuf(name, &marked(sv.into_iter()), true);
+            let nbuf = nv.map(|v| self.vbuf(name, &v, false));
+            let tv: Vec<u32> = t.iter().copied().collect();
+            let parts = tv.chunks((maxb / 12).max(1) * 3).map(|c| {
+                (self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(name), contents: bytemuck::cast_slice(c),
+                    usage: wgpu::BufferUsages::INDEX,
+                }), c.len() as u32)
+            }).collect();
+            STri::Indexed { vbuf, sbuf, nbuf, parts, n_points: n }
+        } else {
+            // Three own vertices per triangle: 36 bytes of positions each.
+            let per_part = (maxb / 36).max(1);
+            let mut parts = Vec::new();
+            let mut first = 0;
+            while first < m {
+                let k = per_part.min(m - first);
+                let mut pos = Vec::with_capacity(k * 9);
+                for tri in first..first + k {
+                    for c in 0..3 {
+                        let i = t[[tri, c]] as usize;
+                        pos.extend_from_slice(&[p[[i, 0]], p[[i, 1]], p[[i, 2]]]);
+                    }
+                }
+                let s3 = marked(sv[first..first + k].iter().flat_map(|&x| [x, x, x]));
+                parts.push(FlatPart { vbuf: self.vbuf(name, &pos, false),
+                                      sbuf: self.vbuf(name, &s3, true), first, tris: k });
+                first += k;
+            }
+            STri::Flat { parts, n_tris: m }
+        };
+        let pass = match mode {
+            "overlay" => Pass::Overlay,
+            "transparent" => Pass::Transparent,
+            _ => Pass::Opaque,
+        };
+        self.put(name, Geom::STri(geom), pass, u);
+        Ok(())
+    }
+
+    /// Segments coloured by a field: (M,6) float32 as in set_lines; scalars
+    /// 2M values (the two ends of each segment) or M (one per segment).
+    #[pyo3(signature = (name, segments, scalars, lut, clim, width=1.0, overlay=false,
+                        opacity=1.0, nan_color=(0.66, 0.66, 0.66, 1.0)))]
+    #[allow(clippy::too_many_arguments)]
+    fn set_scalar_lines(&mut self, name: &str, segments: PyReadonlyArray2<'_, f32>,
+                        scalars: PyReadonlyArray1<'_, f32>, lut: PyReadonlyArray2<'_, f32>,
+                        clim: (f32, f32), width: f32, overlay: bool, opacity: f32,
+                        nan_color: (f32, f32, f32, f32)) -> PyResult<()> {
+        self.check()?;
+        let seg = segments.as_array();
+        if seg.ncols() != 6 {
+            return Err(PyValueError::new_err("segments (M,6)"));
+        }
+        let m = seg.nrows();
+        if m == 0 {
+            self.remove(name);
+            return Ok(());
+        }
+        let sv: Vec<f32> = scalars.as_array().iter().copied().collect();
+        let pairs = Self::pairs(sv, m)?;
+        if m * 24 > self.max_buffer() as usize {
+            return Err(PyValueError::new_err(format!(
+                "{m} segments do not fit one GPU buffer")));
+        }
+        let v: Vec<f32> = seg.iter().copied().collect();
+        let buf = self.vbuf(name, &v, false);
+        let sbuf = self.vbuf(name, &pairs, true);
+        let u = scalar_uniform(&lut.as_array(), clim, opacity, nan_color,
+                               [0.0, 0.0, (width * self.scale).max(1.0), 0.0], false)?;
+        self.put(name, Geom::SSeg { buf, sbuf, count: m as u32 },
+                 if overlay { Pass::LineOverlay } else { Pass::Line }, u);
+        Ok(())
+    }
+
+    /// New values for a layer coloured by a field. The geometry stays on the
+    /// GPU (animation: only the values change). The count is the same as
+    /// when the layer was made.
+    fn update_scalars(&mut self, name: &str, scalars: PyReadonlyArray1<'_, f32>) -> PyResult<()> {
+        self.check()?;
+        let sv: Vec<f32> = scalars.as_array().iter().copied().collect();
+        let l = self.layers.get(name)
+            .ok_or_else(|| PyValueError::new_err(format!("no layer {name:?}")))?;
+        let count = |want: usize, got: usize| if want == got { Ok(()) } else {
+            Err(PyValueError::new_err(format!("{name}: {want} values, not {got}")))
+        };
+        match &l.geom {
+            Geom::STri(STri::Indexed { sbuf, n_points, .. }) => {
+                count(*n_points, sv.len())?;
+                self.queue.write_buffer(sbuf, 0, bytemuck::cast_slice(&marked(sv.into_iter())));
+            }
+            Geom::STri(STri::Flat { parts, n_tris }) => {
+                count(*n_tris, sv.len())?;
+                for part in parts {
+                    let s3 = marked(sv[part.first..part.first + part.tris].iter()
+                        .flat_map(|&x| [x, x, x]));
+                    self.queue.write_buffer(&part.sbuf, 0, bytemuck::cast_slice(&s3));
+                }
+            }
+            Geom::SSeg { sbuf, count: m, .. } => {
+                let pairs = Self::pairs(sv, *m as usize)?;
+                self.queue.write_buffer(sbuf, 0, bytemuck::cast_slice(&pairs));
+            }
+            _ => return Err(PyValueError::new_err(format!("{name}: a layer without a field"))),
+        }
+        Ok(())
+    }
+
+    /// Another colour table or scale for a layer coloured by a field.
+    #[pyo3(signature = (name, lut, clim, nan_color=None, opacity=None))]
+    fn set_colormap(&mut self, name: &str, lut: PyReadonlyArray2<'_, f32>, clim: (f32, f32),
+                    nan_color: Option<(f32, f32, f32, f32)>, opacity: Option<f32>)
+                    -> PyResult<()> {
+        self.check()?;
+        let Some(l) = self.layers.get_mut(name) else {
+            return Err(PyValueError::new_err(format!("no layer {name:?}")));
+        };
+        let old = &l.u;
+        let nan = nan_color.unwrap_or((old.nan[0], old.nan[1], old.nan[2], old.nan[3]));
+        let mut u = scalar_uniform(&lut.as_array(), clim, opacity.unwrap_or(old.color[3]), nan,
+                                   old.params, old.scal[3] > 0.5)?;
+        u.color[..3].copy_from_slice(&old.color[..3]);
+        self.queue.write_buffer(&l.ubuf, 0, bytemuck::bytes_of(&u));
+        l.u = Box::new(u);
         Ok(())
     }
 

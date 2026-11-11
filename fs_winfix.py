@@ -42,6 +42,7 @@ import zipfile
 
 import numpy as np
 import pyvista as pv
+from fs_i18n import tr
 
 # Пакунки pywinrt. Обидва ставляться одним рядком requirements, але шукаємо
 # кожен окремо: часткове встановлення краще побачити тут, ніж ImportError
@@ -95,13 +96,13 @@ def why_not() -> str:
         return ("Ремонт службою Netfabb є лише у Windows: це частина самої "
                 "системи, а не бібліотека програми. З тієї самої причини "
                 "кнопки «Fix model» немає в Bambu Studio й PrusaSlicer на "
-                "Linux і macOS. Тут лишаються «Полагодити все» й "
-                "«Обгорнути…».")
-    return ("Не встановлено пакунки WinRT. У теці програми:" + "\n\n"
-            "    pip install winrt-Windows.Graphics.Printing3D "
-            "winrt-Windows.Storage.Streams" + "\n\n"
-            "Сама служба ремонту вже є у Windows — ці пакунки лише дають до "
-            "неї доступ із Python.")
+                "Linux і macOS. Тут лишаються інші методи в меню "
+                "«Полагодити»: meshfix, alpha wrap, обʼємна перебудова.")
+    return (tr("Не встановлено пакунки WinRT. У теці програми:\n\n    pip "
+               "install winrt-Windows.Graphics.Printing3D "
+               "winrt-Windows.Storage.Streams\n\nСама служба ремонту вже є "
+               "у Windows — ці пакунки лише дають до неї доступ із "
+               "Python."))
 
 
 # --------------------------------------------------------------------------
@@ -301,11 +302,10 @@ def repair(mesh: pv.PolyData, say=None) -> pv.PolyData:
         # Служба говорить кодами COM. Текст у них буває англійський і
         # невиразний, тому лишаємо його поруч, а не замість пояснення.
         raise RuntimeError(
-            "Служба ремонту Windows відмовила: "
-            f"{getattr(exc, 'strerror', None) or exc}." + "\n\n"
-            "Найчастіше це завелика модель або вимкнена служба. "
-            "Спробуйте спершу «Проріднити…», або скористайтеся "
-            "«Полагодити все» чи «Обгорнути…».") from exc
+            tr("Служба ремонту Windows відмовила: {v}.\n\nНайчастіше це "
+               "завелика модель або вимкнена служба. Спробуйте спершу "
+               "«Проріднити…», або виберіть інший метод у меню "
+               "«Полагодити»: meshfix чи alpha wrap.", v=getattr(exc, 'strerror', None) or exc)) from exc
     if out.n_cells == 0:
         raise RuntimeError("Після ремонту не лишилося жодного трикутника.")
     return out

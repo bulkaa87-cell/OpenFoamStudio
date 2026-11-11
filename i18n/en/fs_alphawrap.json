@@ -1,0 +1,10 @@
+{
+ "alpha й offset мусять бути додатні.": "alpha and offset must be positive.",
+ "wrapwrap відмовив (код {code}):\n\n{text}\n\nНайчастіше це замалий alpha на дуже дрібній деталі. Спробуйте більший alpha, або «Полагодити» (meshfix).": "wrapwrap failed (code {code}):\n\n{text}\n\nMost often the cause is an alpha that is too small on a very small part. Try a larger alpha, or “Repair” (meshfix).",
+ "wrapwrap завершився без помилки, але файла не залишив.": "wrapwrap finished without an error, but did not leave a file.",
+ "Нема чого обгортати: у моделі жодного трикутника.": "Nothing to wrap: the model has no triangles.",
+ "Немає {EXE_NAME} — це окрема програма, збірка CGAL Alpha Wrapping.\n\nЗавантажити: github.com/ipadjen/wrapwrap (розділ Releases, готовий {EXE_NAME} для Windows, ~1.3 МБ) і покласти у теку:\n\n    {str}\n\nКнопка «Полагодити» (meshfix, alpha wrap на Rust, Windows, обʼємна перебудова) працює і без цього.": "{EXE_NAME} is missing — this is a separate program, a build of CGAL Alpha Wrapping.\n\nDownload it from github.com/ipadjen/wrapwrap (Releases section, a ready {EXE_NAME} for Windows, ~1.3 MB) and put it in the folder:\n\n    {str}\n\nThe “Repair” button (meshfix, alpha wrap in Rust, Windows, volume remesh) works without it too.",
+ "Після обгортання не лишилося жодного трикутника.": "No triangles are left after wrapping.",
+ "подаю {count} трикутників у alpha wrap (alpha={alpha:g})": "sending {count} triangles to alpha wrap (alpha={alpha:g})",
+ "читаю обгорнену модель і зшиваю вершини": "reading the wrapped model and merging vertices"
+}

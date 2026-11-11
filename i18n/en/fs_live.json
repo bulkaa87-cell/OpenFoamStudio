@@ -1,0 +1,13 @@
+{
+ "t = {t} с": "t = {t} s",
+ "t = {t} с (крок {i})": "t = {t} s (step {i})",
+ "{head} · з повного зрізу (повільніше)": "{head} · from the full time step (slower)",
+ "{head} · поверхні, {size}": "{head} · surfaces, {size}",
+ "{mb:.1f} МБ": "{mb:.1f} MB",
+ "для моменту {t} даних немає": "there is no data for time {t}",
+ "на цьому бекенді проміжні дані недоступні": "intermediate data is not available on this backend",
+ "не вдалося забрати дані: {err}": "cannot get the data: {err}",
+ "прогін розподілений між машинами: повних зрізів тут немає, лише поверхні, які пише сам прогін": "the run is distributed over machines: the full time steps are not here, only the surfaces that the run writes",
+ "теки прогону немає": "the run folder does not exist",
+ "ітерація {t}": "iteration {t}"
+}

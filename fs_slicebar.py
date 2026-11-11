@@ -17,6 +17,7 @@ from PySide6 import QtCore, QtWidgets
 
 import fs_help as fshelp
 import fs_panels as panels
+from fs_i18n import tr
 
 # Ті самі ключі й назви, що в fs_views. Тут — копія, а не імпорт: смуга
 # свідомо без VTK (див. вище), а fs_views тягне його за собою. Що вони
@@ -447,7 +448,8 @@ class SliceBar(QtWidgets.QWidget):
                    default=_STEPS_MM[0])
         self.spin.setSingleStep(step)
         for b in (self.btn_prev, self.btn_next):
-            b.setToolTip("Крок площини: %g мм" % self.spin.singleStep())
+            b.setToolTip(tr("Крок площини: {step:g} мм",
+                            step=self.spin.singleStep()))
         self._silent = False
 
     def set_position(self, pos: float, *, silent: bool = True) -> None:

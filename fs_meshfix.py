@@ -1,6 +1,7 @@
 """meshfix repair: the steps of the Windows repair, in Rust.
 
-WHAT IT IS. «Полагодити як слайсер» (fs_winfix) calls the Windows service
+WHAT IT IS. The method «Windows» of the «Полагодити» menu (fs_winfix)
+calls the Windows service
 (Windows.Graphics.Printing.3D.dll, Printing3DModel.RepairAsync). meshfix
 (rust/meshfix, module meshfix.pyd) does the same 12 steps in the same order
 and with the same tolerances: stitch, close holes of 3 edges, remove
@@ -27,6 +28,10 @@ DIFFERENCES FROM THE SERVICE (measured on tests/meshfix_cases.py):
   Each result is used only when it is closed and no count of the
   program's check is larger than in the input. Report key "fallback".
 
+FORCED METHODS. repair(..., method=...) with "alphawrap" or "volume" runs
+only that fallback, also on a mesh that the 12 steps would make clean. The
+«Полагодити» menu of the window gives these methods (METHODS below).
+
 UNITS. The step tolerances are in mm, as in the service. Thus the mesh goes
 from m to mm for the repair and back, as in fs_winfix.
 """
@@ -35,6 +40,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
+from fs_i18n import tr
 
 try:                                       # pragma: no cover - depends on the build
     import meshfix as _rs
@@ -66,6 +72,21 @@ FALLBACK_TEXT = {
                     "перебудова (тонші за ~0.7 мм частини можуть зникнути)",
 }
 
+# Methods of this module: key → (name in the status text, report key of
+# the step that gives the result; None = the 12 steps).
+METHODS = {
+    "meshfix": ("meshfix", None),
+    "alphawrap": ("alpha wrap", "AlphaWrap"),
+    "volume": ("обʼємна перебудова", "VolumeRemesh"),
+}
+
+# Status text of a forced method.
+FORCED_TEXT = {
+    "AlphaWrap": "обгортка моделі (alpha wrap), стиснута на поверхню",
+    "VolumeRemesh": "обʼємна перебудова (тонші за ~0.7 мм частини могли "
+                    "зникнути)",
+}
+
 # Report of the last repair. The window uses it for the status line.
 last_report: dict | None = None
 
@@ -77,10 +98,10 @@ def available() -> bool:
 def why_not() -> str:
     if available():
         return ""
-    return ("Модуль meshfix (Rust) не зібрано. Зібрати:" + "\n\n"
-            "    powershell -ExecutionPolicy Bypass -File tools\\build_rust.ps1"
-            + "\n\n" + "Ремонт службою Windows («Полагодити як слайсер») "
-            "працює й без нього.")
+    return (tr("Модуль meshfix (Rust) не зібрано. Зібрати:\n\n    "
+               "powershell -ExecutionPolicy Bypass -File "
+               "tools\\build_rust.ps1\n\nРемонт службою Windows (метод "
+               "«Windows» у меню «Полагодити») працює й без нього."))
 
 
 def _triangles(mesh: pv.PolyData) -> np.ndarray:
@@ -91,13 +112,18 @@ def _triangles(mesh: pv.PolyData) -> np.ndarray:
     return faces.reshape(-1, 4)[:, 1:]
 
 
-def repair_arrays(points_mm, tris, *, wrap: bool = True):
+def repair_arrays(points_mm, tris, *, wrap: bool = True,
+                  method: str = "meshfix"):
     """(points mm, triangles) → (points mm, triangles, report). No pyvista."""
     if not available():
         raise RuntimeError(why_not())
-    return _rs.repair(np.ascontiguousarray(points_mm, dtype=np.float64),
-                      np.ascontiguousarray(tris, dtype=np.int64),
-                      True, bool(wrap))
+    if method not in METHODS:
+        raise ValueError(f"no meshfix method {method!r}")
+    args = (np.ascontiguousarray(points_mm, dtype=np.float64),
+            np.ascontiguousarray(tris, dtype=np.int64), True, bool(wrap))
+    if method == "meshfix":
+        return _rs.repair(*args)
+    return _rs.repair(*args, method=method)
 
 
 def summary(report: dict) -> str:
@@ -111,30 +137,36 @@ def summary(report: dict) -> str:
             parts.append(f"{STEP_NAMES.get(name, name)} {count}")
     u = report.get("union") or {}
     if u.get("pairs"):
-        parts.append(f"перетинів тіл розрізано {u['pairs']}")
+        parts.append(tr("перетинів тіл розрізано {u}", u=u['pairs']))
     if u.get("skipped_clusters"):
-        parts.append(f"місць перетину лишено як є {u['skipped_clusters']}")
+        parts.append(tr("місць перетину лишено як є {u}", u=u['skipped_clusters']))
     if u.get("rolled_back") or u.get("panicked"):
         parts.append("обʼєднання тіл не вдалося — тіла лишилися окремими")
     if report.get("guard"):
         return guard_text(report["guard"])
+    if report.get("method", "meshfix") != "meshfix" and fallback in FORCED_TEXT:
+        return FORCED_TEXT[fallback]
     if fallback in FALLBACK_TEXT:
         return FALLBACK_TEXT[fallback]
     after = report.get("after") or {}
     if after.get("boundary_edges") or after.get("non_manifold_edges"):
         # meshfix only cuts and joins closed bodies. An assembly with open
         # and non-manifold parts needs the full wrap of the Windows service.
-        parts.append(f"лишилося відкритих ребер {after.get('boundary_edges', 0)}, "
-                     f"non-manifold {after.get('non_manifold_edges', 0)} — для "
-                     f"такої збірки «Полагодити як слайсер» або «Обгорнути»")
+        parts.append(tr("лишилося відкритих ребер {get}, "
+                     "non-manifold {get2} — для "
+                     "такої збірки є «Windows» і «обʼємна перебудова» "
+                     "у меню «Полагодити»", get=after.get('boundary_edges', 0), get2=after.get('non_manifold_edges', 0)))
     return ", ".join(parts) if parts else "кроки нічого не змінили"
 
 
-def repair(mesh: pv.PolyData, say=None) -> pv.PolyData:
+def repair(mesh: pv.PolyData, say=None,
+           method: str = "meshfix") -> pv.PolyData:
     """A repaired copy of `mesh`. The input and the output are in m.
 
     The same contract as fs_winfix.repair: call it from a thread
     (RepairWorker). Rust releases the GIL, thus the window stays live.
+    method: a key of METHODS. A forced method that gives no result raises
+    RuntimeError (the window then puts the model back).
     """
     global last_report
     say = say or (lambda _text: None)
@@ -144,13 +176,16 @@ def repair(mesh: pv.PolyData, say=None) -> pv.PolyData:
         raise RuntimeError(why_not())
     tri = _triangles(mesh)
     pts = np.asarray(mesh.points, dtype=np.float64) * M_TO_MM
-    say(f"meshfix: {len(tri)} трикутників, 12 кроків")
+    label, stage = METHODS[method]
+    say(tr("{label}: {n_tri} трикутників{v}", label=label, n_tri=len(tri), v=", 12 кроків" if stage is None else ""))
     try:
-        out_p, out_t, report = repair_arrays(pts, tri)
+        out_p, out_t, report = repair_arrays(pts, tri, method=method)
     except ValueError as exc:
-        raise RuntimeError(f"meshfix відмовив: {exc}.") from exc
+        raise RuntimeError(tr("{label} відмовив: {exc}.", label=label, exc=exc)) from exc
     last_report = report
-    say("meshfix: " + summary(report))
+    if stage is not None and report.get("fallback") != stage:
+        raise RuntimeError(forced_failure(method, report))
+    say(f"{label}: " + summary(report))
     if len(out_t) == 0:
         raise RuntimeError("Після ремонту не лишилося жодного трикутника: "
                            "модель була плоскою або з самих крихітних "
@@ -165,9 +200,24 @@ def repair(mesh: pv.PolyData, say=None) -> pv.PolyData:
     worse = worse_than(mesh, out)
     report["guard"] = worse
     if worse:
-        say("meshfix: " + guard_text(worse))
+        say(f"{label}: " + guard_text(worse))
         return mesh.copy()
     return out
+
+
+def forced_failure(method: str, report: dict) -> str:
+    """Text for the dialog when a forced method gave no result."""
+    if method == "volume":
+        v = report.get("volume") or {}
+        if v and 0 < v.get("volume_ratio", 1.0) <= 0.3:
+            return (tr("Обʼємна перебудова втратила тіло: лишилося "
+                    "{v:.0f}% обʼєму. Найчастіше це "
+                    "велика дірка, крізь яку «зовні» затекло всередину. "
+                    "Спробуйте meshfix або alpha wrap.", v=v['volume_ratio'] * 100))
+        return ("Обʼємна перебудова не дала поверхні: модель, мабуть, "
+                "складається з частин, тонших за ~0.7 мм.")
+    return ("Alpha wrap не дав замкненої оболонки. Спробуйте meshfix "
+            "або обʼємну перебудову.")
 
 
 # Program counts that the guard compares: (key, label for the status line).
@@ -185,6 +235,5 @@ def worse_than(before: pv.PolyData, after: pv.PolyData) -> list:
 
 
 def guard_text(worse: list) -> str:
-    return ("результат гірший за вхідну модель ("
-            + ", ".join(f"{label} {a} → {b}" for label, a, b in worse)
-            + ") — модель лишилася без змін")
+    return (tr("результат гірший за вхідну модель ({join}) — модель "
+               "лишилася без змін", join=", ".join(f"{label} {a} → {b}" for label, a, b in worse)))

@@ -16,6 +16,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import fs_view3d as v3
+from fs_i18n import tr
 
 Qt = QtCore.Qt
 
@@ -95,8 +96,9 @@ class GpuWidget(QtWidgets.QWidget):
             try:
                 r = v3.make_renderer(v3.Level(lv.level, note=lv.note), hwnd, w, h, font,
                                      kind=self._kind or "win32")
-                self.setToolTip(f"3D: {lv.backend} не дав поверхню вікна "
-                                f"({self.error}); малює {r.adapter}")
+                self.setToolTip(tr("3D: {backend} не дав поверхню вікна "
+                                   "({error}); малює {adapter}", backend=lv.backend,
+                                   error=self.error, adapter=r.adapter))
                 return r
             except BaseException as exc:                  # noqa: BLE001
                 if not v3.gpu_failed(exc):
@@ -112,7 +114,7 @@ class GpuWidget(QtWidgets.QWidget):
                     raise
                 self.error = f"{self.error}; {exc}"
         if lv.level != "cpu":
-            self._to_cpu(f"{lv.text()} не створився: {self.error}")
+            self._to_cpu(tr("{text} не створився: {error}", text=lv.text(), error=self.error))
             return v3.make_renderer(self.pl.level, None, w, h, font)
         return None
 
@@ -120,7 +122,7 @@ class GpuWidget(QtWidgets.QWidget):
         if self.gpu is not None or v3._fv is None:
             return self.gpu
         w, h = self.pixel_size()
-        self.gpu = self._make(w, h, v3.font_path())
+        self.gpu = self._make(w, h, getattr(self.pl, "font", None) or v3.font_path())
         if self.gpu is None:
             return None
         if hasattr(self.gpu, "set_scale"):
@@ -151,7 +153,7 @@ class GpuWidget(QtWidgets.QWidget):
                 p.fillRect(self.rect(), QtGui.QColor("#22262b"))
                 p.setPen(QtGui.QColor("#e8e8e8"))
                 p.drawText(self.rect(), Qt.AlignCenter,
-                           "3D недоступне: " + (self.error or "немає foamview"))
+                           tr("3D недоступне: {v}", v=self.error or tr("немає foamview")))
             return
         if self._native:
             self._draw()
@@ -187,7 +189,7 @@ class GpuWidget(QtWidgets.QWidget):
         self.setToolTip("3D: " + self.error)
         self.gpu = None
         if self._retried and self.pl.level.level != "cpu":
-            self._to_cpu(f"GPU відмовив двічі: {self.error}")
+            self._to_cpu(tr("GPU відмовив двічі: {error}", error=self.error))
         self._retried = True
         self.update()
 
@@ -218,16 +220,37 @@ class GpuWidget(QtWidgets.QWidget):
         self.gpu = None
 
     # --- миша (як vtkInteractorStyleTrackballCamera) ------------------------
+    # Ручки сцени (площина зрізу, насіння ліній) беруть мишу першими: їх
+    # тягнуть, а не крутять камеру. Координати ручкам — у пікселях кадру.
+    def _px(self, pos) -> np.ndarray:
+        k = self.pl._dpr()
+        return np.array([pos.x() * k, pos.y() * k])
+
     def mousePressEvent(self, e):
+        self.setFocus()
+        btn = {Qt.LeftButton: "left", Qt.RightButton: "right"}.get(e.button())
+        if (btn and not (e.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier))
+                and self.pl.widget_press(self._px(e.position()), btn)):
+            self._drag = ("widget", None)
+            self._last = e.position()
+            return
         self._drag = (e.button(), e.modifiers())
         self._last = e.position()
-        self.setFocus()
 
     def mouseReleaseEvent(self, e):
+        if self._drag is not None and self._drag[0] == "widget":
+            self.pl.widget_release()
+            self.update()
         self._drag = None
 
     def mouseMoveEvent(self, e):
         if self._drag is None or self._last is None:
+            return
+        if self._drag[0] == "widget":
+            pos = e.position()
+            d = self._px(pos) - self._px(self._last)
+            self._last = pos
+            self.pl.widget_move(d, self._px(pos))
             return
         btn, mods = self._drag
         pos = e.position()

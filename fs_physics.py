@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from fs_i18n import tr
 
 C_MU = 0.09
 
@@ -375,11 +376,11 @@ def estimate_mesh(
 def fmt_cells(n: int) -> str:
     """Кількість комірок по-людськи. Мільярди теж: «20628.18M» не читається."""
     if n >= 1_000_000_000:
-        return f"{n / 1_000_000_000:.1f} млрд"
+        return tr("{v:.1f} млрд", v=n / 1_000_000_000)
     if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f} млн"
+        return tr("{v:.2f} млн", v=n / 1_000_000)
     if n >= 1_000:
-        return f"{n / 1_000:.0f} тис."
+        return tr("{v:.0f} тис.", v=n / 1_000)
     return str(n)
 
 
@@ -412,8 +413,8 @@ def memory_breakdown(est: "MeshEstimate", cfg_level: int,
         level -= 1
         gb /= 4.0
 
-    text = (f"Найбільший внесок — {name}: {fmt_cells(value)} комірок "
-            f"({share:.0%} від усіх).")
+    text = (tr("Найбільший внесок — {name}: {value} комірок "
+            "({share:.0%} від усіх).", name=name, value=fmt_cells(value), share=share))
     return text, level
 
 
@@ -423,9 +424,9 @@ def fmt_len(metres: float) -> str:
     if a == 0:
         return "0"
     if a < 1e-6:
-        return f"{metres * 1e9:.1f} нм"
+        return tr("{v:.1f} нм", v=metres * 1e9)
     if a < 1e-3:
-        return f"{metres * 1e6:.1f} мкм"
+        return tr("{v:.1f} мкм", v=metres * 1e6)
     if a < 1.0:
-        return f"{metres * 1e3:.3g} мм"
-    return f"{metres:.4g} м"
+        return tr("{v:.3g} мм", v=metres * 1e3)
+    return tr("{metres:.4g} м", metres=metres)

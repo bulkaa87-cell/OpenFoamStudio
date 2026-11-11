@@ -1,0 +1,12 @@
+{
+ "Не встановлено пакунки WinRT. У теці програми:\n\n    pip install winrt-Windows.Graphics.Printing3D winrt-Windows.Storage.Streams\n\nСама служба ремонту вже є у Windows — ці пакунки лише дають до неї доступ із Python.": "The WinRT packages are not installed. In the program folder:\n\n    pip install winrt-Windows.Graphics.Printing3D winrt-Windows.Storage.Streams\n\nThe repair service itself is already in Windows — these packages only give access to it from Python.",
+ "Після ремонту не лишилося жодного трикутника.": "No triangles are left after the repair.",
+ "Ремонт службою Netfabb є лише у Windows: це частина самої системи, а не бібліотека програми. З тієї самої причини кнопки «Fix model» немає в Bambu Studio й PrusaSlicer на Linux і macOS. Тут лишаються інші методи в меню «Полагодити»: meshfix, alpha wrap, обʼємна перебудова.": "Repair with the Netfabb service exists only in Windows: it is a part of the system itself, not a program library. For the same reason, Bambu Studio and PrusaSlicer have no “Fix model” button on Linux and macOS. Here the other methods in the “Repair” menu stay available: meshfix, alpha wrap, volume rebuild.",
+ "Служба ремонту Windows відмовила: {v}.\n\nНайчастіше це завелика модель або вимкнена служба. Спробуйте спершу «Проріднити…», або виберіть інший метод у меню «Полагодити»: meshfix чи alpha wrap.": "The Windows repair service refused: {v}.\n\nMost often the model is too large or the service is disabled. Try “Decimate…” first, or select another method in the “Repair” menu: meshfix or alpha wrap.",
+ "готую пакунок для служби ремонту": "preparing the package for the repair service",
+ "ремонт службою Windows — на 250 тис. трикутників близько пів хвилини": "repair with the Windows service — about half a minute for 250 k triangles",
+ "служба повернула пакунок без моделі": "the service returned a package without a model",
+ "служба повернула порожню модель": "the service returned an empty model",
+ "у моделі кільце посилань між обʼєктами": "the model has a reference loop between objects",
+ "читаю полагоджену модель": "reading the repaired model"
+}

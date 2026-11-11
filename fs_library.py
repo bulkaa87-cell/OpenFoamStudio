@@ -29,12 +29,16 @@ import re
 import shutil
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 
 import fs_backend as be
+import fs_fastzip as fz
 import fs_case as fc
 import fs_post as post
+import fs_i18n
+from fs_i18n import tr
 
 MANIFEST = "studio.json"
 FORMAT = 1
@@ -950,8 +954,8 @@ class CaseInfo:
             return ("ітерацій", str(self.iterations) if self.iterations else "—")
         if not self.end_time:
             return ("часу", "—")
-        return ("часу", f"{self.end_time:g} с за {self.iterations} кроків"
-                if self.iterations else f"{self.end_time:g} с")
+        return ("часу", tr("{end_time:g} с за {iterations} кроків", end_time=self.end_time, iterations=self.iterations)
+                if self.iterations else tr("{end_time:g} с", end_time=self.end_time))
 
     @property
     def last_run(self) -> dict:
@@ -1116,21 +1120,21 @@ def stability(cases: list[CaseInfo]) -> Stability:
     usable = []                     # (info, cfg, (Cd, Cl, Cm), розкиди)
     for info in cases:
         if not info.has_cfg:
-            out.notes.append(f"«{info.name}»: маніфесту немає, налаштування "
-                             f"невідомі — кейс пропущено")
+            out.notes.append(tr("«{name}»: маніфесту немає, налаштування "
+                             "невідомі — кейс пропущено", name=info.name))
             continue
         cfg = cfg_from_dict(info.cfg)
         got = [info.coeff(n) for n in ("Cd", "Cl", "CmPitch")]
         if any(p is None for p in got):
-            out.notes.append(f"«{info.name}»: коефіцієнтів немає — кейс пропущено")
+            out.notes.append(tr("«{name}»: коефіцієнтів немає — кейс пропущено", name=info.name))
             continue
         means = [p[0] for p in got]
         if not all(math.isfinite(v) and abs(v) < 1e3 for v in means):
-            out.notes.append(f"«{info.name}»: розрахунок розійшовся — кейс пропущено")
+            out.notes.append(tr("«{name}»: розрахунок розійшовся — кейс пропущено", name=info.name))
             continue
         if abs(cfg.flow.aos_deg) > 1e-6:
-            out.notes.append(f"«{info.name}»: кут ковзання {cfg.flow.aos_deg:g}° — "
-                             f"поздовжню стійкість так не знайти, кейс пропущено")
+            out.notes.append(tr("«{name}»: кут ковзання {aos_deg:g}° — "
+                             "поздовжню стійкість так не знайти, кейс пропущено", name=info.name, aos_deg=cfg.flow.aos_deg))
             continue
         usable.append((info, cfg, means, [p[1] for p in got]))
     if len(usable) < 2:
@@ -1147,17 +1151,17 @@ def stability(cases: list[CaseInfo]) -> Stability:
                         for a, b in zip(f.cofr, ref.cofr)))
         if not same:
             out.problem = (
-                f"у «{info.name}» інші Lref, Aref чи центр моментів, ніж у "
-                f"«{usable[0][0].name}»: коефіцієнти нормовані по-різному, "
-                f"порівнювати їх не можна")
+                tr("у «{name}» інші Lref, Aref чи центр моментів, ніж у "
+                "«{name2}»: коефіцієнти нормовані по-різному, "
+                "порівнювати їх не можна", name=info.name, name2=usable[0][0].name))
             return out
     out.l_ref, out.x_cofr = ref.l_ref, ref.cofr[0]
     out.names = [u[0].name for u in usable]
 
     angles = [u[1].flow.aoa_deg for u in usable]
     if max(angles) - min(angles) < be.MIN_ANGLE_SPAN:
-        out.problem = (f"кути атаки однакові або різняться менш ніж на "
-                       f"{be.MIN_ANGLE_SPAN:g}°: за одним кутом похідної нема")
+        out.problem = (tr("кути атаки однакові або різняться менш ніж на "
+                       "{MIN_ANGLE_SPAN:g}°: за одним кутом похідної нема", MIN_ANGLE_SPAN=be.MIN_ANGLE_SPAN))
         return out
 
     # Габарит тіла: щоб показати точку «від носа», а не лише в системі кейсу.
@@ -1172,9 +1176,9 @@ def stability(cases: list[CaseInfo]) -> Stability:
     out.point = be.neutral_point(
         [(u[1].flow.aoa_deg, *u[2]) for u in usable], out.l_ref, out.x_cofr)
     if out.point is None:
-        out.problem = ("нормальна сила майже не росте з кутом (dCn/dα менше "
-                       f"{be.MIN_CN_ALPHA:g} на градус): нейтральна точка тікає "
-                       "в нескінченність")
+        out.problem = (tr("нормальна сила майже не росте з кутом (dCn/dα менше "
+                       "{MIN_CN_ALPHA:g} на градус): нейтральна точка тікає "
+                       "в нескінченність", MIN_CN_ALPHA=be.MIN_CN_ALPHA))
         return out
 
     # На що зважити в числі.
@@ -1184,9 +1188,9 @@ def stability(cases: list[CaseInfo]) -> Stability:
                          "третій між ними чи поряд")
     elif p.pairs and max(p.pairs) - min(p.pairs) > 0.10 * out.l_ref:
         out.notes.append(
-            f"за різними парами кутів точка ходить від {min(p.pairs):.3f} до "
-            f"{max(p.pairs):.3f} м: залежність від кута нелінійна (зрив?), "
-            f"беріть кути ближче до робочого")
+            tr("за різними парами кутів точка ходить від {pairs:.3f} до "
+            "{pairs2:.3f} м: залежність від кута нелінійна (зрив?), "
+            "беріть кути ближче до робочого", pairs=min(p.pairs), pairs2=max(p.pairs)))
     speeds = [u[1].flow.u_inf for u in usable]
     if max(speeds) > 1.01 * min(speeds):
         out.notes.append("швидкість у кейсів різна — числа Рейнольдса не "
@@ -1198,14 +1202,13 @@ def stability(cases: list[CaseInfo]) -> Stability:
                          "прогони: беріть однакові")
     sources = {os.path.basename(u[0].stl_source) for u in usable if u[0].stl_source}
     if len(sources) > 1:
-        out.notes.append("кейси зроблено з різних файлів геометрії: "
-                         + ", ".join(sorted(sources)))
+        out.notes.append(tr("кейси зроблено з різних файлів геометрії: {join}", join=", ".join(sorted(sources))))
     shaky = [u[0].name for u in usable
              if any(sp > 0.05 * max(abs(m), 0.01)
                     for sp, m in zip(u[3][1:], u[2][1:]))]
     if shaky:
-        out.notes.append("коефіцієнти ще коливаються в кейсах: "
-                         + ", ".join(shaky) + " — точка наближена")
+        out.notes.append(tr("коефіцієнти ще коливаються в кейсах: "
+                            "{shaky} — точка наближена", shaky=", ".join(shaky)))
     if out.nose_x is not None and out.length:
         lo, hi = out.nose_x - 0.25 * out.length, out.nose_x + 1.25 * out.length
         if not lo <= p.x <= hi:
@@ -1252,26 +1255,22 @@ def parse_angles(text: str) -> tuple[list[float], str]:
         try:
             a = float(t)
         except ValueError:
-            return [], f"«{t}» — не число"
+            return [], tr("«{t}» — не число", t=t)
         if not math.isfinite(a) or abs(a) > 90.0:
-            return [], f"кут {t}° поза межами −90…90°"
+            return [], tr("кут {t}° поза межами −90…90°", t=t)
         angles.append(a)
     unique = sorted({round(a, 6) for a in angles})
     if len(unique) < 2:
         return unique, "потрібно щонайменше два різні кути"
     if unique[-1] - unique[0] < be.MIN_ANGLE_SPAN:
-        return unique, (f"кути різняться менш ніж на {be.MIN_ANGLE_SPAN:g}°: "
-                        f"похідної з них не взяти")
+        return unique, (tr("кути різняться менш ніж на {MIN_ANGLE_SPAN:g}°: "
+                        "похідної з них не взяти", MIN_ANGLE_SPAN=be.MIN_ANGLE_SPAN))
     return unique, ""
 
 
 def runs_word(n: int) -> str:
     """«2 прогони», «5 прогонів», «21 прогін» — українська форма числівника."""
-    if n % 10 == 1 and n % 100 != 11:
-        return f"{n} прогін"
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return f"{n} прогони"
-    return f"{n} прогонів"
+    return fs_i18n.plural(n, "{n} прогін", "{n} прогони", "{n} прогонів").format(n=n)
 
 
 def series_case_name(base: str, angle: float) -> str:
@@ -1293,9 +1292,9 @@ def series_problem(cfg) -> str:
     """
     f = cfg.flow
     if abs(f.aos_deg) > 1e-6:
-        return (f"стоїть кут ковзання {f.aos_deg:g}°: нейтральна точка по "
-                f"тангажу шукається при нульовому ковзанні, і такі кейси в "
-                f"розрахунок не підуть. Поставте ковзання 0 на вкладці «Потік».")
+        return (tr("стоїть кут ковзання {aos_deg:g}°: нейтральна точка по "
+                "тангажу шукається при нульовому ковзанні, і такі кейси в "
+                "розрахунок не підуть. Поставте ковзання 0 на вкладці «Потік».", aos_deg=f.aos_deg))
     if f.farfield_mode == "tunnel":
         return ("зовнішні межі в режимі «аеротруба»: slip-стінки зрізають кут "
                 "атаки, і всі прогони серії порахували б той самий потік. "
@@ -1309,9 +1308,9 @@ def series_notes(angles: list[float]) -> list[str]:
     if len(angles) == 2:
         notes.append("лише два кути: лінійність не перевірити, краще три")
     if max(abs(a) for a in angles) > SERIES_STALL_DEG:
-        notes.append(f"кути понад {SERIES_STALL_DEG:g}° близькі до зриву: там "
-                     f"стаціонарний розвʼязувач не сходиться, а момент "
-                     f"нелінійний — точка поїде")
+        notes.append(tr("кути понад {SERIES_STALL_DEG:g}° близькі до зриву: там "
+                     "стаціонарний розвʼязувач не сходиться, а момент "
+                     "нелінійний — точка поїде", SERIES_STALL_DEG=SERIES_STALL_DEG))
     return notes
 
 
@@ -1325,7 +1324,7 @@ def fmt_size(n: int) -> str:
     for unit, div in (("ГБ", 1 << 30), ("МБ", 1 << 20), ("КБ", 1 << 10)):
         if n >= div:
             return f"{n / div:.1f} {unit}"
-    return f"{n} Б"
+    return tr("{n} Б", n=n)
 
 
 def fmt_time(stamp: float) -> str:
@@ -1338,10 +1337,10 @@ def fmt_seconds(s: float) -> str:
     if not s:
         return "—"
     if s < 90:
-        return f"{s:.0f} с"
+        return tr("{s:.0f} с", s=s)
     if s < 3600:
-        return f"{s / 60:.1f} хв"
-    return f"{s / 3600:.1f} год"
+        return tr("{v:.1f} хв", v=s / 60)
+    return tr("{v:.1f} год", v=s / 3600)
 
 
 # ==========================================================================
@@ -1375,6 +1374,9 @@ PROJECT_VERSION = 1
 # Лежить під mesh/polyMesh/…, а ключ (fs_backend.mesh_key) — у маніфесті:
 # без ключа не сказати, чи ця сітка ще пасує до геометрії й налаштувань.
 PROJECT_MESH = "mesh"
+# Розміри стиснених шматків кожного файлу сітки (fs_fastzip): за ними сітка
+# розпаковується в кілька потоків. Старі проєкти його не мають — і не треба.
+PROJECT_MESH_INDEX = PROJECT_MESH + "/index.json"
 
 
 def _safe_stem(name: str, fallback: str) -> str:
@@ -1428,7 +1430,9 @@ def extract_project_mesh(path: str | os.PathLike, store: str | os.PathLike) -> s
     part = Path(store) / f".prj-{key}"
     shutil.rmtree(part, ignore_errors=True)
     try:
-        with zipfile.ZipFile(path, "r") as z:
+        with zipfile.ZipFile(path, "r") as z, open(path, "rb") as raw, \
+                ThreadPoolExecutor(fz.workers()) as pool:
+            index = _mesh_index(z)
             for info in z.infolist():
                 name = info.filename
                 if not name.startswith(PROJECT_MESH + "/polyMesh/") or info.is_dir():
@@ -1438,6 +1442,9 @@ def extract_project_mesh(path: str | os.PathLike, store: str | os.PathLike) -> s
                     continue
                 out = part / rel
                 out.parent.mkdir(parents=True, exist_ok=True)
+                if fz.inflate_to(raw, info, index.get(name), out, pool):
+                    continue
+                # Старий проєкт (без індексу) або індекс не пасує — звичайно.
                 with z.open(info) as src, open(out, "wb") as fh:
                     shutil.copyfileobj(src, fh, 1 << 20)
         if not be._mesh_complete(part):
@@ -1451,9 +1458,21 @@ def extract_project_mesh(path: str | os.PathLike, store: str | os.PathLike) -> s
         shutil.rmtree(part, ignore_errors=True)
 
 
+def _mesh_index(z: zipfile.ZipFile) -> dict:
+    """{імʼя запису: [розміри стиснених шматків]} або {} (індексу немає)."""
+    try:
+        m = json.loads(z.read(PROJECT_MESH_INDEX).decode("utf-8"))
+        if m.get("chunk") != fz.CHUNK:
+            return {}
+        return {str(k): [int(n) for n in v] for k, v in m["files"].items()}
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return {}
+
+
 def write_project(path: str | os.PathLike, cfg: fc.CaseCfg, parts,
                   extra: dict | None = None, mesh_key: str = "",
-                  mesh_dir: str | os.PathLike | None = None) -> str:
+                  mesh_dir: str | os.PathLike | None = None,
+                  keep_mesh: bool = True) -> str:
     """Записати проєкт. `parts` — список словників із ключем `stl` (bytes).
 
     Решта ключів словника йде в маніфест як є: імʼя, роль, оберти, вісь,
@@ -1465,6 +1484,11 @@ def write_project(path: str | os.PathLike, cfg: fc.CaseCfg, parts,
     сітку З ТИМ САМИМ ключем — її переносимо: інакше автозбереження перед
     прогоном (коли нової сітки ще немає) мовчки викидало б сітку з проєкту.
     Ключ інший — стара сітка вже не пасує, і її не переносимо.
+    `keep_mesh=False` — не переносимо взагалі («Зберегти проєкт» без сітки).
+
+    Сітка стискається (DEFLATE) у кілька потоків (fs_fastzip): 2.4 млн
+    комірок — це ~300 МБ сирих файлів. Перенесена сітка копіюється
+    стисненою, як є.
     """
     target = Path(path)
     if target.suffix.lower() != PROJECT_EXT:
@@ -1476,7 +1500,8 @@ def write_project(path: str | os.PathLike, cfg: fc.CaseCfg, parts,
     # Ключ невідомий (кейс ще не створено) — переносимо як є: сітка з
     # чужим ключем у проєкті нешкідлива, бо перед прогоном її беруть лише
     # тоді, коли ключ збігся.
-    old_key = project_mesh_key(target) if (mesh_src is None and target.is_file()) else ""
+    old_key = (project_mesh_key(target)
+               if (keep_mesh and mesh_src is None and target.is_file()) else "")
     carry = bool(old_key) and (not mesh_key or old_key == mesh_key)
     if carry:
         mesh_key = old_key
@@ -1506,27 +1531,36 @@ def write_project(path: str | os.PathLike, cfg: fc.CaseCfg, parts,
     # зберігають поверх старого, і обрив на середині запису коштував би
     # і нового файлу, і старого.
     tmp = target.with_suffix(target.suffix + ".part")
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(PROJECT_MANIFEST,
-                   json.dumps(manifest, ensure_ascii=False, indent=1))
-        for fname, data in blobs:
-            # STL уже стиснений погано, але геть без стиснення архів
-            # виходить утричі більший — лишаємо DEFLATE.
-            z.writestr(fname, data)
-        if mesh_src is not None:
-            for f in sorted(mesh_src.rglob("*")):
-                if f.is_file():
-                    z.write(f, f"{PROJECT_MESH}/polyMesh/"
-                               + f.relative_to(mesh_src).as_posix())
-        elif carry:
-            # Потоком, а не в памʼять: сітка — сотні мегабайт.
-            with zipfile.ZipFile(target, "r") as old:
-                for info in old.infolist():
-                    if info.filename.startswith(PROJECT_MESH + "/"):
-                        with old.open(info) as src, \
-                                z.open(info.filename, "w", force_zip64=True) as dst:
-                            shutil.copyfileobj(src, dst, 1 << 20)
-    os.replace(tmp, target)
+    try:
+        with fz.Writer(tmp) as z:
+            z.add_bytes(PROJECT_MANIFEST,
+                        json.dumps(manifest, ensure_ascii=False,
+                                   indent=1).encode("utf-8"))
+            for fname, data in blobs:
+                # STL уже стиснений погано, але геть без стиснення архів
+                # виходить утричі більший — лишаємо DEFLATE.
+                z.add_bytes(fname, data)
+            if mesh_src is not None:
+                names = []
+                for f in sorted(mesh_src.rglob("*")):
+                    if f.is_file():
+                        name = (f"{PROJECT_MESH}/polyMesh/"
+                                + f.relative_to(mesh_src).as_posix())
+                        z.add_file(name, f)
+                        names.append(name)
+                z.add_bytes(PROJECT_MESH_INDEX, json.dumps(
+                    {"chunk": fz.CHUNK,
+                     "files": {n: z.chunks[n] for n in names}}).encode("utf-8"))
+            elif carry:
+                # Стисненими байтами як є: без розпаковки і нового стиснення.
+                with zipfile.ZipFile(target, "r") as old, \
+                        open(target, "rb") as raw:
+                    for info in old.infolist():
+                        if info.filename.startswith(PROJECT_MESH + "/"):
+                            z.add_raw(raw, info)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
     return str(target)
 
 

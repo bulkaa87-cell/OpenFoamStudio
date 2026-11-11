@@ -1,0 +1,18 @@
+{
+ "  разом розвʼязувач: ~{need:.1f} ГБ на {n_sol} машинах{tail}": "  solver total: ~{need:.1f} GB on {n_sol} machines{tail}",
+ "  сітка збережена ({cells} комірок) — snappyHexMesh не запускається": "  mesh is saved ({cells} cells) — snappyHexMesh does not run",
+ " (кнопка «Перевірити машини»)": " (button “Check machines”)",
+ " (памʼять відома лише для {n_known} з них: {ram} ГБ)": " (memory known only for {n_known} of them: {ram} GB)",
+ " з {ram} ГБ": " of {ram} GB",
+ "{head} з {ram_gb} ГБ (під задачу {budget_gb}) — {verdict}": "{head} of {ram_gb} GB ({budget_gb} for the job) — {verdict}",
+ "{head} — памʼять машини ще невідома": "{head} — machine memory not known yet",
+ "{what} на {name}: {cells} комірок, ~{need_gb:.1f} ГБ": "{what} on {name}: {cells} cells, ~{need_gb:.1f} GB",
+ "НЕ ВЛІЗЕ": "DOES NOT FIT",
+ "Памʼять (оцінка):": "Memory (estimate):",
+ "влізе": "fits",
+ "збереженої сітки ": "of the saved mesh ",
+ "розвʼязувач × {ranks}": "solver × {ranks}",
+ "ℹ памʼять {names} ще невідома — там памʼять не перевіряю{v}": "ℹ memory of {names} not known yet — memory is not checked there{v}",
+ "⚠ розвʼязувач не влізе на {name}: {cells} комірок {src}~{need_gb:.1f} ГБ, памʼяті {ram_gb} ГБ (під задачу {budget_gb})": "⚠ solver will not fit on {name}: {cells} cells {src}~{need_gb:.1f} GB, memory {ram_gb} GB ({budget_gb} for the job)",
+ "⚠ сітка не влізе на {name}: snappyHexMesh ~{need_gb:.1f} ГБ, памʼяті {ram_gb} ГБ (під задачу {budget_gb})": "⚠ mesh will not fit on {name}: snappyHexMesh ~{need_gb:.1f} GB, memory {ram_gb} GB ({budget_gb} for the job)"
+}

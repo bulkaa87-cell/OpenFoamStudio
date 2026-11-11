@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -135,16 +135,64 @@ enum Geom {
     Tri { pts: Vec<[f32; 3]>, idx: Vec<[u32; 3]> },
     Seg(Vec<[f32; 6]>),
     Text(Vec<CGlyph>),
+    // Coloured by a field (Renderer.set_scalar_triangles / set_scalar_lines).
+    // vals: one per point, or one per triangle (cell); NaN already marked.
+    FieldTri { pts: Vec<[f32; 3]>, idx: Vec<[u32; 3]>, vals: Vec<f32>, cell: bool,
+               screen: bool },
+    FieldSeg { segs: Vec<[f32; 6]>, vals: Vec<[f32; 2]> },
 }
+
+/// The colour table of a layer coloured by a field (as Layer.lut on the GPU).
+struct Lut {
+    table: Vec<[f32; 4]>,
+    lo: f32,
+    inv: f32,
+    nan: [f32; 4],
+}
+
+impl Lut {
+    fn new(lut: &numpy::ndarray::ArrayView2<'_, f32>, clim: (f32, f32),
+           nan: (f32, f32, f32, f32)) -> PyResult<Lut> {
+        let k = lut.nrows();
+        if k == 0 || k > 256 || !(lut.ncols() == 3 || lut.ncols() == 4) {
+            return Err(PyValueError::new_err("lut (K,3|4), 1 <= K <= 256"));
+        }
+        let table = lut.rows().into_iter()
+            .map(|r| [r[0], r[1], r[2], if r.len() > 3 { r[3] } else { 1.0 }]).collect();
+        let span = clim.1 - clim.0;
+        let inv = if span.abs() > f32::MIN_POSITIVE && span.is_finite() { 1.0 / span } else { 0.0 };
+        Ok(Lut { table, lo: clim.0, inv, nan: [nan.0, nan.1, nan.2, nan.3] })
+    }
+
+    /// The same rule as lut_color in shaders.wgsl.
+    fn color(&self, s: f32) -> [f32; 4] {
+        if !(s.abs() <= 1e30) {
+            return self.nan;
+        }
+        let n = self.table.len() as f32;
+        let i = (((s - self.lo) * self.inv * n).floor()).clamp(0.0, n - 1.0) as usize;
+        self.table[i]
+    }
+}
+
+/// NaN and infinity become NAN_MARK, as on the GPU.
+fn mark(x: f32) -> f32 {
+    if x.is_finite() { x } else { NAN_MARK }
+}
+
+const NAN_MARK: f32 = 3.0e38;
 
 struct Layer {
     geom: Geom,
     pass: Pass,
+    lut: Option<Lut>,
     color: [f32; 4],
     lighting: bool,
     specular: f32,
     // Line width in device pixels (logical width × scale), as on the GPU.
     width: f32,
+    // Layers with a field: the light on a face seen edge-on (0 = 0.18).
+    ambient: f32,
     visible: bool,
     order: u64,
 }
@@ -193,6 +241,7 @@ struct STri {
     z: [f32; 3],
     iw: [f32; 3],
     vpw: [[f32; 3]; 3], // view-space position × 1/w (perspective-correct)
+    sw: [f32; 3],       // scalar × 1/w (perspective-correct)
     n: [f32; 3],        // face normal, view space
     bias: f32,
     bx: (i32, i32, i32, i32), // pixel bounds [x0, x1) × [y0, y1)
@@ -206,6 +255,11 @@ struct SSeg {
     point: bool,
     za: f32,
     zb: f32,
+    sa: f32,
+    sb: f32,
+    // 1/w at the two ends: the GPU interpolates the scalar perspective-correct.
+    iwa: f32,
+    iwb: f32,
     bias: f32,
     bx: (i32, i32, i32, i32),
 }
@@ -220,8 +274,8 @@ struct SQuad<'a> {
 
 enum Item<'a> {
     Tris { tris: Vec<STri>, pass: Pass, color: [f32; 4], lighting: bool, spec: f32,
-           persp: bool },
-    Segs { segs: Vec<SSeg>, color: [f32; 4] },
+           amb: f32, persp: bool, lut: Option<&'a Lut> },
+    Segs { segs: Vec<SSeg>, color: [f32; 4], lut: Option<&'a Lut> },
     Glyphs { quads: Vec<SQuad<'a>>, color: [f32; 4], clip: (i32, i32, i32, i32) },
 }
 
@@ -235,6 +289,7 @@ fn edge(ax: i64, ay: i64, bx: i64, by: i64, px: i64, py: i64) -> i64 {
 struct CV {
     c: [f32; 4],
     v: [f32; 3],
+    s: f32,
 }
 
 fn lerp_cv(a: CV, b: CV, t: f32) -> CV {
@@ -246,7 +301,7 @@ fn lerp_cv(a: CV, b: CV, t: f32) -> CV {
     for i in 0..3 {
         v[i] = a.v[i] + (b.v[i] - a.v[i]) * t;
     }
-    CV { c, v }
+    CV { c, v, s: a.s + (b.s - a.s) * t }
 }
 
 /// Sutherland–Hodgman against one clip-space plane: keep dist >= 0.
@@ -266,12 +321,19 @@ fn clip_poly(poly: &[CV], dist: impl Fn(&[f32; 4]) -> f32) -> Vec<CV> {
     out
 }
 
-fn setup_tri(view: &View, p: [[f32; 3]; 3], overlay: bool,
+/// `s`: the scalar at each vertex (0 without a field). `screen`: x, y are
+/// fractions of the viewport (a colour bar), at depth 0.
+#[allow(clippy::too_many_arguments)]
+fn setup_tri(view: &View, p: [[f32; 3]; 3], s: [f32; 3], screen: bool, overlay: bool,
              clip: (i32, i32, i32, i32), out: &mut Vec<STri>) {
-    let mut poly: Vec<CV> = p.iter()
-        .map(|q| {
+    let mut poly: Vec<CV> = p.iter().zip(s)
+        .map(|(q, sv)| {
+            if screen {
+                return CV { c: [q[0] * 2.0 - 1.0, q[1] * 2.0 - 1.0, 0.0, 1.0],
+                            v: [q[0], q[1], 0.0], s: sv };
+            }
             let v = mul(&view.view, *q);
-            CV { c: mul(&view.vp, *q), v: [v[0], v[1], v[2]] }
+            CV { c: mul(&view.vp, *q), v: [v[0], v[1], v[2]], s: sv }
         })
         .collect();
     let n = cross3(sub3(poly[1].v, poly[0].v), sub3(poly[2].v, poly[0].v));
@@ -297,12 +359,12 @@ fn setup_tri(view: &View, p: [[f32; 3]; 3], overlay: bool,
             }
         }
     }
-    let sv: Vec<(f32, f32, f32, f32, [f32; 3])> = poly.iter()
+    let sv: Vec<(f32, f32, f32, f32, [f32; 3], f32)> = poly.iter()
         .filter(|q| q.c[3] > 1e-20)
         .map(|q| {
             let (sx, sy, z) = view.to_screen(q.c);
             let iw = 1.0 / q.c[3];
-            (sx, sy, z, iw, [q.v[0] * iw, q.v[1] * iw, q.v[2] * iw])
+            (sx, sy, z, iw, [q.v[0] * iw, q.v[1] * iw, q.v[2] * iw], q.s * iw)
         })
         .collect();
     if sv.len() < 3 {
@@ -364,13 +426,15 @@ fn setup_tri(view: &View, p: [[f32; 3]; 3], overlay: bool,
             x, y, area, tl, z,
             iw: [v[0].3, v[1].3, v[2].3],
             vpw: [v[0].4, v[1].4, v[2].4],
+            sw: [v[0].5, v[1].5, v[2].5],
             n, bias, bx,
         });
     }
 }
 
-fn setup_seg(view: &View, s: &[f32; 6], width: f32, overlay: bool,
+fn setup_seg(view: &View, s: &[f32; 6], sv: [f32; 2], width: f32, overlay: bool,
              clip: (i32, i32, i32, i32)) -> Option<SSeg> {
+    let (mut sa, mut sb) = (sv[0], sv[1]);
     let mut ca = mul(&view.vp, [s[0], s[1], s[2]]);
     let mut cb = mul(&view.vp, [s[3], s[4], s[5]]);
     // Near plane (z >= 0): the GPU clips the quad there.
@@ -382,9 +446,13 @@ fn setup_seg(view: &View, s: &[f32; 6], width: f32, overlay: bool,
          a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t]
     };
     if ca[2] < 0.0 {
-        ca = lerp(ca, cb, ca[2] / (ca[2] - cb[2]));
+        let t = ca[2] / (ca[2] - cb[2]);
+        ca = lerp(ca, cb, t);
+        sa += (sb - sa) * t;
     } else if cb[2] < 0.0 {
-        cb = lerp(cb, ca, cb[2] / (cb[2] - ca[2]));
+        let t = cb[2] / (cb[2] - ca[2]);
+        cb = lerp(cb, ca, t);
+        sb += (sa - sb) * t;
     }
     let wa = ca[3].max(1e-6);
     let wb = cb[3].max(1e-6);
@@ -413,10 +481,11 @@ fn setup_seg(view: &View, s: &[f32; 6], width: f32, overlay: bool,
     if bx.0 >= bx.1 || bx.2 >= bx.3 {
         return None;
     }
-    Some(SSeg { a, dir, len, half, point, za, zb, bias, bx })
+    Some(SSeg { a, dir, len, half, point, za, zb, sa, sb, iwa: 1.0 / wa, iwb: 1.0 / wb, bias, bx })
 }
 
-fn shade(base: [f32; 4], lighting: bool, spec: f32, n: [f32; 3], vpos: [f32; 3],
+#[allow(clippy::too_many_arguments)]
+fn shade(base: [f32; 4], lighting: bool, spec: f32, amb: f32, n: [f32; 3], vpos: [f32; 3],
          persp: bool) -> [f32; 3] {
     let b = [base[0], base[1], base[2]];
     if !lighting {
@@ -430,7 +499,9 @@ fn shade(base: [f32; 4], lighting: bool, spec: f32, n: [f32; 3], vpos: [f32; 3],
     let k = 2.0 * dot3(n, v);
     let r = [-v[0] + k * n[0], -v[1] + k * n[1], -v[2] + k * n[2]];
     let s = spec * dot3(r, v).max(0.0).powf(30.0);
-    [b[0] * (0.18 + 0.82 * d) + s, b[1] * (0.18 + 0.82 * d) + s, b[2] * (0.18 + 0.82 * d) + s]
+    let amb = if amb > 0.0 { amb } else { 0.18 };
+    let k = amb + (1.0 - amb) * d;
+    [b[0] * k + s, b[1] * k + s, b[2] * k + s]
 }
 
 #[inline]
@@ -447,9 +518,16 @@ fn put(dst: &mut [f32; 3], c: [f32; 3], a: f32, blend: bool) {
 }
 
 /// Draw one item into the band of rows [y0, y1) (full-width rows).
-fn draw_item(item: &Item, col: &mut [[f32; 3]], dep: &mut [f32], fw: usize, y0: i32, y1: i32) {
+/// ss: samples per pixel side (2 with anti-aliasing). A field colour is
+/// looked up once per pixel, at its centre, as MSAA on the GPU shades once
+/// per pixel: the colour bands then have the same edges.
+#[allow(clippy::too_many_arguments)]
+fn draw_item(item: &Item, col: &mut [[f32; 3]], dep: &mut [f32], fw: usize, y0: i32, y1: i32,
+             ss: i32) {
+    // The centre of the pixel that frame sample k (x or y) belongs to.
+    let centre = |k: i32| ((k / ss) * ss) as f32 + 0.5 * ss as f32;
     match item {
-        Item::Tris { tris, pass, color, lighting, spec, persp, .. } => {
+        Item::Tris { tris, pass, color, lighting, spec, amb, persp, lut } => {
             let blend = *pass != Pass::Opaque;
             let write = *pass != Pass::Transparent;
             for t in tris {
@@ -486,7 +564,23 @@ fn draw_item(item: &Item, col: &mut [[f32; 3]], dep: &mut [f32], fw: usize, y0: 
                         for (k, o) in vp.iter_mut().enumerate() {
                             *o = (b[0] * t.vpw[0][k] + b[1] * t.vpw[1][k] + b[2] * t.vpw[2][k]) / q;
                         }
-                        let c = shade(*color, *lighting, *spec, t.n, vp, *persp);
+                        let base = match lut {
+                            Some(l) => {
+                                let (cxp, cyp) = ((centre(px) as f64 * SUB) as i64,
+                                                  (centre(py) as f64 * SUB) as i64);
+                                let c = [
+                                    (edge(t.x[1], t.y[1], t.x[2], t.y[2], cxp, cyp) as f64 / af) as f32,
+                                    (edge(t.x[2], t.y[2], t.x[0], t.y[0], cxp, cyp) as f64 / af) as f32,
+                                    (edge(t.x[0], t.y[0], t.x[1], t.y[1], cxp, cyp) as f64 / af) as f32,
+                                ];
+                                let qc = c[0] * t.iw[0] + c[1] * t.iw[1] + c[2] * t.iw[2];
+                                let sv = (c[0] * t.sw[0] + c[1] * t.sw[1] + c[2] * t.sw[2]) / qc;
+                                let c = l.color(sv);
+                                [c[0], c[1], c[2], color[3]]
+                            }
+                            None => *color,
+                        };
+                        let c = shade(base, *lighting, *spec, *amb, t.n, vp, *persp);
                         put(&mut col[i], c, color[3], blend);
                         if write {
                             dep[i] = z;
@@ -495,8 +589,8 @@ fn draw_item(item: &Item, col: &mut [[f32; 3]], dep: &mut [f32], fw: usize, y0: 
                 }
             }
         }
-        Item::Segs { segs, color, .. } => {
-            let c = [color[0], color[1], color[2]];
+        Item::Segs { segs, color, lut } => {
+            let c0 = [color[0], color[1], color[2]];
             for s in segs {
                 let (ya, yb) = (s.bx.2.max(y0), s.bx.3.min(y1));
                 for py in ya..yb {
@@ -524,6 +618,19 @@ fn draw_item(item: &Item, col: &mut [[f32; 3]], dep: &mut [f32], fw: usize, y0: 
                         }
                         let i = row + px as usize;
                         if z <= dep[i] {
+                            let c = match lut {
+                                Some(l) => {
+                                    let tc = if s.point { 0.0 } else {
+                                        (((centre(px) - s.a.0) * s.dir.0
+                                          + (centre(py) - s.a.1) * s.dir.1) / s.len)
+                                            .clamp(0.0, 1.0)
+                                    };
+                                    let (qa, qb) = ((1.0 - tc) * s.iwa, tc * s.iwb);
+                                    let k = l.color((qa * s.sa + qb * s.sb) / (qa + qb));
+                                    [k[0], k[1], k[2]]
+                                }
+                                None => c0,
+                            };
                             put(&mut col[i], c, color[3], true);
                             dep[i] = z;
                         }
@@ -588,7 +695,8 @@ impl CpuRenderer {
     }
 
     /// The same layout as `Renderer::layout_text` (lib.rs).
-    fn layout_text(&mut self, anchor: [f32; 4], text: &str, px: u32, center: bool,
+    /// align: 0 = text starts at the anchor, 0.5 = centred, 1 = ends there.
+    fn layout_text(&mut self, anchor: [f32; 4], text: &str, px: u32, align: f32,
                    offset: (f32, f32)) -> Vec<CGlyph> {
         let ascent = self.font.as_ref()
             .and_then(|f| f.horizontal_line_metrics(px as f32))
@@ -599,7 +707,7 @@ impl CpuRenderer {
             let glyphs: Vec<(char, Option<Metrics>)> =
                 line.chars().map(|c| (c, self.glyph(c, px))).collect();
             let width: f32 = glyphs.iter().map(|(_, g)| g.map_or(px as f32 * 0.5, |g| g.advance)).sum();
-            let mut pen = if center { -width / 2.0 } else { 0.0 } + offset.0;
+            let mut pen = -width * align + offset.0;
             let base = ascent + li as f32 * line_h + offset.1;
             for (c, g) in glyphs {
                 if let Some(g) = g {
@@ -623,6 +731,18 @@ impl CpuRenderer {
         (TRIAD_PX as f32 * self.scale).round().max(40.0) as u32
     }
 
+    /// Scalars of segments as pairs: 2M values, or M values twice.
+    fn pairs(sv: Vec<f32>, m: usize) -> PyResult<Vec<[f32; 2]>> {
+        if sv.len() == 2 * m {
+            Ok(sv.chunks_exact(2).map(|c| [mark(c[0]), mark(c[1])]).collect())
+        } else if sv.len() == m {
+            Ok(sv.into_iter().map(|x| [mark(x), mark(x)]).collect())
+        } else {
+            Err(PyValueError::new_err(format!(
+                "scalars: {} (two per segment) or {m} values, not {}", 2 * m, sv.len())))
+        }
+    }
+
     fn build_triad(&mut self) {
         let axes = [([1.0f32, 0.0, 0.0], [0.86, 0.24, 0.22], "X"),
                     ([0.0, 1.0, 0.0], [0.93, 0.83, 0.25], "Y"),
@@ -631,7 +751,7 @@ impl CpuRenderer {
         for (d, c, name) in axes {
             let px = (15.0 * self.scale).round() as u32;
             let glyphs = self.layout_text([d[0] * 0.95, d[1] * 0.95, d[2] * 0.95, 0.0], name, px,
-                                          true, (0.0, -8.0 * self.scale));
+                                          0.5, (0.0, -8.0 * self.scale));
             out.push(TriadAxis {
                 seg: [0.0, 0.0, 0.0, d[0] * 0.8, d[1] * 0.8, d[2] * 0.8],
                 color: [c[0], c[1], c[2], 1.0],
@@ -642,12 +762,14 @@ impl CpuRenderer {
         self.triad = out;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn put_layer(&mut self, name: &str, geom: Geom, pass: Pass, color: [f32; 4], lighting: bool,
                  specular: f32, width: f32) {
         let visible = self.layers.get(name).map_or(true, |l| l.visible);
         self.counter += 1;
-        self.layers.insert(name.to_string(), Layer { geom, pass, color, lighting, specular, width,
-                                                     visible, order: self.counter });
+        self.layers.insert(name.to_string(), Layer { geom, pass, lut: None, color, lighting,
+                                                     specular, width, ambient: 0.0, visible,
+                                                     order: self.counter });
     }
 
     fn quads<'a>(&'a self, view: &View, glyphs: &[CGlyph]) -> Vec<SQuad<'a>> {
@@ -661,8 +783,11 @@ impl CpuRenderer {
                 }
                 let w = c[3].max(1e-6);
                 ((c[0] / w * 0.5 + 0.5) * view.vw, view.vh - (c[1] / w * 0.5 + 0.5) * view.vh)
-            } else {
+            } else if g.anchor[3] < 1.5 {
                 (g.anchor[0] * ss, g.anchor[1] * ss)
+            } else {
+                // Fractions of the viewport from the bottom-left corner.
+                (g.anchor[0] * view.vw, (1.0 - g.anchor[1]) * view.vh)
             };
             Some(SQuad { x0: view.ox + bx + g.rect[0] * ss, y0: view.oy + by + g.rect[1] * ss,
                          w: g.rect[2] * ss, h: g.rect[3] * ss, bmp })
@@ -688,19 +813,43 @@ impl CpuRenderer {
                         let tris: Vec<STri> = idx.par_iter()
                             .fold(Vec::new, |mut acc, t| {
                                 let p = [pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]];
-                                setup_tri(&main, p, overlay, full, &mut acc);
+                                setup_tri(&main, p, [0.0; 3], false, overlay, full, &mut acc);
                                 acc
                             })
                             .reduce(Vec::new, |mut a, mut b| { a.append(&mut b); a });
                         items.push(Item::Tris { tris, pass, color: l.color, lighting: l.lighting,
-                                                spec: l.specular, persp: perspective });
+                                                spec: l.specular, amb: 0.0, persp: perspective,
+                                                lut: None });
+                    }
+                    Geom::FieldTri { pts, idx, vals, cell, screen } => {
+                        let overlay = pass == Pass::Overlay;
+                        let tris: Vec<STri> = idx.par_iter().enumerate()
+                            .fold(Vec::new, |mut acc, (k, t)| {
+                                let p = [pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]];
+                                let s = if *cell { [vals[k]; 3] } else {
+                                    [vals[t[0] as usize], vals[t[1] as usize], vals[t[2] as usize]]
+                                };
+                                setup_tri(&main, p, s, *screen, overlay, full, &mut acc);
+                                acc
+                            })
+                            .reduce(Vec::new, |mut a, mut b| { a.append(&mut b); a });
+                        items.push(Item::Tris { tris, pass, color: l.color, lighting: l.lighting,
+                                                spec: l.specular, amb: l.ambient,
+                                                persp: perspective, lut: l.lut.as_ref() });
                     }
                     Geom::Seg(segs) => {
                         let w = l.width * ss as f32;
                         let ov = pass == Pass::LineOverlay;
                         let s: Vec<SSeg> = segs.par_iter()
-                            .filter_map(|s| setup_seg(&main, s, w, ov, full)).collect();
-                        items.push(Item::Segs { segs: s, color: l.color });
+                            .filter_map(|s| setup_seg(&main, s, [0.0; 2], w, ov, full)).collect();
+                        items.push(Item::Segs { segs: s, color: l.color, lut: None });
+                    }
+                    Geom::FieldSeg { segs, vals } => {
+                        let w = l.width * ss as f32;
+                        let ov = pass == Pass::LineOverlay;
+                        let s: Vec<SSeg> = segs.par_iter().zip(vals.par_iter())
+                            .filter_map(|(s, v)| setup_seg(&main, s, *v, w, ov, full)).collect();
+                        items.push(Item::Segs { segs: s, color: l.color, lut: l.lut.as_ref() });
                     }
                     Geom::Text(g) => {
                         items.push(Item::Glyphs { quads: self.quads(&main, g), color: l.color,
@@ -719,9 +868,9 @@ impl CpuRenderer {
                                 vw: tpx as f32 * s, vh: tpx as f32 * s, ss: s };
                 let clip = tv.rect();
                 for a in &self.triad {
-                    let segs: Vec<SSeg> = setup_seg(&tv, &a.seg, a.width * s, false, clip)
-                        .into_iter().collect();
-                    items.push(Item::Segs { segs, color: a.color });
+                    let segs: Vec<SSeg> = setup_seg(&tv, &a.seg, [0.0; 2], a.width * s, false,
+                                                    clip).into_iter().collect();
+                    items.push(Item::Segs { segs, color: a.color, lut: None });
                     items.push(Item::Glyphs { quads: self.quads(&tv, &a.glyphs), color: a.color,
                                               clip });
                 }
@@ -745,7 +894,7 @@ impl CpuRenderer {
                     c[row..row + fw].fill(px);
                 }
                 for it in &items {
-                    draw_item(it, c, d, fw, y0, y1);
+                    draw_item(it, c, d, fw, y0, y1, ss as i32);
                 }
             });
         // Resolve: the average of each ss × ss block (as an MSAA resolve).
@@ -888,20 +1037,22 @@ impl CpuRenderer {
     }
 
     #[pyo3(signature = (name, anchors, texts, color, size=14, screen=false, center=false,
-                        offset=(0.0, 0.0)))]
+                        offset=(0.0, 0.0), viewport=false, right=false))]
     #[allow(clippy::too_many_arguments)]
     fn set_labels(&mut self, name: &str, anchors: Vec<(f32, f32, f32)>, texts: Vec<String>,
                   color: (f32, f32, f32, f32), size: u32, screen: bool, center: bool,
-                  offset: (f32, f32)) -> PyResult<()> {
+                  offset: (f32, f32), viewport: bool, right: bool) -> PyResult<()> {
         if anchors.len() != texts.len() {
             return Err(PyValueError::new_err("one text per anchor"));
         }
         let mut glyphs = Vec::new();
         for (a, t) in anchors.iter().zip(&texts) {
-            let anchor = [a.0, a.1, a.2, if screen { 1.0 } else { 0.0 }];
+            let kind = if viewport { 2.0 } else if screen { 1.0 } else { 0.0 };
+            let anchor = [a.0, a.1, a.2, kind];
             let px = ((size as f32) * self.scale).round().max(6.0) as u32;
             let off = (offset.0 * self.scale, offset.1 * self.scale);
-            glyphs.extend(self.layout_text(anchor, t, px, center, off));
+            let align = if center { 0.5 } else if right { 1.0 } else { 0.0 };
+            glyphs.extend(self.layout_text(anchor, t, px, align, off));
         }
         if glyphs.is_empty() {
             self.remove(name);
@@ -915,6 +1066,121 @@ impl CpuRenderer {
                        false, 0.0, 0.0);
         self.put_layer(name, Geom::Text(glyphs), Pass::Text,
                        [color.0, color.1, color.2, color.3], false, 0.0, 0.0);
+        Ok(())
+    }
+
+    /// The same as Renderer.set_scalar_triangles. `normals` are not used:
+    /// the CPU always shades flat.
+    #[pyo3(signature = (name, points, tris, scalars, lut, clim, cell=false, normals=None,
+                        opacity=1.0, nan_color=(0.66, 0.66, 0.66, 1.0), mode="opaque",
+                        lighting=true, specular=0.0, screen=false, ambient=0.0))]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn set_scalar_triangles(&mut self, name: &str, points: PyReadonlyArray2<'_, f32>,
+                            tris: PyReadonlyArray2<'_, u32>, scalars: PyReadonlyArray1<'_, f32>,
+                            lut: PyReadonlyArray2<'_, f32>, clim: (f32, f32), cell: bool,
+                            normals: Option<PyReadonlyArray2<'_, f32>>, opacity: f32,
+                            nan_color: (f32, f32, f32, f32), mode: &str, lighting: bool,
+                            specular: f32, screen: bool, ambient: f32) -> PyResult<()> {
+        let p = points.as_array();
+        let t = tris.as_array();
+        if p.ncols() != 3 || t.ncols() != 3 {
+            return Err(PyValueError::new_err("points (N,3), tris (M,3)"));
+        }
+        let pts: Vec<[f32; 3]> = p.rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect();
+        let idx: Vec<[u32; 3]> = t.rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect();
+        let vals: Vec<f32> = scalars.as_array().iter().map(|&x| mark(x)).collect();
+        let want = if cell { idx.len() } else { pts.len() };
+        if vals.len() != want {
+            return Err(PyValueError::new_err(format!("scalars: {want} values, not {}",
+                                                     vals.len())));
+        }
+        if idx.iter().flatten().any(|&i| i as usize >= pts.len()) {
+            return Err(PyValueError::new_err("triangle index out of range"));
+        }
+        if idx.is_empty() || pts.is_empty() {
+            self.remove(name);
+            return Ok(());
+        }
+        let l = Lut::new(&lut.as_array(), clim, nan_color)?;
+        let pass = match mode {
+            "overlay" => Pass::Overlay,
+            "transparent" => Pass::Transparent,
+            _ => Pass::Opaque,
+        };
+        self.put_layer(name, Geom::FieldTri { pts, idx, vals, cell, screen }, pass,
+                       [1.0, 1.0, 1.0, opacity], lighting, specular, 0.0);
+        if let Some(layer) = self.layers.get_mut(name) {
+            layer.lut = Some(l);
+            layer.ambient = ambient.clamp(0.0, 1.0);
+        }
+        Ok(())
+    }
+
+    /// The same as Renderer.set_scalar_lines.
+    #[pyo3(signature = (name, segments, scalars, lut, clim, width=1.0, overlay=false,
+                        opacity=1.0, nan_color=(0.66, 0.66, 0.66, 1.0)))]
+    #[allow(clippy::too_many_arguments)]
+    fn set_scalar_lines(&mut self, name: &str, segments: PyReadonlyArray2<'_, f32>,
+                        scalars: PyReadonlyArray1<'_, f32>, lut: PyReadonlyArray2<'_, f32>,
+                        clim: (f32, f32), width: f32, overlay: bool, opacity: f32,
+                        nan_color: (f32, f32, f32, f32)) -> PyResult<()> {
+        let s = segments.as_array();
+        if s.ncols() != 6 {
+            return Err(PyValueError::new_err("segments (M,6)"));
+        }
+        let segs: Vec<[f32; 6]> = s.rows().into_iter()
+            .map(|r| [r[0], r[1], r[2], r[3], r[4], r[5]]).collect();
+        if segs.is_empty() {
+            self.remove(name);
+            return Ok(());
+        }
+        let vals = Self::pairs(scalars.as_array().iter().copied().collect(), segs.len())?;
+        let l = Lut::new(&lut.as_array(), clim, nan_color)?;
+        self.put_layer(name, Geom::FieldSeg { segs, vals },
+                       if overlay { Pass::LineOverlay } else { Pass::Line },
+                       [1.0, 1.0, 1.0, opacity], false, 0.0, (width * self.scale).max(1.0));
+        if let Some(layer) = self.layers.get_mut(name) {
+            layer.lut = Some(l);
+        }
+        Ok(())
+    }
+
+    /// The same as Renderer.update_scalars.
+    fn update_scalars(&mut self, name: &str, scalars: PyReadonlyArray1<'_, f32>) -> PyResult<()> {
+        let sv: Vec<f32> = scalars.as_array().iter().map(|&x| mark(x)).collect();
+        let Some(l) = self.layers.get_mut(name) else {
+            return Err(PyValueError::new_err(format!("no layer {name:?}")));
+        };
+        match &mut l.geom {
+            Geom::FieldTri { vals, .. } => {
+                if vals.len() != sv.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "{name}: {} values, not {}", vals.len(), sv.len())));
+                }
+                *vals = sv;
+            }
+            Geom::FieldSeg { segs, vals } => {
+                *vals = Self::pairs(sv, segs.len())?;
+            }
+            _ => return Err(PyValueError::new_err(format!("{name}: a layer without a field"))),
+        }
+        Ok(())
+    }
+
+    /// The same as Renderer.set_colormap.
+    #[pyo3(signature = (name, lut, clim, nan_color=None, opacity=None))]
+    fn set_colormap(&mut self, name: &str, lut: PyReadonlyArray2<'_, f32>, clim: (f32, f32),
+                    nan_color: Option<(f32, f32, f32, f32)>, opacity: Option<f32>)
+                    -> PyResult<()> {
+        let Some(l) = self.layers.get_mut(name) else {
+            return Err(PyValueError::new_err(format!("no layer {name:?}")));
+        };
+        let old = l.lut.as_ref().map_or([0.66, 0.66, 0.66, 1.0], |x| x.nan);
+        let nan = nan_color.unwrap_or((old[0], old[1], old[2], old[3]));
+        l.lut = Some(Lut::new(&lut.as_array(), clim, nan)?);
+        if let Some(a) = opacity {
+            l.color[3] = a;
+        }
         Ok(())
     }
 

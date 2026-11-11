@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+from fs_i18n import tr
 
 try:                                       # pragma: no cover - залежить від збірки
     import foamview as _fv
@@ -89,7 +90,7 @@ LEVEL_TEXT = {
     "vtk": "3D: VTK (OpenGL)",
     "cpu": "3D: CPU без GPU — повільно",
 }
-PROBE_VERSION = 1          # змінити, коли міняється сама проба: кеш стане старим
+PROBE_VERSION = 2          # змінити, коли міняється сама проба: кеш стане старим
 PROBE_TIMEOUT = 25.0       # с на одного кандидата
 _HW_RANK = {"DiscreteGpu": 0, "IntegratedGpu": 1, "VirtualGpu": 2, "Other": 3}
 
@@ -133,6 +134,7 @@ def make_renderer(level: Level, hwnd, w: int, h: int, font, kind: str = "win32")
 _EYE = [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
 _BG = (204, 51, 25)
 _FG = (26, 179, 77)
+_FG2 = (40, 90, 200)
 
 
 def check_frame(r) -> tuple[bool, str]:
@@ -152,7 +154,23 @@ def check_frame(r) -> tuple[bool, str]:
     bg = img[2, 2, :3].astype(int)
     fg = img[h // 2, w // 2, :3].astype(int)
     ok = (np.abs(bg - _BG).max() < 12) and (np.abs(fg - _FG).max() < 12)
-    return bool(ok), "" if ok else f"кадр не той: тло {bg.tolist()}, центр {fg.tolist()}"
+    if not ok:
+        return False, tr("кадр не той: тло {tolist}, центр {tolist2}", tolist=bg.tolist(),
+                         tolist2=fg.tolist())
+    if hasattr(r, "set_scalar_triangles"):
+        # Шар із полем («Результати»): інший шейдер і таблиця кольорів у
+        # буфері шару — перевіряємо й його. Значення 0.75 на шкалі 0..1 з
+        # двох кольорів — другий колір.
+        lut = np.array([[c / 255 for c in _BG] + [1.0], [c / 255 for c in _FG2] + [1.0]],
+                       np.float32)
+        r.set_scalar_triangles("probe", pts, np.array([[0, 1, 2], [0, 2, 3]], np.uint32),
+                               np.full(4, 0.75, np.float32), lut, (0.0, 1.0), lighting=False)
+        img = np.asarray(r.screenshot(_EYE, _EYE, False, None))
+        r.remove("probe")
+        fg = img[h // 2, w // 2, :3].astype(int)
+        if np.abs(fg - _FG2).max() >= 12:
+            return False, tr("шар із полем не той: центр {tolist}", tolist=fg.tolist())
+    return True, ""
 
 
 def _probe_foamview(level: Level) -> tuple[bool, str]:
@@ -181,7 +199,7 @@ def _probe_vtk() -> tuple[bool, str]:
         h, w = img.shape[:2]
         fg = img[h // 2, w // 2, :3].astype(int)
         ok = np.abs(fg - _FG).max() < 20
-        return bool(ok), "OpenGL" if ok else f"кадр не той: центр {fg.tolist()}"
+        return bool(ok), "OpenGL" if ok else tr("кадр не той: центр {tolist}", tolist=fg.tolist())
     except Exception as exc:                              # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
 
@@ -247,13 +265,15 @@ def _run_probe(args: list[str]) -> tuple[bool, str]:
                             errors="replace", timeout=PROBE_TIMEOUT, creationflags=flags,
                             env=env)
     except subprocess.TimeoutExpired:
-        return False, f"проба зависла (> {PROBE_TIMEOUT:.0f} с)"
+        return False, tr("проба зависла (> {PROBE_TIMEOUT:.0f} с)",
+                         PROBE_TIMEOUT=PROBE_TIMEOUT)
     except OSError as exc:
-        return False, f"проба не запустилась: {exc}"
+        return False, tr("проба не запустилась: {exc}", exc=exc)
     lines = [s for s in cp.stdout.splitlines() if s.startswith("{")]
     if not lines:
         tail = (cp.stderr.strip().splitlines() or ["?"])[-1][:200]
-        return False, f"проба впала (код {cp.returncode}): {tail}"
+        return False, tr("проба впала (код {returncode}): {tail}", returncode=cp.returncode,
+                         tail=tail)
     res = json.loads(lines[-1])
     return bool(res.get("ok")), str(res.get("note", ""))
 
@@ -284,12 +304,11 @@ def select_level(refresh: bool = False, log=None) -> Level:
     кандидатів дочірніми процесами, ~1 с на кандидата; далі — з кешу.
     """
     import json
-    import time
     global _LEVEL
     if _LEVEL is not None and not refresh:
         return _LEVEL
     say = log or (lambda s: None)
-    forced = os.environ.get("FS_3D", "").strip().lower()
+    forced, source = forced_level()
     if forced in LEVELS:
         if forced in ("gpu", "soft") and _fv is not None:
             # Примусово — без перебору: адаптер вибирає wgpu (або
@@ -298,7 +317,8 @@ def select_level(refresh: bool = False, log=None) -> Level:
             lv = pick[0] if (forced == "soft" and pick) else Level(forced)
         else:
             lv = Level(forced if (forced == "vtk" or _fv is not None) else "vtk")
-        lv.note = f"FS_3D={forced}"
+        lv.note = (f"FS_3D={forced}" if source == "FS_3D"
+                   else f"settings: {forced}")
         _LEVEL = lv
         return lv
     if _fv is None:
@@ -316,19 +336,56 @@ def select_level(refresh: bool = False, log=None) -> Level:
                 return _LEVEL
         except (OSError, ValueError):
             pass
+    chosen = _probe_chain(adapters, key, path, say)
+    _LEVEL = chosen
+    return chosen
+
+
+def check_graphics(log=None) -> Level:
+    """«Перевірити графіку» (Файл → Налаштування → 3D): probe all candidates
+    again, as the automatic choice does, and write the cache.
+
+    It does not change the level of this process (the open views keep
+    their renderer); the next start uses the new cache.
+    """
+    say = log or (lambda s: None)
+    if _fv is None:
+        return Level("vtk", note="foamview не зібрано")
+    adapters = _adapters()
+    return _probe_chain(adapters, _cache_key(adapters), _cache_path(), say)
+
+
+def forced_level() -> tuple[str, str]:
+    """(level, source) that the user forces, or ("", ""): the environment
+    variable FS_3D first, then the program setting "view3d_backend"."""
+    env = os.environ.get("FS_3D", "").strip().lower()
+    if env:
+        return env, "FS_3D"
+    try:
+        import fs_settings
+        return fs_settings.view3d_forced()
+    except Exception:                                     # noqa: BLE001
+        return "", ""
+
+
+def _probe_chain(adapters: list[dict], key: str, path: Path, say) -> Level:
+    """Candidates one by one in child processes; the first good one wins.
+    The result goes to the cache file."""
+    import json
+    import time
     notes = []
     chosen = None
     for c in candidates(adapters):
-        say(f"3D: пробую {c.adapter} ({c.backend})…")
+        say(tr("3D: пробую {adapter} ({backend})…", adapter=c.adapter, backend=c.backend))
         ok, note = _run_probe(["foamview", c.level, c.backend or "", c.adapter or ""])
-        notes.append(f"{c.adapter} ({c.backend}): {'ок' if ok else note}")
+        notes.append(f"{c.adapter} ({c.backend}): {tr('ок') if ok else note}")
         if ok:
             chosen = Level(c.level, c.backend, c.adapter)
             break
     if chosen is None:
         say("3D: пробую VTK…")
         ok, note = _run_probe(["vtk"])
-        notes.append(f"VTK: {'ок' if ok else note}")
+        notes.append(f"VTK: {tr('ок') if ok else note}")
         chosen = Level("vtk") if ok else Level("cpu")
     chosen.note = "; ".join(notes)
     try:
@@ -338,7 +395,6 @@ def select_level(refresh: bool = False, log=None) -> Level:
                         encoding="utf-8")
     except OSError:
         pass
-    _LEVEL = chosen
     return chosen
 
 
@@ -667,14 +723,47 @@ class _RenderWindow:
 
 
 class _Mapper:
-    """GetInput() і зсув глибини: Viewport вмикає його для підсвітки, що
-    лежить РІВНО на поверхні тіла. Тут це — шар-накладка в foamview."""
+    """Те, що код бере в мапері VTK/pyvista: вхідні дані (`dataset`,
+    `SetInputData`), де лежить поле (`SetScalarModeTo…`, `SelectColorArray`)
+    і зсув глибини (Viewport вмикає його для підсвітки, що лежить РІВНО на
+    поверхні тіла; тут це — шар-накладка в foamview).
+
+    Нові дані НЕ малюють кадр самі (як і в pyvista): кадр — `render()`."""
 
     def __init__(self, actor):
         self._a = actor
 
     def GetInput(self):
         return self._a.mesh
+
+    GetInputAsDataSet = GetInput
+
+    def Update(self):
+        """Мапер VTK тут нічого не рахує: дані вже лежать у шарі."""
+
+    @property
+    def dataset(self):
+        return self._a.mesh
+
+    @dataset.setter
+    def dataset(self, ds):
+        self._a.set_mesh(ds)
+
+    def SetInputData(self, ds):
+        self._a.set_mesh(ds)
+
+    def SetScalarModeToUseCellData(self):
+        self._a.restyle(preference="cell")
+
+    def SetScalarModeToUsePointData(self):
+        self._a.restyle(preference="point")
+
+    def SelectColorArray(self, name):
+        self._a.restyle(scalars=name)
+
+    @property
+    def scalar_range(self):
+        return self._a.style.get("clim")
 
     def SetResolveCoincidentTopologyToPolygonOffset(self):
         self._a.set_overlay(True)
@@ -686,6 +775,54 @@ class _Mapper:
         self._a.set_overlay(True)
 
 
+class _Property:
+    """vtkProperty актора: те, що код міняє після add_mesh."""
+
+    def __init__(self, actor):
+        self._a = actor
+
+    def SetEdgeVisibility(self, on):
+        self._a.restyle(show_edges=bool(on))
+
+    def GetEdgeVisibility(self):
+        return bool(self._a.style.get("show_edges"))
+
+    def SetOpacity(self, a):
+        self._a.restyle(opacity=float(a))
+
+    def GetOpacity(self):
+        return float(self._a.style.get("opacity", 1.0))
+
+    def SetColor(self, *c):
+        self._a.restyle(color=tuple(c[0]) if len(c) == 1 else tuple(c))
+
+    def SetLineWidth(self, w):
+        self._a.restyle(line_width=float(w))
+
+    def SetPointSize(self, s):
+        self._a.restyle(point_size=float(s))
+
+    def __getattr__(self, name):            # решта властивостей — без дії
+        if name.startswith("Set") or name.endswith("On") or name.endswith("Off"):
+            return lambda *_a, **_k: None
+        raise AttributeError(name)
+
+
+class _Inert:
+    """Властивість тексту шкали: шрифт тут — шрифт усього Plotter (файл
+    TrueType з кирилицею), тож Set… нічого не міняють, а GetFontFile каже,
+    яким файлом шкалу підписано."""
+
+    def __init__(self, font=None):
+        self._font = font
+
+    def GetFontFile(self):
+        return self._font
+
+    def __getattr__(self, name):
+        return lambda *_a, **_k: None
+
+
 class Actor:
     """Шар у сцені — з тим, що в акторі VTK питають вікно й тести."""
 
@@ -695,19 +832,68 @@ class Actor:
         self.mesh = mesh
         self.kind = kind
         self.style = dict(style or {})
-        self.parts: list[str] = [name]      # імена шарів у foamview
+        # Імена шарів у foamview: сам шар і ребра граней (show_edges).
+        self.parts: list[str] = [name, name + EDGES]
         self._visible = True
+        self._mapper = _Mapper(self)
+        # Як значення поля лягли на шар (з _upload): де лежить поле і яка
+        # комірка сітки в кожного трикутника. Для швидкого кадру анімації.
+        self._field: dict | None = None
+        self._values = None                 # значення з set_scalars
 
     def set_overlay(self, on: bool):
         if bool(self.style.get("overlay")) != bool(on):
             self.style["overlay"] = bool(on)
             self._view._upload(self)
 
+    def set_mesh(self, ds):
+        """Нові дані того самого шару (зріз пересунули, кадр анімації)."""
+        self.mesh = _as_polydata(ds)
+        self._values = None
+        self._view._upload(self)
+
+    def restyle(self, **kw):
+        changed = {k: v for k, v in kw.items() if self.style.get(k, None) != v}
+        if changed:
+            self.style.update(changed)
+            self._view._upload(self)
+
+    def set_scalars(self, values) -> None:
+        """Лише нові значення поля — геометрія лишається на GPU (кадр
+        анімації). `values` — по точках або по комірках `mesh`, як поле
+        лежало, коли шар клали. Кадр не малює: це `render()`."""
+        v = np.ascontiguousarray(values, np.float32).ravel()
+        self._values = v
+        f = self._field
+        g = self._view.gpu
+        if f is not None and g is not None and hasattr(g, "update_scalars"):
+            try:
+                g.update_scalars(self.name, v if f["cid"] is None else v[f["cid"]])
+                return
+            except GPU_ERRORS as exc:                     # noqa: BLE001
+                if not gpu_failed(exc):
+                    raise
+        self._view._upload(self)
+
+    def SetText(self, _position, text):
+        """vtkCornerAnnotation.SetText: новий текст підпису."""
+        self.style["texts"] = [str(text)]
+        self._view._upload(self)
+
     def GetBounds(self):
         return tuple(self.mesh.bounds) if self.mesh is not None else (0,) * 6
 
+    @property
+    def mapper(self):
+        return self._mapper
+
     def GetMapper(self):
-        return _Mapper(self)
+        return self._mapper
+
+    def GetProperty(self):
+        return _Property(self)
+
+    prop = property(GetProperty)
 
     def SetVisibility(self, on):
         self._visible = bool(on)
@@ -716,13 +902,150 @@ class Actor:
     def GetVisibility(self):
         return self._visible
 
+    visibility = property(GetVisibility, SetVisibility)
+
     VisibilityOn = lambda self: self.SetVisibility(True)      # noqa: E731
     VisibilityOff = lambda self: self.SetVisibility(False)    # noqa: E731
+
+
+# Суфікси імен шарів у foamview: ребра граней актора, частини шкали.
+EDGES = "\u0001edges"
+BAR = "\u0002bar\u0000"
+
+
+class ScalarBar:
+    """Шкала кольорів (як vtkScalarBarActor у pyvista): смуга з таблицею
+    кольорів актора, позначки й заголовок. Місце — частки вікна від лівого
+    нижнього кута, тож шкала йде за зміною розміру вікна сама."""
+
+    def __init__(self, view, title: str, actor: Actor, *, vertical=False, position_x=None,
+                 position_y=None, width=None, height=None, n_labels=5, fmt=None,
+                 color=None, title_font_size=None, label_font_size=None):
+        self._view = view
+        self.title = title
+        self.actor = actor
+        self.vertical = bool(vertical)
+        d = (0.9, 0.02, 0.08, 0.45) if self.vertical else (0.35, 0.05, 0.6, 0.08)
+        self.box = tuple(float(v) if v is not None else dv for v, dv in
+                         zip((position_x, position_y, width, height), d))
+        self.n_labels = int(n_labels if n_labels is not None else 5)
+        self.fmt = fmt or "%.3g"
+        self.color = hex_rgb(color) if color is not None else (1.0, 1.0, 1.0)
+        self.title_size = int(title_font_size or 14)
+        self.label_size = int(label_font_size or 12)
+        self._visible = True
+        key = BAR + title
+        self.parts = [key + "\u0000strip", key + "\u0000labels", key + "\u0000title"]
+
+    def SetVisibility(self, on):
+        self._visible = bool(on)
+        self._view._upload_bar(self)
+        self._view._dirty()
+
+    def GetVisibility(self):
+        return self._visible
+
+    VisibilityOn = lambda self: self.SetVisibility(True)      # noqa: E731
+    VisibilityOff = lambda self: self.SetVisibility(False)    # noqa: E731
+
+    def GetTitleTextProperty(self):
+        return _Inert(getattr(self._view, "font", None) or font_path())
+
+    GetLabelTextProperty = GetTitleTextProperty
+    GetAnnotationTextProperty = GetTitleTextProperty
+
+    def ticks(self) -> list[str]:
+        lo, hi = self.actor.style["clim"]
+        n = max(self.n_labels, 2)
+        out = []
+        for v in np.linspace(lo, hi, n):
+            try:
+                out.append(self.fmt % v)
+            except (TypeError, ValueError):
+                out.append("%.3g" % v)
+        return out
 
 
 # --------------------------------------------------------------------------
 # Геометрія pyvista → масиви для foamview
 # --------------------------------------------------------------------------
+
+NAN_COLOR = (0.663, 0.663, 0.663, 1.0)     # як у pyvista (dark_gray)
+# Світло на грані, що стоїть ребром до погляду, для поверхні з полем. Більше,
+# ніж у простої поверхні (0.18): колір поля лишається близьким до кольору на
+# шкалі, як під «light kit» VTK у pyvista, а форму ще видно.
+FIELD_AMBIENT = 0.55
+CID = "__fs_cid"                           # номер комірки до розбиття на трикутники
+
+
+def _as_polydata(ds):
+    import pyvista as pv
+    if ds is None:
+        return None
+    m = ds if isinstance(ds, pv.DataSet) else pv.wrap(ds)
+    if not isinstance(m, pv.PolyData):
+        # extract_cells / підсвітка граней дає UnstructuredGrid: малюємо
+        # його поверхню (VTK робить так само).
+        m = m.extract_surface(algorithm="dataset_surface")
+    return m
+
+
+def lut_colors(cmap=None, n_colors=256) -> np.ndarray:
+    """(K, 4) float32: таблиця кольорів, як pyvista будує її для VTK —
+    K рівних відрізків шкали, колір у кожному — з мапи `cmap`."""
+    from matplotlib import colormaps
+    from matplotlib.colors import Colormap, ListedColormap
+    if cmap is None:
+        cm = colormaps["viridis"]
+    elif isinstance(cmap, Colormap):
+        cm = cmap
+    elif isinstance(cmap, str):
+        cm = colormaps[cmap]
+    else:
+        cm = ListedColormap([hex_rgb(c) for c in cmap])
+    n = int(max(1, min(int(n_colors or 256), 256)))
+    return np.ascontiguousarray(cm(np.linspace(0.0, 1.0, n)), np.float32)
+
+
+def _field(mesh, scalars, preference="point"):
+    """(значення float32 (n,), "point" | "cell") для `scalars` з add_mesh
+    (імʼя масиву або сам масив), або None. Вектор — його довжина (як pyvista)."""
+    if scalars is None or mesh is None:
+        return None
+    if isinstance(scalars, str):
+        order = ("cell", "point") if preference == "cell" else ("point", "cell")
+        for where in order:
+            data = mesh.cell_data if where == "cell" else mesh.point_data
+            if scalars in data.keys():
+                v = np.asarray(data[scalars])
+                break
+        else:
+            return None
+    else:
+        v = np.asarray(scalars)
+        n = v.shape[0] if v.ndim else 0
+        if n == mesh.n_points and not (preference == "cell" and n == mesh.n_cells):
+            where = "point"
+        elif n == mesh.n_cells:
+            where = "cell"
+        else:
+            return None
+    if v.ndim == 2:
+        v = np.linalg.norm(v, axis=1)
+    return np.ascontiguousarray(v, np.float32).ravel(), where
+
+
+def _clim(values) -> tuple[float, float]:
+    """Межі шкали за даними (pyvista: від найменшого до найбільшого)."""
+    v = np.asarray(values, float)
+    v = v[np.isfinite(v)]
+    if not v.size:
+        return (0.0, 1.0)
+    lo, hi = float(v.min()), float(v.max())
+    if hi <= lo:
+        hi = lo + max(abs(lo) * 1e-6, 1e-12)
+    return (lo, hi)
+
 
 def _has_faces(m) -> bool:
     """Чи є в сітці грані (полігони) — без застарілого n_faces_strict."""
@@ -730,43 +1053,81 @@ def _has_faces(m) -> bool:
     return faces is not None and len(faces) > 0
 
 
-def _triangles(mesh):
-    """(points float32 (N,3), tris uint32 (M,3)) поверхні, або None."""
-    import pyvista as pv
-    if mesh is None or not mesh.n_points:
+def _triangles(mesh, cells: bool = False):
+    """(points float32 (N,3), tris uint32 (M,3), cid) поверхні, або None.
+
+    cid — номер комірки `mesh` для кожного трикутника (cells=True), щоб
+    покласти на трикутники значення по комірках; None — номери збігаються.
+    Порядок комірок VTK: точки, лінії, а вже потім полігони."""
+    m = _as_polydata(mesh)
+    if m is None or not m.n_points or not _has_faces(m):
         return None
-    m = mesh if isinstance(mesh, pv.PolyData) else mesh.extract_surface(
-        algorithm="dataset_surface")
-    if not _has_faces(m):
-        return None
-    if not m.is_all_triangles:
-        m = m.triangulate()
-    faces = np.asarray(m.faces).reshape(-1, 4)[:, 1:]
-    return (np.ascontiguousarray(m.points, np.float32),
-            np.ascontiguousarray(faces, np.uint32))
+    cid = None
+    if m.is_all_triangles:
+        t = m
+        first = m.n_verts + m.n_lines
+        if cells and first:
+            cid = np.arange(first, first + len(m.faces) // 4)
+    else:
+        if cells:
+            t = m.copy(deep=False)
+            t.cell_data[CID] = np.arange(m.n_cells, dtype=np.int64)
+            t = t.triangulate()
+            cid = np.asarray(t.cell_data[CID])[t.n_verts + t.n_lines:]
+        else:
+            t = m.triangulate()
+    faces = np.asarray(t.faces).reshape(-1, 4)[:, 1:]
+    return (np.ascontiguousarray(t.points, np.float32),
+            np.ascontiguousarray(faces, np.uint32), cid)
 
 
-def _segments(mesh, wireframe: bool = False):
-    """Відрізки (M,6) float32: лінії сітки, а для wireframe — ребра граней."""
-    import pyvista as pv
-    if mesh is None or not mesh.n_points:
+def _line_index(m):
+    """(i0, i1, line) для кожного відрізка ліній PolyData `m`: номери точок
+    кінців і номер лінії (від першої лінії, без точок-вершин)."""
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+    ca = m.GetLines()
+    if ca is None or ca.GetNumberOfCells() == 0:
         return None
-    m = mesh if isinstance(mesh, pv.PolyData) else mesh.extract_surface(
-        algorithm="dataset_surface")
+    off = vtk_to_numpy(ca.GetOffsetsArray()).astype(np.int64)
+    conn = vtk_to_numpy(ca.GetConnectivityArray()).astype(np.int64)
+    if len(conn) < 2:
+        return None
+    k = np.arange(len(conn) - 1)
+    start = np.zeros(len(conn) + 1, bool)
+    start[off[1:-1]] = True                 # тут починається наступна лінія
+    keep = ~start[k + 1]
+    k = k[keep]
+    if not k.size:
+        return None
+    line = np.searchsorted(off, k, side="right") - 1
+    return conn[k], conn[k + 1], line
+
+
+def _segments(mesh, wireframe: bool = False, field=None):
+    """Відрізки (M,6) float32: лінії сітки, а для wireframe — ребра граней.
+    field — (значення, "point"|"cell") тієї ж сітки: тоді ще й значення на
+    кінцях (2M,). Повертає segs або (segs, pairs); None — ліній немає."""
+    m = _as_polydata(mesh)
+    if m is None or not m.n_points:
+        return None
     if wireframe and _has_faces(m):
         m = m.extract_all_edges()
-    pts = np.asarray(m.points, np.float32)
-    conn = np.asarray(m.lines)
-    segs, i = [], 0
-    while i < len(conn):
-        n = int(conn[i])
-        ids = conn[i + 1:i + 1 + n]
-        if n >= 2:
-            segs.append(np.column_stack([pts[ids[:-1]], pts[ids[1:]]]))
-        i += n + 1
-    if not segs:
+        field = None
+    got = _line_index(m)
+    if got is None:
         return None
-    return np.ascontiguousarray(np.vstack(segs), np.float32)
+    i0, i1, line = got
+    pts = np.asarray(m.points, np.float32)
+    segs = np.ascontiguousarray(np.column_stack([pts[i0], pts[i1]]), np.float32)
+    if field is None:
+        return segs
+    v, where = field
+    if where == "point":
+        pairs = np.column_stack([v[i0], v[i1]])
+    else:
+        c = v[m.n_verts + line]
+        pairs = np.column_stack([c, c])
+    return segs, np.ascontiguousarray(pairs, np.float32).ravel()
 
 
 def _points(mesh):
@@ -775,6 +1136,294 @@ def _points(mesh):
         return None
     p = np.asarray(mesh.points, np.float32)
     return np.ascontiguousarray(np.column_stack([p, p]), np.float32)
+
+
+def _point_normals(pts: np.ndarray, tris: np.ndarray) -> np.ndarray:
+    """Нормалі в точках (сума нормалей граней, зважена площею) — гладке
+    освітлення (smooth_shading). Бік не важливий: світло двостороннє."""
+    a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
+    fn = np.cross(b - a, c - a).astype(np.float64)
+    n = np.zeros((len(pts), 3))
+    for k in range(3):                  # bincount: у рази швидше за np.add.at
+        for j in range(3):
+            n[:, j] += np.bincount(tris[:, k], weights=fn[:, j], minlength=len(pts))
+    ln = np.linalg.norm(n, axis=1, keepdims=True)
+    return np.ascontiguousarray(n / np.where(ln > 0, ln, 1.0), np.float32)
+
+
+# --------------------------------------------------------------------------
+# Ручки, які тягнуть мишею (замість віджетів VTK)
+# --------------------------------------------------------------------------
+#
+# fs_views ставить у вʼюпорт три ручки VTK: площину зрізу
+# (vtkImplicitPlaneWidget2), відрізок і кулю насіння ліній потоку
+# (vtkLineWidget, vtkSphereWidget2). Їм потрібен інтерактор VTK, а тут його
+# нема. DragWidget — те саме для foamview: малюється шарами, мишу бере
+# GpuWidget, і в нього ті самі методи VTK, які кличе fs_views (GetOrigin,
+# SetPoint1, GetCenter, AddObserver, InvokeEvent, Off…), тож код сцен і
+# тести працюють з обома.
+
+class DragWidget:
+    """kind: "plane" — площина ⟂ осі `axis`, ручка — переріз рамки `bounds`,
+    тягнеться лише вздовж осі й не виходить за рамку; "line" — відрізок з
+    двома кінцями-ручками (тягнути кінець або весь); "sphere" — куля (ліва
+    кнопка — перенести, права — радіус)."""
+
+    GRAB_PX = 10.0                          # на скільки пікселів біля ручки беремо
+
+    def __init__(self, plotter, kind: str, *, color=(0.9, 0.92, 0.95), bounds=None,
+                 axis: int = 0, origin=(0.0, 0.0, 0.0), point1=None, point2=None,
+                 centre=None, radius: float = 1.0, line_width: float = 3.0):
+        self._pl = plotter
+        self.kind = kind
+        self.color = tuple(color)
+        self.bounds = tuple(float(b) for b in bounds) if bounds is not None else None
+        self.axis = int(axis)
+        self._origin = np.asarray(origin, float).copy()
+        self._p1 = np.asarray(point1 if point1 is not None else (0, 0, 0), float).copy()
+        self._p2 = np.asarray(point2 if point2 is not None else (1, 0, 0), float).copy()
+        self._centre = np.asarray(centre if centre is not None else (0, 0, 0), float).copy()
+        self._radius = float(radius)
+        self.line_width = float(line_width)
+        self._obs: dict[str, list] = {}
+        self._on = False
+        self._grab = None                   # що тягнуть: "plane", "p1", "p2", "line", "move", "radius"
+        self._selected = False
+        self.name = f"\u0003widget{id(self)}"
+        self.parts = [self.name + s for s in ("\u0000fill", "\u0000line", "\u0000dots")]
+
+    # --- VTK-подібне ---------------------------------------------------------
+    def AddObserver(self, event, cb):
+        self._obs.setdefault(event, []).append(cb)
+        return len(self._obs[event])
+
+    def RemoveAllObservers(self):
+        self._obs.clear()
+
+    def InvokeEvent(self, event):
+        for cb in list(self._obs.get(event, ())):
+            cb(self, event)
+
+    def On(self):
+        if not self._on:
+            self._on = True
+            self._pl._add_widget(self)
+
+    def Off(self):
+        if self._on:
+            self._on = False
+            self._pl._remove_widget(self)
+
+    def SetInteractor(self, iren):
+        if iren is None:
+            self.Off()
+
+    def GetEnabled(self):
+        return self._on
+
+    def GetOrigin(self):
+        return tuple(float(x) for x in self._origin)
+
+    def SetOrigin(self, *o):
+        o = np.asarray(o[0] if len(o) == 1 else o, float)
+        self._origin = self._clamp_origin(o)
+        self._redraw()
+
+    def GetNormal(self):
+        n = [0.0, 0.0, 0.0]
+        n[self.axis] = 1.0
+        return tuple(n)
+
+    def GetPoint1(self):
+        return tuple(float(x) for x in self._p1)
+
+    def GetPoint2(self):
+        return tuple(float(x) for x in self._p2)
+
+    def SetPoint1(self, *p):
+        self._p1 = np.asarray(p[0] if len(p) == 1 else p, float).copy()
+        self._redraw()
+
+    def SetPoint2(self, *p):
+        self._p2 = np.asarray(p[0] if len(p) == 1 else p, float).copy()
+        self._redraw()
+
+    def GetCenter(self):
+        return tuple(float(x) for x in self._centre)
+
+    def SetCenter(self, *c):
+        self._centre = np.asarray(c[0] if len(c) == 1 else c, float).copy()
+        self._redraw()
+
+    def GetRadius(self):
+        return float(self._radius)
+
+    def SetRadius(self, r):
+        self._radius = max(float(r), 1e-12)
+        self._redraw()
+
+    # --- геометрія -----------------------------------------------------------
+    def _clamp_origin(self, o):
+        o = np.asarray(o, float).copy()
+        if self.bounds is not None:
+            lo, hi = self.bounds[2 * self.axis], self.bounds[2 * self.axis + 1]
+            o[self.axis] = min(max(o[self.axis], lo), hi)
+        return o
+
+    def _plane_quad(self) -> np.ndarray:
+        """Чотири кути перерізу рамки площиною (ручка площини)."""
+        u, v = [a for a in range(3) if a != self.axis]
+        b = self.bounds or (-1, 1, -1, 1, -1, 1)
+        out = []
+        for cu, cv in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            p = np.zeros(3)
+            p[self.axis] = self._origin[self.axis]
+            p[u] = b[2 * u + cu]
+            p[v] = b[2 * v + cv]
+            out.append(p)
+        return np.asarray(out)
+
+    def _circles(self, n: int = 48) -> np.ndarray:
+        """Три великі кола кулі: відрізки (3n, 6)."""
+        t = np.linspace(0, 2 * np.pi, n + 1)
+        segs = []
+        for a, b in ((0, 1), (1, 2), (0, 2)):
+            ring = np.zeros((n + 1, 3))
+            ring[:, a] = np.cos(t)
+            ring[:, b] = np.sin(t)
+            ring = self._centre + self._radius * ring
+            segs.append(np.column_stack([ring[:-1], ring[1:]]))
+        return np.vstack(segs)
+
+    def _redraw(self):
+        if self._on:
+            self._pl._upload_widget(self)
+            self._pl._dirty()
+
+    def draw(self, g):
+        """Покласти шари віджета в foamview `g`."""
+        for p in self.parts:
+            g.remove(p)
+        if not self._on:
+            return
+        k = 1.25 if self._selected else 1.0
+        col = tuple(min(1.0, c * k) for c in self.color)
+        if self.kind == "plane":
+            q = self._plane_quad().astype(np.float32)
+            g.set_triangles(self.parts[0], q, np.array([[0, 1, 2], [0, 2, 3]], np.uint32),
+                            (*col, 0.16 if self._selected else 0.08), mode="transparent",
+                            lighting=False)
+            edges = np.array([np.concatenate([q[i], q[(i + 1) % 4]]) for i in range(4)],
+                             np.float32)
+            g.set_lines(self.parts[1], edges, (*col, 1.0), width=2.0, overlay=True)
+        elif self.kind == "line":
+            seg = np.concatenate([self._p1, self._p2]).astype(np.float32)[None, :]
+            g.set_lines(self.parts[1], seg, (*col, 1.0), width=self.line_width, overlay=True)
+            dots = np.array([np.concatenate([self._p1, self._p1]),
+                             np.concatenate([self._p2, self._p2])], np.float32)
+            g.set_lines(self.parts[2], dots, (*col, 1.0), width=10.0, overlay=True)
+        elif self.kind == "sphere":
+            g.set_lines(self.parts[1], self._circles().astype(np.float32), (*col, 0.6),
+                        width=1.5, overlay=True)
+
+    # --- миша ------------------------------------------------------------------
+    def _screen(self, p) -> np.ndarray:
+        return self._pl._to_screen(p)
+
+    def pick(self, xy, button) -> str | None:
+        """Що під курсором `xy` (пікселі вікна, y униз): імʼя ручки або None."""
+        xy = np.asarray(xy, float)
+        r = self.GRAB_PX * self._pl._dpr()
+        if self.kind == "plane":
+            if button != "left":
+                return None
+            poly = np.array([self._screen(p) for p in self._plane_quad()])
+            return "plane" if _inside(xy, poly) else None
+        if self.kind == "line":
+            if button != "left":
+                return None
+            a, b = self._screen(self._p1), self._screen(self._p2)
+            if np.linalg.norm(xy - a) <= r:
+                return "p1"
+            if np.linalg.norm(xy - b) <= r:
+                return "p2"
+            return "line" if _seg_dist(xy, a, b) <= r * 0.7 else None
+        if self.kind == "sphere":
+            c = self._screen(self._centre)
+            edge = self._screen(self._centre + self._radius * self._pl._screen_right())
+            rad = np.linalg.norm(edge - c)
+            if np.linalg.norm(xy - c) <= rad + r:
+                return "move" if button == "left" else "radius" if button == "right" else None
+        return None
+
+    def press(self, grab: str):
+        self._grab = grab
+        self._selected = True
+        self.InvokeEvent("StartInteractionEvent")
+        self._redraw()
+
+    def move(self, d_xy, xy):
+        """Курсор зрушив на d_xy пікселів (y униз)."""
+        g = self._grab
+        if g is None:
+            return
+        if g == "plane":
+            o = self._origin
+            a = self._screen(o)
+            ax = np.zeros(3)
+            ax[self.axis] = 1.0
+            span = (self.bounds[2 * self.axis + 1] - self.bounds[2 * self.axis]
+                    if self.bounds else 1.0) or 1.0
+            b = self._screen(o + ax * span)
+            d = b - a
+            dd = float(d @ d)
+            if dd > 1e-9:
+                o = o.copy()
+                o[self.axis] += float(np.asarray(d_xy) @ d) / dd * span
+                self._origin = self._clamp_origin(o)
+        elif g in ("p1", "p2", "line", "move"):
+            at = {"p1": self._p1, "p2": self._p2,
+                  "line": 0.5 * (self._p1 + self._p2), "move": self._centre}[g]
+            w = self._pl._screen_to_world_delta(at, d_xy)
+            if g in ("p1", "line"):
+                self._p1 = self._p1 + w
+            if g in ("p2", "line"):
+                self._p2 = self._p2 + w
+            if g == "move":
+                self._centre = self._centre + w
+        elif g == "radius":
+            # Угору — більше, униз — менше (як права кнопка у VTK).
+            self._radius = max(self._radius * (1.0 + 0.01 * -float(d_xy[1])), 1e-9)
+        self._redraw()
+        self.InvokeEvent("InteractionEvent")
+
+    def release(self):
+        if self._grab is None:
+            return
+        self._grab = None
+        self._selected = False
+        self._redraw()
+        self.InvokeEvent("EndInteractionEvent")
+
+
+def _inside(p, poly) -> bool:
+    """Точка в опуклому чи простому многокутнику (парність перетинів)."""
+    x, y = p
+    n, ins = len(poly), False
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            xc = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if xc > x:
+                ins = not ins
+    return ins
+
+
+def _seg_dist(p, a, b) -> float:
+    d = b - a
+    t = float(np.clip((p - a) @ d / max(float(d @ d), 1e-12), 0.0, 1.0))
+    return float(np.linalg.norm(p - (a + t * d)))
 
 
 # --------------------------------------------------------------------------
@@ -793,12 +1442,15 @@ _VIEWS = {
 class Plotter:
     """Сцена й камера поверх foamview з іменами з pyvista/VTK."""
 
-    def __init__(self, parent=None, level: Level | None = None, on_level=None):
+    def __init__(self, parent=None, level: Level | None = None, on_level=None,
+                 font: str | None = None):
         """level — хто малює (select_level()); типово GPU, як вибере wgpu.
         on_level(Level) — коли віджет сам перейшов на інший рівень (GPU
-        відмовив під час роботи → CPU)."""
+        відмовив під час роботи → CPU). font — файл шрифту TrueType
+        (типово — font_path())."""
         from fs_view3d_qt import GpuWidget
         self.level = level or Level("gpu")
+        self.font = font if font and os.path.isfile(font) else None
         self.on_level = on_level
         self.camera = Camera()
         self.camera.changed = self._dirty
@@ -877,22 +1529,57 @@ class Plotter:
             return                          # покладемо, щойно зʼявиться GPU
         for p in a.parts:
             g.remove(p)
+        a._field = None
         st = a.style
         rgb = hex_rgb(st.get("color", "#b9c4cf"))
         alpha = float(st.get("opacity", 1.0))
         col = (*rgb, alpha)
+        # Поле — лише там, де рушій уміє (старий foamview.pyd — одним кольором).
+        fld = None
+        if st.get("scalars") is not None and hasattr(g, "set_scalar_triangles"):
+            fld = _field(a.mesh, st["scalars"], st.get("preference", "point"))
+            if fld is not None and a._values is not None and len(a._values) == len(fld[0]):
+                fld = (a._values, fld[1])
         if a.kind == "surface":
-            tri = _triangles(a.mesh)
+            cells = fld is not None and fld[1] == "cell"
+            tri = _triangles(a.mesh, cells=cells)
             if tri is not None:
                 mode = ("overlay" if st.get("overlay") else
                         "transparent" if alpha < 0.999 else "opaque")
-                g.set_triangles(a.name, tri[0], tri[1], col, mode=mode,
-                                lighting=bool(st.get("lighting", True)),
-                                specular=float(st.get("specular", 0.0)))
+                lighting = bool(st.get("lighting", True))
+                if fld is not None:
+                    pts, tris, cid = tri
+                    v = fld[0] if cid is None else fld[0][cid]
+                    normals = None
+                    if not cells and lighting and st.get("smooth"):
+                        normals = _point_normals(pts, tris)
+                    g.set_scalar_triangles(
+                        a.name, pts, tris, np.ascontiguousarray(v, np.float32), st["lut"],
+                        tuple(map(float, st["clim"])), cell=cells, normals=normals,
+                        opacity=alpha, nan_color=st.get("nan_color", NAN_COLOR), mode=mode,
+                        lighting=lighting, specular=float(st.get("specular", 0.0)),
+                        ambient=FIELD_AMBIENT)
+                    a._field = {"where": fld[1], "cid": cid}
+                else:
+                    g.set_triangles(a.name, tri[0], tri[1], col, mode=mode, lighting=lighting,
+                                    specular=float(st.get("specular", 0.0)))
+                if st.get("show_edges"):
+                    seg = _segments(a.mesh, wireframe=True)
+                    if seg is not None:
+                        g.set_lines(a.name + EDGES, seg,
+                                    (*hex_rgb(st.get("edge_color", "#000000")), 1.0),
+                                    width=1.0, overlay=True)
         elif a.kind == "lines":
-            seg = _segments(a.mesh, wireframe=bool(st.get("wireframe")))
-            if seg is not None:
-                g.set_lines(a.name, seg, col, width=float(st.get("line_width", 1.0)),
+            got = _segments(a.mesh, wireframe=bool(st.get("wireframe")), field=fld)
+            if isinstance(got, tuple):
+                g.set_scalar_lines(a.name, got[0], got[1], st["lut"],
+                                   tuple(map(float, st["clim"])),
+                                   width=float(st.get("line_width", 1.0)),
+                                   overlay=bool(st.get("overlay")), opacity=alpha,
+                                   nan_color=st.get("nan_color", NAN_COLOR))
+                a._field = {"where": "segments", "cid": None}
+            elif got is not None:
+                g.set_lines(a.name, got, col, width=float(st.get("line_width", 1.0)),
                             overlay=bool(st.get("overlay")))
         elif a.kind == "points":
             seg = _points(a.mesh)
@@ -900,12 +1587,58 @@ class Plotter:
                 g.set_lines(a.name, seg, col, width=float(st.get("point_size", 5.0)),
                             overlay=True)
         elif a.kind == "text":
+            # Нові ключі — лише коли потрібні: старий foamview.pyd їх не знає.
+            extra = {k: True for k in ("viewport", "right") if st.get(k)}
             g.set_labels(a.name, st["anchors"], st["texts"], col,
                          size=int(st.get("size", 14)), screen=bool(st.get("screen")),
                          center=bool(st.get("center")),
-                         offset=tuple(st.get("offset", (0.0, 0.0))))
+                         offset=tuple(st.get("offset", (0.0, 0.0))), **extra)
         for p in a.parts:
             g.set_visible(p, a._visible)
+
+    def _upload_bar(self, bar: "ScalarBar"):
+        """Шкала: смуга з таблицею кольорів, позначки, заголовок."""
+        g = self.gpu
+        if g is None:
+            return
+        for p in bar.parts:
+            g.remove(p)
+        st = bar.actor.style
+        if not bar._visible or "lut" not in st or not hasattr(g, "set_scalar_triangles"):
+            return
+        x, y, w, h = bar.box
+        lo, hi = (float(c) for c in st["clim"])
+        col = (*bar.color, 1.0)
+        quad = np.array([[0, 1, 2], [0, 2, 3]], np.uint32)
+        ticks = bar.ticks()
+        n = len(ticks)
+        if bar.vertical:
+            # Смуга — ліва частина рамки; позначки праворуч, заголовок над
+            # рамкою з правим краєм на її правому краї (рамка стоїть біля
+            # правого краю вікна, і текст по центру вилазив би за нього).
+            x1 = x + 0.4 * w
+            pts = np.array([[x, y, 0], [x1, y, 0], [x1, y + h, 0], [x, y + h, 0]], np.float32)
+            vals = np.array([lo, lo, hi, hi], np.float32)
+            anchors = [(x1, y + h * i / (n - 1), 0.0) for i in range(n)]
+            g.set_labels(bar.parts[1], anchors, ticks, col, size=bar.label_size,
+                         viewport=True, offset=(4.0, -0.62 * bar.label_size))
+            g.set_labels(bar.parts[2], [(x + w, y + h, 0.0)], [bar.title.rstrip()], col,
+                         size=bar.title_size, viewport=True, right=True,
+                         offset=(0.0, -1.25 * bar.title_size - 6.0))
+        else:
+            # Смуга — верхня частина рамки; позначки під нею, заголовок над.
+            y0 = y + 0.35 * h
+            pts = np.array([[x, y0, 0], [x + w, y0, 0], [x + w, y + h, 0], [x, y + h, 0]],
+                           np.float32)
+            vals = np.array([lo, hi, hi, lo], np.float32)
+            anchors = [(x + w * i / (n - 1), y0, 0.0) for i in range(n)]
+            g.set_labels(bar.parts[1], anchors, ticks, col, size=bar.label_size,
+                         viewport=True, center=True, offset=(0.0, 3.0))
+            g.set_labels(bar.parts[2], [(x + 0.5 * w, y + h, 0.0)], [bar.title.rstrip()], col,
+                         size=bar.title_size, viewport=True, center=True,
+                         offset=(0.0, -1.25 * bar.title_size - 4.0))
+        g.set_scalar_triangles(bar.parts[0], pts, quad, vals, st["lut"], (lo, hi),
+                               lighting=False, screen=True)
 
     def upload_all(self):
         for a in self.actors.values():
@@ -914,6 +1647,10 @@ class Plotter:
                     self._upload(sub)
             else:
                 self._upload(a)
+        for bar in self.scalar_bars.values():
+            self._upload_bar(bar)
+        for wd in self.widgets:
+            self._upload_widget(wd)
 
     def _add(self, a: Actor, reset_camera=False) -> Actor:
         old = self.actors.get(a.name)
@@ -930,16 +1667,14 @@ class Plotter:
                  name=None, reset_camera=False, smooth_shading=False, specular=0.0,
                  point_size=None, render_points_as_spheres=False, show_edges=False,
                  render_lines_as_tubes=False, lighting=True, scalars=None, cmap=None,
-                 show_scalar_bar=True, scalar_bar_args=None, render=True, **_ignored):
-        import pyvista as pv
+                 show_scalar_bar=True, scalar_bar_args=None, render=True, clim=None,
+                 n_colors=256, preference="point", nan_color=None, edge_color=None,
+                 flip_scalars=False, **_ignored):
         name = name or f"actor{len(self.actors)}"
-        m = mesh if isinstance(mesh, pv.DataSet) else pv.wrap(mesh)
-        if not isinstance(m, pv.PolyData):
-            # extract_cells / підсвітка граней дає UnstructuredGrid: малюємо
-            # його поверхню (VTK робить так само).
-            m = m.extract_surface(algorithm="dataset_surface")
+        m = _as_polydata(mesh)
         st = dict(color=color or "#b9c4cf", opacity=opacity, specular=specular,
-                  lighting=lighting)
+                  lighting=lighting, smooth=bool(smooth_shading),
+                  show_edges=bool(show_edges), edge_color=edge_color or "#000000")
         if point_size is not None and not _has_faces(m) and not m.n_lines:
             kind = "points"
             st["point_size"] = point_size
@@ -954,7 +1689,69 @@ class Plotter:
             st["point_size"] = point_size
         else:
             kind = "surface"
-        return self._add(Actor(self, name, m, kind, st), reset_camera=reset_camera)
+        fld = _field(m, scalars, preference) if scalars is not None else None
+        if fld is not None:
+            # Межі й таблиця — раз, при додаванні (як у pyvista: нові дані
+            # мапера шкалу не міняють).
+            lut = lut_colors(cmap, n_colors)
+            if flip_scalars:
+                lut = np.ascontiguousarray(lut[::-1])
+            st.update(scalars=scalars if isinstance(scalars, str) else fld[0],
+                      preference=fld[1], lut=lut,
+                      clim=tuple(map(float, clim)) if clim is not None else _clim(fld[0]))
+            if nan_color is not None:
+                st["nan_color"] = (*hex_rgb(nan_color), 1.0)
+        a = self._add(Actor(self, name, m, kind, st), reset_camera=reset_camera)
+        if fld is not None and show_scalar_bar:
+            args = dict(scalar_bar_args or {})
+            title = args.pop("title", None) or (scalars if isinstance(scalars, str) else "")
+            self.add_scalar_bar(title=title, mapper=a.mapper, render=False, **args)
+        return a
+
+    # --- шкали -------------------------------------------------------------
+    @property
+    def scalar_bars(self) -> dict:
+        if not hasattr(self, "_bars"):
+            self._bars: dict[str, ScalarBar] = {}
+        return self._bars
+
+    def add_scalar_bar(self, title="", mapper=None, n_labels=5, fmt=None, vertical=None,
+                       position_x=None, position_y=None, width=None, height=None,
+                       color=None, title_font_size=None, label_font_size=None,
+                       render=True, **_ignored):
+        """Шкала кольорів актора `mapper` (або останнього актора з полем)."""
+        actor = getattr(mapper, "_a", None)
+        if actor is None:
+            actor = next((a for a in reversed(list(self.actors.values()))
+                          if "lut" in a.style), None)
+        if actor is None:
+            return None
+        title = str(title)
+        old = self.scalar_bars.pop(title, None)
+        if old is not None and self.gpu is not None:
+            for p in old.parts:
+                self.gpu.remove(p)
+        bar = ScalarBar(self, title, actor, vertical=bool(vertical), position_x=position_x,
+                        position_y=position_y, width=width, height=height,
+                        n_labels=n_labels, fmt=fmt, color=color,
+                        title_font_size=title_font_size, label_font_size=label_font_size)
+        self.scalar_bars[title] = bar
+        self._upload_bar(bar)
+        self._dirty()
+        return bar
+
+    def remove_scalar_bar(self, title=None, render=True):
+        if title is None:
+            titles = list(self.scalar_bars)
+        else:
+            titles = [title]
+        for t in titles:
+            bar = self.scalar_bars.pop(t, None)
+            if bar is not None and self.gpu is not None:
+                for p in bar.parts:
+                    self.gpu.remove(p)
+        if render:
+            self._dirty()
 
     def add_point_labels(self, points, labels, text_color="white", font_size=14,
                          name=None, shape=None, always_visible=True, **_ignored):
@@ -966,11 +1763,39 @@ class Plotter:
                   offset=(8.0, -8.0))
         return self._add(Actor(self, name, pv.PolyData(pts), "text", st))
 
+    # Куточки й краї вікна для add_text: (x, y) частки вікна від лівого
+    # нижнього кута; вирівнювання; верх тексту біля y чи низ.
+    _CORNERS = {
+        "lower_left": ((0.01, 0.01), "left", "bottom"),
+        "lower_right": ((0.99, 0.01), "right", "bottom"),
+        "upper_right": ((0.99, 0.99), "right", "top"),
+        "upper_edge": ((0.5, 0.99), "center", "top"),
+        "lower_edge": ((0.5, 0.01), "center", "bottom"),
+    }
+
     def add_text(self, text, position="upper_left", font_size=12, color="white",
-                 name=None, **_ignored):
+                 name=None, viewport=False, **_ignored):
+        """Напис у вікні. position — куточок ("upper_left", …) або (x, y):
+        частки вікна (viewport=True) чи пікселі від лівого нижнього кута;
+        (x, y) — лівий нижній кут тексту, як у VTK."""
         name = name or f"text{len(self.actors)}"
-        st = dict(color=color, anchors=[(8.0, 8.0, 0.0)], texts=[str(text)],
-                  size=int(font_size * 1.3), screen=True)
+        size = int(font_size * 1.3)
+        lines = max(1, str(text).count("\n") + 1)
+        st = dict(color=color, texts=[str(text)], size=size)
+        if isinstance(position, str) and position in self._CORNERS:
+            (x, y), align, edge = self._CORNERS[position]
+            st.update(anchors=[(x, y, 0.0)], viewport=True, center=align == "center",
+                      right=align == "right",
+                      offset=(0.0, -1.25 * size * lines if edge == "bottom" else 0.0))
+        elif isinstance(position, (tuple, list)) and len(position) >= 2:
+            x, y = float(position[0]), float(position[1])
+            if not viewport:
+                w, h = self.window_size
+                x, y = x / max(w, 1), y / max(h, 1)
+            st.update(anchors=[(x, y, 0.0)], viewport=True,
+                      offset=(0.0, -1.25 * size * lines))
+        else:                                   # "upper_left" та невідоме
+            st.update(anchors=[(8.0, 8.0, 0.0)], screen=True)
         return self._add(Actor(self, name, None, "text", st))
 
     def add_ruler(self, pointa, pointb, title="", font_size_factor=0.5,
@@ -1033,9 +1858,106 @@ class Plotter:
 
     def clear(self):
         self.actors.clear()
+        self.scalar_bars.clear()
         if self.gpu is not None:
             self.gpu.clear()
+            for wd in self.widgets:            # ручки живуть далі (як у VTK)
+                self._upload_widget(wd)
         self._dirty()
+
+    @property
+    def background_color(self):
+        import pyvista as pv
+        return pv.Color(self._bg[1])
+
+    # --- ручки (DragWidget) ------------------------------------------------
+    @property
+    def widgets(self) -> list:
+        if not hasattr(self, "_widgets"):
+            self._widgets: list[DragWidget] = []
+        return self._widgets
+
+    def add_drag_widget(self, kind: str, **kw) -> DragWidget:
+        """Ручка, яку тягнуть мишею (див. DragWidget). Вмикає її On()."""
+        return DragWidget(self, kind, **kw)
+
+    def _add_widget(self, wd):
+        if wd not in self.widgets:
+            self.widgets.append(wd)
+        self._upload_widget(wd)
+        self._dirty()
+
+    def _remove_widget(self, wd):
+        if wd in self.widgets:
+            self.widgets.remove(wd)
+        if self.gpu is not None:
+            for p in wd.parts:
+                self.gpu.remove(p)
+        self._dirty()
+
+    def _upload_widget(self, wd):
+        if self.gpu is not None:
+            wd.draw(self.gpu)
+
+    def _dpr(self) -> float:
+        """Фізичних пікселів кадру на логічний піксель віджета."""
+        return self.window_size[0] / max(self.interactor.width(), 1)
+
+    def _to_screen(self, p) -> np.ndarray:
+        """Світова точка → пікселі кадру від лівого ВЕРХНЬОГО кута."""
+        w, h = self.window_size
+        c = self.view_proj() @ np.array([p[0], p[1], p[2], 1.0])
+        cw = c[3] if abs(c[3]) > 1e-300 else 1e-300
+        return np.array([(c[0] / cw + 1) * 0.5 * w, (1 - c[1] / cw) * 0.5 * h])
+
+    def _screen_right(self) -> np.ndarray:
+        c = self.camera
+        return _unit(np.cross(c._foc - c._pos, c._up))
+
+    def _screen_to_world_delta(self, at, d_xy) -> np.ndarray:
+        """Зсув курсора на d_xy пікселів кадру (y униз) → зсув у світі в
+        площині екрана, що проходить через точку `at`."""
+        c = self.camera
+        h = max(self.window_size[1], 1)
+        f = _unit(c._foc - c._pos)
+        if c.parallel_projection:
+            per = 2.0 * c.parallel_scale / h
+        else:
+            depth = max(float((np.asarray(at, float) - c._pos) @ f), 1e-9)
+            per = 2.0 * depth * math.tan(math.radians(c.view_angle) / 2.0) / h
+        return (self._screen_right() * float(d_xy[0]) - c._up * float(d_xy[1])) * per
+
+    def widget_press(self, xy, button: str) -> bool:
+        """Миша натиснута в `xy` (пікселі кадру): чи взяла її ручка."""
+        for wd in reversed(self.widgets):
+            grab = wd.pick(xy, button)
+            if grab:
+                self._grabbed = wd
+                wd.press(grab)
+                return True
+        return False
+
+    def widget_move(self, d_xy, xy) -> bool:
+        wd = getattr(self, "_grabbed", None)
+        if wd is None:
+            return False
+        wd.move(d_xy, xy)
+        return True
+
+    def widget_release(self) -> bool:
+        wd = getattr(self, "_grabbed", None)
+        self._grabbed = None
+        if wd is None:
+            return False
+        wd.release()
+        return True
+
+    def reset_camera_clipping_range(self):
+        self.camera.reset_clipping(self.scene_bounds())
+
+    # Інтерактора VTK тут немає: віджети VTK (площина зрізу, насіння ліній)
+    # дивляться на `iren` і без нього не вмикаються.
+    iren = None
 
     # --- камера ------------------------------------------------------------
     @property

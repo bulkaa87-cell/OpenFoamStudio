@@ -13,10 +13,12 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import tarfile
@@ -26,6 +28,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
+from fs_i18n import tr
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
@@ -276,8 +279,8 @@ def soft_check_local(case_dir: str) -> tuple[bool, str]:
     t, d = max(times)
     if not any((d / f).is_file() and (d / f).stat().st_size
                for f in ("U", "U.gz")):
-        return (False, f"у зрізі {d.name} немає поля U")
-    return (True, f"зріз {d.name}: {len(list(d.iterdir()))} полів")
+        return (False, tr("у зрізі {name} немає поля U", name=d.name))
+    return (True, tr("зріз {name}: {n_list} полів", name=d.name, n_list=len(list(d.iterdir()))))
 
 
 def soft_restore_file(case_dir: str) -> None:
@@ -488,14 +491,14 @@ def detect_ssh(hosts: "list[str] | tuple[str, ...]" = ()) -> list[Backend]:
         rc, text = _run(ssh_argv(host, f"shopt -s nullglob; {probe}"),
                         timeout=25)
         if rc != 0:
-            out.append(Backend(kind="ssh", label=f"Сервер {host}", host=host,
+            out.append(Backend(kind="ssh", label=tr("Сервер {host}", host=host), host=host,
                                ready=False,
                                detail=(text.strip().splitlines() or
                                        ["немає звʼязку"])[-1][:120]))
             continue
         bashrc = (text.strip().splitlines() or [""])[-1].strip()
         if not bashrc:
-            out.append(Backend(kind="ssh", label=f"Сервер {host}", host=host,
+            out.append(Backend(kind="ssh", label=tr("Сервер {host}", host=host), host=host,
                                ready=False,
                                detail="звʼязок є, але OpenFOAM не знайдено"))
             continue
@@ -505,18 +508,29 @@ def detect_ssh(hosts: "list[str] | tuple[str, ...]" = ()) -> list[Backend]:
         lines = [l.strip() for l in ver.strip().splitlines() if l.strip()]
         version = lines[0] if lines else ""
         cores = lines[1] if len(lines) > 1 else "?"
-        out.append(Backend(kind="ssh", label=f"Сервер {host} / {version}",
+        out.append(Backend(kind="ssh", label=tr("Сервер {host} / {version}", host=host, version=version),
                            host=host, bashrc=bashrc, version=version,
-                           detail=f"{bashrc}, ядер {cores}"))
+                           detail=tr("{bashrc}, ядер {cores}", bashrc=bashrc, cores=cores)))
     return out
 
 
-def detect_all(ssh_hosts: "list[str] | tuple[str, ...]" = ()) -> list[Backend]:
+def detect_all(ssh_hosts: "list[str] | tuple[str, ...]" = (),
+               progress=None) -> list[Backend]:
+    """Усі бекенди: WSL, blueCFD, Docker і сервери зі списку.
+
+    `progress(name, i, n)` (за бажання) кличеться ПЕРЕД кожною перевіркою:
+    вікно показує, яку машину зараз питаємо. Перевірки довгі (SSH до 25 с
+    на сервер), і без цього вікно виглядало б завислим.
+    """
+    hosts = [h.strip() for h in ssh_hosts if (h or "").strip()]
+    steps = [("WSL", detect_wsl), ("blueCFD", detect_bluecfd),
+             ("Docker", detect_docker)]
+    steps += [(h, lambda h=h: detect_ssh([h])) for h in hosts]
     found: list[Backend] = []
-    found += detect_wsl()
-    found += detect_bluecfd()
-    found += detect_docker()
-    found += detect_ssh(ssh_hosts)
+    for i, (name, check) in enumerate(steps, 1):
+        if progress is not None:
+            progress(name, i, len(steps))
+        found += check()
     found.sort(key=lambda b: (not b.ready, b.kind != "wsl"))
     return found
 
@@ -787,14 +801,14 @@ def check_machines(ms: "list[DistMachine]") -> "tuple[list[DistMachine], str]":
     seen = set()
     for m in on:
         if not m.addr or not _ADDR_RE.fullmatch(m.addr):
-            return on, f"«{m.label() or '?'}»: адреса «{m.addr}» — не адреса"
+            return on, tr("«{v}»: адреса «{addr}» — не адреса", v=m.label() or '?', addr=m.addr)
         if m.addr in seen:
-            return on, f"адреса {m.addr} двічі"
+            return on, tr("адреса {addr} двічі", addr=m.addr)
         seen.add(m.addr)
         if m.procs < 1:
-            return on, f"«{m.label()}»: нуль процесів"
+            return on, tr("«{label}»: нуль процесів", label=m.label())
         if m.user and not re.fullmatch(r"[\w.\-]+", m.user):
-            return on, f"«{m.label()}»: користувач «{m.user}»"
+            return on, tr("«{label}»: користувач «{user}»", label=m.label(), user=m.user)
         if any(c in m.key for c in " ,='\"$`"):
             return on, f"«{m.label()}»: у шляху ключа не можна пробілів і ,='\"$`"
     if len(on) < 2:
@@ -828,11 +842,11 @@ def parse_dist_hosts(text: str) -> tuple[list[tuple[str, int]], str]:
             continue
         m = re.fullmatch(r"([\w.\-]+):(\d+)", part)
         if not m:
-            return [], (f"«{part}»: треба адреса:процеси, наприклад "
-                        "10.0.0.21:4")
+            return [], (tr("«{part}»: треба адреса:процеси, наприклад "
+                        "10.0.0.21:4", part=part))
         n = int(m.group(2))
         if n < 1:
-            return [], f"«{part}»: нуль процесів"
+            return [], tr("«{part}»: нуль процесів", part=part)
         out.append((m.group(1), n))
     if len(out) < 2:
         return out, "потрібно хоча б дві машини — інакше це звичайний прогін"
@@ -855,8 +869,8 @@ def ensure_foamdist(backend: Backend, local: Path = FOAMDIST_LOCAL) -> str:
     if backend.kind != "ssh":
         return "розподіл між машинами — лише для прогону на сервері"
     if not Path(local).is_file():
-        return (f"немає {local} — зберіть: tools\\build_rust.ps1 "
-                "(збирає й foamdist під Linux)")
+        return (tr("немає {local} — зберіть: tools\\build_rust.ps1 "
+                "(збирає й foamdist під Linux)", local=local))
     data = Path(local).read_bytes()
     want = hashlib.sha256(data).hexdigest()
     rc, out = _run(ssh_argv(backend.host,
@@ -871,10 +885,9 @@ def ensure_foamdist(backend: Backend, local: Path = FOAMDIST_LOCAL) -> str:
                            capture_output=True, timeout=300,
                            creationflags=CREATE_NO_WINDOW)
     except (OSError, subprocess.SubprocessError) as exc:
-        return f"не вдалося покласти foamdist на сервер: {exc}"
+        return tr("не вдалося покласти foamdist на сервер: {exc}", exc=exc)
     if p.returncode != 0:
-        return ("не вдалося покласти foamdist на сервер: "
-                + p.stderr.decode("utf-8", "replace")[-300:])
+        return (tr("не вдалося покласти foamdist на сервер: {decode}", decode=p.stderr.decode("utf-8", "replace")[-300:]))
     return ""
 
 
@@ -1002,18 +1015,18 @@ def scan_to_machines(found: list[dict], existing: "list[DistMachine]") -> list:
             elif "Connection refused" in err or "timed out" in err:
                 why = "ssh не відповідає"
             else:
-                why = f"не вдалося: {err[:120]}"
+                why = tr("не вдалося: {err}", err=err[:120])
             ready = False
         elif cores <= 0:
             why, ready = "ssh пускає, але це не схоже на Linux-машину", False
         elif g.get("image") != "yes":
-            why = (f"{cores} ядер, але немає образу OpenFOAM "
-                   "(podman pull docker.io/opencfd/openfoam-run:2512)")
+            why = (tr("{cores} ядер, але немає образу OpenFOAM "
+                   "(podman pull docker.io/opencfd/openfoam-run:2512)", cores=cores))
             ready = False
         else:
-            busy = f", навантаження {g.get('load')}" if g.get("load") is not None else ""
-            why = (f"{'сервер, ' if g.get('self') else ''}{cores} ядер / "
-                   f"{threads} потоків, {g.get('mem_gb', '?')} ГБ вільно{busy}")
+            busy = tr(", навантаження {get}", get=g.get('load')) if g.get("load") is not None else ""
+            why = (tr("{v}{cores} ядер / "
+                   "{threads} потоків, {get} ГБ вільно{busy}", v='сервер, ' if g.get('self') else '', cores=cores, threads=threads, get=g.get('mem_gb', '?'), busy=busy))
             ready = True
         rows.append((m, why, ready, m.addr in have))
     return rows
@@ -1039,7 +1052,7 @@ def dist_weights(backend: Backend, hosts, key: str,
                 return json.loads(line)
             except ValueError:
                 break
-    return {"error": out.strip()[-400:] or f"foamdist weights: код {rc}"}
+    return {"error": out.strip()[-400:] or tr("foamdist weights: код {rc}", rc=rc)}
 
 
 # --------------------------------------------------------------------------
@@ -1196,7 +1209,7 @@ def fetch_mesh(backend: Backend, key: str) -> str:
     rc, err = _pipe(argv, stdout_path=tmp, timeout=3600)
     try:
         if rc != 0:
-            return f"сітку не забрано: {err.strip()[-200:] or f'код {rc}'}"
+            return tr("сітку не забрано: {v}", v=err.strip()[-200:] or tr("код {rc}", rc=rc))
         shutil.rmtree(part, ignore_errors=True)
         part.mkdir()
         with tarfile.open(tmp, "r:gz") as tar:
@@ -1206,7 +1219,7 @@ def fetch_mesh(backend: Backend, key: str) -> str:
                 if (not (m.isfile() or m.isdir()) or m.name.startswith("/")
                         or ".." in Path(m.name).parts
                         or Path(m.name).parts[0] != key):
-                    return f"дивний запис в архіві сітки: {m.name}"
+                    return tr("дивний запис в архіві сітки: {name}", name=m.name)
             tar.extractall(part)
         if not _mesh_complete(part / key):
             return "в архіві сітки чогось бракує"
@@ -1237,7 +1250,7 @@ def push_mesh(backend: Backend, key: str) -> str:
             tar.add(src, arcname=key)
         rc, err = _pipe(argv, stdin_path=tmp, timeout=3600)
         if rc != 0:
-            return f"сітку не вивантажено: {err.strip()[-200:] or f'код {rc}'}"
+            return tr("сітку не вивантажено: {v}", v=err.strip()[-200:] or tr("код {rc}", rc=rc))
         return ""
     finally:
         tmp.unlink(missing_ok=True)
@@ -1404,6 +1417,29 @@ RE_ARROW = re.compile(r"^-+>\s*")
 FATAL_LINES = 6        # більше в рядок стану однаково не влазить
 
 
+def _is_float(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+_fast_mod = None
+
+
+def _fast():
+    """fs_fast, завантажений при першій потребі (тягне numpy)."""
+    global _fast_mod
+    if _fast_mod is None:
+        try:
+            import fs_fast as mod
+        except Exception:                  # pragma: no cover - збірка без numpy
+            mod = False
+        _fast_mod = mod
+    return _fast_mod or None
+
+
 @dataclass
 class RunState:
     # Час розвʼязувача. У стаціонарі це номер ітерації (1, 2, 3…), у
@@ -1438,17 +1474,17 @@ class RunState:
             return ("fatal", "у сітці є комірки нульового чи відʼємного обʼєму")
         if self.max_skewness >= SKEW_FATAL:
             return ("fatal", (
-                f"перекіс {self.max_skewness:.2f} на {self.n_skew_faces} гранях "
-                f"(поріг небезпеки {SKEW_FATAL:.0f})"))
+                tr("перекіс {max_skewness:.2f} на {n_skew_faces} гранях "
+                "(поріг небезпеки {SKEW_FATAL:.0f})", max_skewness=self.max_skewness, n_skew_faces=self.n_skew_faces, SKEW_FATAL=SKEW_FATAL)))
         if self.max_nonortho >= NONORTHO_FATAL:
-            return ("fatal", f"неортогональність {self.max_nonortho:.1f}")
+            return ("fatal", tr("неортогональність {max_nonortho:.1f}", max_nonortho=self.max_nonortho))
         if self.mesh_ok is False:
             parts = []
             if self.max_skewness:
-                parts.append(f"перекіс {self.max_skewness:.2f} "
-                             f"на {self.n_skew_faces} гранях")
+                parts.append(tr("перекіс {max_skewness:.2f} "
+                             "на {n_skew_faces} гранях", max_skewness=self.max_skewness, n_skew_faces=self.n_skew_faces))
             if self.max_nonortho:
-                parts.append(f"неортогональність {self.max_nonortho:.1f}")
+                parts.append(tr("неортогональність {max_nonortho:.1f}", max_nonortho=self.max_nonortho))
             return ("warn", ", ".join(parts) or "є зауваження")
         return ("ok", "")
 
@@ -1540,7 +1576,13 @@ class RunState:
 
         m = RE_RESID.search(line)
         if m:
-            fld, init = m.group(1), float(m.group(2))
+            fld = m.group(1)
+            # [0-9.eE+-]+ пропускає й «1.2.3»: такий рядок просто
+            # пропускаємо, а не валимо читання журналу (так само й foamrs).
+            try:
+                init = float(m.group(2))
+            except ValueError:
+                return False
             # Ux/Uy/Uz зводимо в один ряд U, беручи найгірший
             key = "U" if fld in ("Ux", "Uy", "Uz") else fld
             series = self.residuals.setdefault(key, [])
@@ -1570,13 +1612,13 @@ class RunState:
             changed = True
 
         m = RE_SKEW.search(line)
-        if m:
+        if m and _is_float(m.group(1)):
             self.max_skewness = float(m.group(1))
             self.n_skew_faces = int(m.group(2))
             changed = True
 
         m = RE_NONORTHO.search(line)
-        if m:
+        if m and _is_float(m.group(1)):
             self.max_nonortho = max(self.max_nonortho, float(m.group(1)))
             changed = True
 
@@ -1597,6 +1639,53 @@ class RunState:
             changed = True
 
         return changed
+
+    # Поля, які розбирач змінює. Їх же бере й віддає foamrs.parse_log.
+    _PARSED = ("moment", "steps", "cells", "converged", "fatal", "phase",
+               "mesh_ok", "mesh_failed_checks", "max_skewness",
+               "n_skew_faces", "max_nonortho", "negative_volumes",
+               "layer_coverage")
+
+    def feed_text(self, text: str) -> bool:
+        """Те саме, що `feed` для кожного рядка `text.split("\\n")`.
+
+        Навіщо. Підключення до прогону, що йде вже добу, перечитує весь
+        журнал: пів мільйона рядків. `feed` по рядку — це ≈ 1 с самого лише
+        розбору, foamrs (Rust) робить те саме за соті частки секунди. Без
+        foamrs, або коли блок має щось, що точно розбирає лише Python
+        (юнікодні цифри тощо), працює цикл по `feed`. Результат однаковий.
+        """
+        fast = _fast()
+        if fast is not None:
+            out = fast.parse_log(text, self._parse_state())
+            if out is not None:
+                self._take_parse(out)
+                return bool(out["changed"])
+        changed = False
+        for line in text.split("\n"):
+            if self.feed(line):
+                changed = True
+        return changed
+
+    def _parse_state(self) -> dict:
+        st = {k: getattr(self, k) for k in self._PARSED}
+        st["fatal_open"] = self._fatal_open
+        st["fatal_parts"] = list(self._fatal_parts)
+        st["last"] = [(k, s[-1]) for k, s in self.residuals.items() if s]
+        return st
+
+    def _take_parse(self, out: dict) -> None:
+        for k in self._PARSED:
+            setattr(self, k, out[k])
+        self._fatal_open = out["fatal_open"]
+        self._fatal_parts = list(out["fatal_parts"])
+        for key, pts in out["series"]:
+            series = self.residuals.get(key)
+            if series:
+                # Перша точка foamrs — це оновлена остання точка ряду.
+                series[-1:] = pts
+            else:
+                self.residuals[key] = pts
 
 
 def body_coeff_names(case_dir: str) -> list[str]:
@@ -1880,6 +1969,92 @@ def neutral_point(points: list[tuple[float, float, float, float]],
 # розкладається назад по кроках.
 _STEP_LINE = re.compile(r"^=====\s+(.+?)\s+=====$")
 
+
+def step_heads(block: str) -> list:
+    """Заголовки кроків у блоці рядків: [(початок, кінець, рядок, збіг)].
+
+    Кандидатів шукає str.find (рядок, що починається з «=====»): регулярний
+    вираз з re.M на 40 МБ журналу йде майже секунду. Вирішує _STEP_LINE.
+    """
+    heads = []
+    if block.startswith("====="):
+        at = 0
+    else:
+        at = block.find("\n=====") + 1          # 0: не знайдено
+        if at == 0:
+            return heads
+    while True:
+        end = block.find("\n", at)
+        if end < 0:
+            end = len(block)
+        line = block[at:end]
+        head = _STEP_LINE.match(line)
+        if head:
+            heads.append((at, end, line, head))
+        at = block.find("\n=====", end) + 1
+        if at == 0:
+            return heads
+
+
+def read_blocks(stream, chunk: int = 1 << 20):
+    """Текст з труби блоками цілих рядків (через "\n", без останнього "\n").
+
+    Рядки ті самі, що дав би `readline` у текстовому режимі (utf-8 із
+    заміною, "\r\n" і "\r" стають "\n"), але без виклику на кожен рядок.
+    Окремий потік читає трубу, а тут береться ВСЕ, що вже прийшло: поки
+    сервер віддає старий журнал, блоки великі; потім — по кілька рядків,
+    без затримки.
+    """
+    q: "queue.Queue[bytes | None]" = queue.Queue()
+
+    def pump():
+        try:
+            while True:
+                data = stream.read(chunk)
+                if not data:
+                    break
+                q.put(data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            q.put(None)
+
+    threading.Thread(target=pump, daemon=True, name="log-pump").start()
+    # Не io.IncrementalNewlineDecoder: він у 4-5 разів повільніший за сам
+    # utf-8, хоча в журналі з сервера "\r" майже не буває.
+    dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    rest = ""
+    cr = False             # блок скінчився на "\r": може бути пів "\r\n"
+    while True:
+        parts = [q.get()]
+        while True:
+            try:
+                parts.append(q.get_nowait())
+            except queue.Empty:
+                break
+        done = parts[-1] is None
+        if done:
+            parts.pop()
+        text = dec.decode(b"".join(parts), final=done)
+        if cr:
+            text = "\r" + text
+        cr = not done and text.endswith("\r")
+        if cr:
+            text = text[:-1]
+        if "\r" in text:
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = rest + text
+        if done:
+            if text:
+                yield text[:-1] if text.endswith("\n") else text
+            return
+        cut = text.rfind("\n")
+        if cut < 0:
+            rest = text
+            continue
+        rest = text[cut + 1:]
+        yield text[:cut]
+
 STUDIO = "studio"
 SESSION_ROOT = "$HOME/openfoam-studio"
 # Скільки секунд чекати між опитуваннями стану, поки читаємо журнал.
@@ -2123,14 +2298,14 @@ def launch_detached(backend: Backend, remote_dir: str, script: str) -> int:
         creationflags=CREATE_NO_WINDOW)
     out = up.stdout.decode("utf-8", "replace").strip()
     if up.returncode != 0:
-        raise RuntimeError(f"не вдалося покласти сценарій: {out[:200]}")
+        raise RuntimeError(tr("не вдалося покласти сценарій: {out}", out=out[:200]))
     # Звіряємо РОЗМІР, а не код повернення: саме мовчазний нульовий файл і
     # був тією вадою, тож перевіряти тут треба те, що вона ламала.
     got = next((int(t) for t in out.split() if t.isdigit()), 0)
     want = len(script.encode("utf-8"))
     if got != want:
         raise RuntimeError(
-            f"сценарій дійшов не цілим: {got} байт замість {want}")
+            tr("сценарій дійшов не цілим: {got} байт замість {want}", got=got, want=want))
 
     rc, out = _run(ssh_argv(backend.host, (
         f'cd "{remote_dir}" && {{ setsid nohup bash '
@@ -2138,7 +2313,7 @@ def launch_detached(backend: Backend, remote_dir: str, script: str) -> int:
         f'> "{remote_dir}/{STUDIO}/boot.log" 2>&1 < /dev/null & echo $!; }}'
     )), timeout=60)
     if rc != 0:
-        raise RuntimeError(f"не вдалося пустити прогін: {out.strip()[:200]}")
+        raise RuntimeError(tr("не вдалося пустити прогін: {strip}", strip=out.strip()[:200]))
     for token in reversed(out.split()):
         if token.isdigit():
             return int(token)
@@ -2290,11 +2465,14 @@ class Runner:
     def __init__(self, backend: Backend, case_dir: str,
                  on_line=None, on_step=None, on_done=None,
                  native_dir: str | None = None,
-                 stop_on_bad_mesh: bool = True):
+                 stop_on_bad_mesh: bool = True, on_block=None):
         self.backend = backend
         self.case_dir = case_dir
         self.native_dir = native_dir
         self.on_line = on_line or (lambda s: None)
+        # Блок рядків журналу одним текстом (рядки через "\n"). Без нього
+        # кожен рядок іде в on_line окремо.
+        self.on_block = on_block
         self.on_step = on_step or (lambda name, idx, total: None)
         self.on_done = on_done or (lambda ok, msg: None)
         self.stop_on_bad_mesh = stop_on_bad_mesh
@@ -2334,7 +2512,7 @@ class Runner:
             self.paused = False
             return (False, "жоден процес цього кейсу не знайдений — "
                            "можливо, прогін уже скінчився")
-        return (True, f"{'відживлено' if resume else 'завмерло'} процесів: {n}")
+        return (True, tr("{v} процесів: {n}", v='відживлено' if resume else 'завмерло', n=n))
 
     def detach(self) -> None:
         """Перестати ЧИТАТИ журнал, не чіпаючи самого прогону.
@@ -2381,8 +2559,7 @@ class Runner:
         else:
             rc, out = _run(argv, timeout=30)
             if rc != 0:
-                return (False, "не вдалося дістатися кейсу: "
-                        + (out.strip()[:200] or f"код {rc}"))
+                return (False, tr("не вдалося дістатися кейсу: {v}", v=out.strip()[:200] or tr("код {rc}", rc=rc)))
         word = next((ln.strip() for ln in reversed(out.strip().splitlines())
                      if ln.strip()), "")
         if word == "nosolver":
@@ -2454,8 +2631,8 @@ class Runner:
         }
         script = detached_script(steps, target, self.backend.bashrc, meta,
                                  stop_on_bad_mesh=self.stop_on_bad_mesh)
-        self.on_line(f"Пускаю на {self.backend.host} відчепленим — "
-                     f"прогін не залежатиме від цього вікна.")
+        self.on_line(tr("Пускаю на {host} відчепленим — "
+                     "прогін не залежатиме від цього вікна.", host=self.backend.host))
         pid = launch_detached(self.backend, target, script)
         self.remote_dir = target
         self.on_line(f"{DETACHED_MARK} {target} (процес {pid}).")
@@ -2480,8 +2657,7 @@ class Runner:
         try:
             self._proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                bufsize=1, universal_newlines=True, encoding="utf-8",
-                errors="replace", creationflags=CREATE_NO_WINDOW,
+                bufsize=0, creationflags=CREATE_NO_WINDOW,
             )
         except OSError as exc:
             self.on_done(False, str(exc))
@@ -2489,39 +2665,23 @@ class Runner:
 
         # Журнал розкладаємо по файлах кроків на льоту: вікно посилає людину
         # саме в logs/<крок>.log, і при підключенні ці файли мають бути.
-        fh = None
+        #
+        # ЧИТАЄМО БЛОКАМИ, А НЕ ПО РЯДКУ. На початку підключення приходить
+        # увесь журнал прогону — пів мільйона рядків і більше. По рядку це
+        # секунди (readline, розбір, запис і сигнал вікну на кожен рядок);
+        # блоком — соті частки: один розбір (foamrs), один запис, один
+        # сигнал. Далі блоки дрібні, і рядки йдуть так само одразу.
+        self._attach_fh = None
         try:
             assert self._proc.stdout is not None
-            for line in iter(self._proc.stdout.readline, ""):
-                line = line.rstrip("\n")
-                head = _STEP_LINE.match(line)
-                if head:
-                    title = head.group(1).strip()
-                    if fh is not None:
-                        fh.close()
-                        fh = None
-                    if title != "готово":
-                        self.current_step = title
-                        self.state.reset_step()
-                        if names and title in names:
-                            self.on_step(title, names.index(title), total)
-                        else:
-                            self.on_step(title, 0, 0)
-                        try:
-                            fh = open(self.log_dir / f"{title}.log", "w",
-                                      encoding="utf-8")
-                        except OSError:
-                            fh = None
-                if fh is not None and not head:
-                    fh.write(line + "\n")
-                    fh.flush()
-                self.state.feed(line)
-                self.on_line(line)
+            for block in read_blocks(self._proc.stdout):
+                self._attach_block(block, names, total)
                 if self._stop.is_set():
                     break
         finally:
-            if fh is not None:
-                fh.close()
+            if self._attach_fh is not None:
+                self._attach_fh.close()
+                self._attach_fh = None
         self._proc.wait()
 
         if self._stop.is_set():
@@ -2543,7 +2703,53 @@ class Runner:
                 "браком памʼяті."))
         else:
             what = final.message or "без пояснення"
-            self.on_done(False, f"{final.step or 'прогін'}: {what}")
+            self.on_done(False, f"{final.step or tr('прогін')}: {what}")
+
+    def _attach_block(self, block: str, names: list[str], total: int) -> None:
+        """Один блок журналу сесії: рядки кроків — у файли й розбирач,
+        заголовки кроків («===== крок =====») — як і раніше, по одному."""
+        pos = 0
+        for start, end, line, head in step_heads(block):
+            if start > pos:
+                self._attach_lines(block[pos:start - 1])
+            title = head.group(1).strip()
+            if self._attach_fh is not None:
+                self._attach_fh.close()
+                self._attach_fh = None
+            if title != "готово":
+                self.current_step = title
+                self.state.reset_step()
+                if names and title in names:
+                    self.on_step(title, names.index(title), total)
+                else:
+                    self.on_step(title, 0, 0)
+                try:
+                    # Двійковий файл: ті самі байти, що дав би текстовий
+                    # режим (див. _attach_lines), але без його повільного
+                    # перекладу кінців рядків.
+                    self._attach_fh = open(self.log_dir / f"{title}.log", "wb")
+                except OSError:
+                    self._attach_fh = None
+            self.state.feed(line)
+            self.on_line(line)
+            pos = end + 1
+        if pos <= len(block):
+            self._attach_lines(block[pos:])
+
+    def _attach_lines(self, text: str) -> None:
+        """Рядки без заголовків кроків (через "\\n", без останнього "\\n")."""
+        if self._attach_fh is not None:
+            data = (text + "\n").encode("utf-8")
+            if os.linesep != "\n":
+                data = data.replace(b"\n", os.linesep.encode())
+            self._attach_fh.write(data)
+            self._attach_fh.flush()
+        self.state.feed_text(text)
+        if self.on_block is not None:
+            self.on_block(text)
+        else:
+            for line in text.split("\n"):
+                self.on_line(line)
 
     def run(self, steps: list[Step]) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -2562,7 +2768,7 @@ class Runner:
             ok, msg = self._run_step(step)
             if not ok:
                 if step.optional:
-                    self.on_line(f"[{step.name}] крок необовʼязковий, продовжую: {msg}")
+                    self.on_line(tr("[{name}] крок необовʼязковий, продовжую: {msg}", name=step.name, msg=msg))
                     continue
                 self.on_done(False, f"{step.name}: {msg}")
                 return
@@ -2575,8 +2781,8 @@ class Runner:
                 level, why = self.state.mesh_severity()
                 if level == "fatal" and self.stop_on_bad_mesh:
                     self.on_done(False, (
-                        f"сітка непридатна: {why}. Розвʼязувач на ній майже "
-                        f"напевно зірветься. Дивіться logs/checkMesh.log."))
+                        tr("сітка непридатна: {why}. Розвʼязувач на ній майже "
+                        "напевно зірветься. Дивіться logs/checkMesh.log.", why=why)))
                     return
                 if level == "warn":
                     self.on_line("")
@@ -2585,8 +2791,8 @@ class Runner:
                         tip = (" Перекіс помітно вище порога: якщо розвʼязувач "
                                "зірветься в перші сотні ітерацій, вмикайте "
                                "«Стійкий старт».")
-                    self.on_line(f"[checkMesh] зауваження: {why}. Для реальної "
-                                 f"сітки це в межах норми — продовжую.{tip}")
+                    self.on_line(tr("[checkMesh] зауваження: {why}. Для реальної "
+                                 "сітки це в межах норми — продовжую.{tip}", why=why, tip=tip))
         if self._soft.is_set():
             self._finish_soft()
             return
@@ -2612,7 +2818,7 @@ class Runner:
             ok, last = soft_check_local(self.case_dir)
             self.on_line(last)
             self.on_done(ok, (f"зупинено зі зрізом — {last}" if ok else
-                              f"мʼяка зупинка: зріз не записався ({last})"))
+                              tr("мʼяка зупинка: зріз не записався ({last})", last=last)))
             return
         ok, msg = self._run_step(Step("перевірка зрізу", soft_check_command()))
         last = next((ln for ln in reversed(
@@ -2621,7 +2827,7 @@ class Runner:
             if ln.strip()), "") if (self.log_dir / "перевірка зрізу.log"
                                     ).exists() else ""
         if not ok:
-            self.on_done(False, f"мʼяка зупинка: зріз не записався ({last or msg})")
+            self.on_done(False, tr("мʼяка зупинка: зріз не записався ({v})", v=last or msg))
             return
         self.on_done(True, f"зупинено зі зрізом — {last}")
 
@@ -2667,7 +2873,7 @@ class Runner:
         if self.state.fatal:
             return (False, self.state.fatal)
         if rc != 0:
-            return (False, f"код виходу {rc}, див. logs/{step.name}.log")
+            return (False, tr("код виходу {rc}, див. {log}", rc=rc, log=f"logs/{step.name}.log"))
         return (True, "")
 
 
@@ -2719,7 +2925,7 @@ def sync_to_ssh(backend: Backend, case_dir: str, name: str) -> str:
     src = Path(case_dir)
     items = [i for i in SYNC_INPUTS if (src / i).exists()]
     if not items:
-        raise RuntimeError(f"у кейсі немає нічого з {SYNC_INPUTS}")
+        raise RuntimeError(tr("у кейсі немає нічого з {SYNC_INPUTS}", SYNC_INPUTS=SYNC_INPUTS))
     remote = remote_dir_for(name)
     tmp = Path(tempfile.gettempdir()) / f"ofs-{name}.tar"
     try:
@@ -2735,7 +2941,7 @@ def sync_to_ssh(backend: Backend, case_dir: str, name: str) -> str:
     finally:
         tmp.unlink(missing_ok=True)
     if rc != 0:
-        raise RuntimeError(f"не вдалося покласти кейс на сервер: {err.strip()[:200]}")
+        raise RuntimeError(tr("не вдалося покласти кейс на сервер: {strip}", strip=err.strip()[:200]))
     return remote
 
 
@@ -2770,7 +2976,10 @@ def sync_from_ssh(backend: Backend, remote_dir: str, case_dir: str) -> None:
         'for d in [0-9]*/; do n=${d%/}; '
         'case "$n" in ""|*[!0-9.]*) continue;; esac; out="$out $n"; done; '
         + "".join(f'[ -e "{r}" ] && out="$out {r}"; ' for r in SYNC_OUTPUTS)
-        + '[ -z "$out" ] && exit 3; tar cf - $out'
+        # Проміжні поверхні (fs_live) лишаються на сервері: це десятки МБ на
+        # кожен запис, а після прогону є повні зрізи.
+        + '[ -z "$out" ] && exit 3; '
+        "tar cf - --exclude='postProcessing/studioLive*' $out"
     )
     rc, err = _pipe(ssh_argv(backend.host, listing), stdout_path=tmp)
     try:
@@ -2778,8 +2987,7 @@ def sync_from_ssh(backend: Backend, remote_dir: str, case_dir: str) -> None:
             raise RuntimeError("на сервері немає результатів: прогін не дійшов "
                                "до запису")
         if rc != 0:
-            raise RuntimeError("не вдалося забрати результати з сервера: "
-                               + (err.strip()[:200] or f"код {rc}"))
+            raise RuntimeError(tr("не вдалося забрати результати з сервера: {v}", v=err.strip()[:200] or tr("код {rc}", rc=rc)))
         with tarfile.open(tmp, "r") as tar:
             tar.extractall(dst)
     finally:
@@ -2808,7 +3016,7 @@ def sync_to_wsl(backend: Backend, case_dir: str, name: str) -> str:
         f'echo "$HOME/openfoam-studio/{name}"')
     rc, out = _run(wsl_argv(backend.distro, cmd), timeout=600)
     if rc != 0:
-        raise RuntimeError(f"не вдалося скопіювати кейс у WSL: {out.strip()}")
+        raise RuntimeError(tr("не вдалося скопіювати кейс у WSL: {strip}", strip=out.strip()))
     return out.strip().splitlines()[-1].strip()
 
 
@@ -2843,8 +3051,7 @@ def sync_from_wsl(backend: Backend, native_dir: str, case_dir: str) -> None:
         # виглядала як успішна: людина дивилася на результати попереднього
         # прогону й не мала жодного способу про це дізнатися.
         raise RuntimeError(
-            "не вдалося повернути результати з WSL: "
-            + (out.strip().splitlines()[-1] if out.strip() else f"код {rc}"))
+            tr("не вдалося повернути результати з WSL: {v}", v=out.strip().splitlines()[-1] if out.strip() else tr("код {rc}", rc=rc)))
 
 
 def find_paraview() -> str:

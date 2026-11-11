@@ -33,6 +33,7 @@ import pyvista as pv
 
 import fs_fast
 import fs_views as fv
+from fs_i18n import tr
 
 # Поля на тілі: ключ → (підпис шкали, симетрична шкала, звідки береться).
 BODY_FIELDS = {
@@ -237,7 +238,7 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
     _say(say, "читаю сітку першого кадру", 0.0)
     volume = results.internal(tvals[0])
     if volume is None:
-        raise ValueError(f"У моменті {times[0]} немає сітки з полями.")
+        raise ValueError(tr("У моменті {times} немає сітки з полями.", times=times[0]))
     n_cells = fs_fast.n_cells(case, times[0])
     moving = fs_fast.mesh_moves(case, times)
     fast = (not force_vtk and not moving and n_cells == volume.n_cells
@@ -276,8 +277,8 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
                                     "збіглися — тіло читаю через VTK.")
                 owners = None
         except (OSError, ValueError) as exc:
-            frames.notes.append(f"Власники граней не прочиталися ({exc}) — "
-                                f"тіло через VTK.")
+            frames.notes.append(tr("Власники граней не прочиталися ({exc}) — "
+                                "тіло через VTK.", exc=exc))
             owners = None
 
     # --- геометрія зрізу --------------------------------------------------
@@ -358,7 +359,7 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
                 try:
                     lines = fv.case_streamlines(pt, bodies, fs, rotors)
                 except Exception as exc:                  # noqa: BLE001
-                    frames.notes.append(f"Лінії кадру {times[i]}: {exc}")
+                    frames.notes.append(tr("Лінії кадру {times}: {exc}", times=times[i], exc=exc))
                     lines = pv.PolyData()
                 if lines.n_points and "U" in lines.point_data:
                     lines.point_data[ANIM] = np.linalg.norm(
@@ -372,7 +373,7 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
         patch_req = [(w, body_n[w]) for w in walls]
         for a in range(0, total, CHUNK):
             chunk = times[a:a + CHUNK]
-            _say(say, f"кадри {a + 1}–{a + len(chunk)} з {total}",
+            _say(say, tr("кадри {v}–{v2} з {total}", v=a + 1, v2=a + len(chunk), total=total),
                  a / max(total, 1))
             paths, index = [], []
             for t in chunk:
@@ -393,10 +394,10 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
                 frame_from(internal, patch_vals, a + j)
     else:
         for i, t in enumerate(tvals):
-            _say(say, f"кадр {i + 1} з {total} (через VTK)", i / max(total, 1))
+            _say(say, tr("кадр {v} з {total} (через VTK)", v=i + 1, total=total), i / max(total, 1))
             vol = results.internal(t)
             if vol is None:
-                raise ValueError(f"У моменті {times[i]} немає полів.")
+                raise ValueError(tr("У моменті {times} немає полів.", times=times[i]))
             internal = {n: np.asarray(vol.cell_data[n]) for n in names
                         if n in vol.cell_data}
             patch_vals = {}

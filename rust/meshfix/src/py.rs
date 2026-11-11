@@ -1,6 +1,6 @@
 //! Python module `meshfix`: repair(points, tris) for fs_meshfix.py.
 
-use crate::{mesh_info, repair as do_repair, Mesh, MeshInfo, RepairOptions};
+use crate::{mesh_info, repair as do_repair, Mesh, MeshInfo, Method, RepairOptions};
 use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -24,9 +24,10 @@ fn info_dict<'py>(py: Python<'py>, i: &MeshInfo) -> PyResult<Bound<'py, PyDict>>
 /// alpha_wrap: fallback 1, an alpha wrap when the 12 steps leave defects.
 /// alpha, offset: ball radius and offset of that wrap in the units of the
 /// points (None = from the model). volume: fallback 2, the volumetric
-/// remesh.
+/// remesh. method: "meshfix" (the 12 steps and the fallbacks), or one
+/// forced method, "alphawrap" or "volume" (see lib.rs `Method`).
 #[pyfunction]
-#[pyo3(signature = (points, tris, normalize=true, wrap=true, stop_after=None, alpha_wrap=true, alpha=None, offset=None, volume=true))]
+#[pyo3(signature = (points, tris, normalize=true, wrap=true, stop_after=None, alpha_wrap=true, alpha=None, offset=None, volume=true, method="meshfix"))]
 #[allow(clippy::too_many_arguments)]
 fn repair<'py>(
     py: Python<'py>,
@@ -39,7 +40,10 @@ fn repair<'py>(
     alpha: Option<f64>,
     offset: Option<f64>,
     volume: bool,
+    method: &str,
 ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyDict>)> {
+    let method = Method::from_name(method)
+        .ok_or_else(|| PyValueError::new_err(format!("method: no method {method}")))?;
     let stop = match stop_after {
         None => None,
         Some(name) => Some(
@@ -75,6 +79,7 @@ fn repair<'py>(
         wrap_alpha: alpha,
         wrap_offset: offset,
         volume_fallback: volume,
+        method,
         ..Default::default()
     };
     let (mesh, report) = py.detach(move || {
@@ -115,6 +120,7 @@ fn repair<'py>(
     let undone: Vec<&str> = report.undone.iter().map(|s| s.name()).collect();
     d.set_item("undone", undone)?;
     d.set_item("fallback", report.fallback.map(|s| s.name()))?;
+    d.set_item("method", method.name())?;
     if let Some(w) = &report.alpha_wrap {
         let a = PyDict::new(py);
         a.set_item("used", report.fallback == Some(crate::Stage::AlphaWrap))?;

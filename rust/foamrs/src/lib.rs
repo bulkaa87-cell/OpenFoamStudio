@@ -11,6 +11,7 @@ use pyo3::types::PyDict;
 use rayon::prelude::*;
 
 pub mod field;
+pub mod logparse;
 pub mod surface;
 pub mod topo;
 
@@ -272,6 +273,7 @@ fn foamrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mesh_check, m)?)?;
     m.add_function(wrap_pyfunction!(shell_projections, m)?)?;
     m.add_function(wrap_pyfunction!(threads, m)?)?;
+    m.add_function(wrap_pyfunction!(logparse::parse_log, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

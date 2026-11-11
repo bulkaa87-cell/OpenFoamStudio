@@ -43,6 +43,7 @@ import pyvista as pv
 import vtk
 from matplotlib.colors import Colormap, LinearSegmentedColormap, Normalize
 from matplotlib.ticker import MaxNLocator
+from fs_i18n import tr
 
 BG = "#0b0d10"            # тло вʼюпорта результатів
 INK = "#e6ebf1"           # основний текст і контур тіла
@@ -186,6 +187,12 @@ class FieldSpec:
     pct: float = 99.0
     floor: float | None = None   # фіксований низ односторонньої шкали
     weighted: bool = True        # зважувати площею, а не рахувати комірки
+
+    def __post_init__(self):
+        # The texts are shown in the interface language. The language is
+        # read before this module is imported, and a change needs a restart.
+        for name in ("title", "label", "about"):
+            object.__setattr__(self, name, tr(getattr(self, name)))
 
 
 FIELDS = (
@@ -845,8 +852,8 @@ class SliceScene:
         lost = [a for a in self.spec.arrays if a not in have]
         if lost:
             raise ValueError(
-                f"У обʼємі немає {', '.join(lost)} — поле «{self.spec.key}» "
-                f"показати нічим.")
+                tr("У обʼємі немає {lost} — поле «{key}» "
+                "показати нічим.", lost=', '.join(lost), key=self.spec.key))
 
     def _decorate(self, s):
         """Кладе в переріз скаляр для розфарбування під іменем VALUE."""
@@ -951,10 +958,10 @@ class SliceScene:
 
     def caption(self) -> str:
         cut_txt = ", ".join(self.cut_names) if self.cut_names else "тіла не зачіпає"
-        text = (f"зріз {AXES[self.axis]} = {self.pos * 1000:.1f} мм"
-                f"   ·   контур: {cut_txt}")
+        text = (tr("зріз {AXES} = {v:.1f} мм"
+                "   ·   контур: {cut_txt}", AXES=AXES[self.axis], v=self.pos * 1000, cut_txt=cut_txt))
         if self.arrows:
-            text += f"   ·   стрілка в клітинку = {self.arrow_ref():.3g} м/с"
+            text += tr("   ·   стрілка в клітинку = {arrow_ref:.3g} м/с", arrow_ref=self.arrow_ref())
         return text
 
     # --- стрілки --------------------------------------------------------
@@ -1098,7 +1105,21 @@ class SliceScene:
         iren = getattr(self.plotter, "iren", None)
         interactor = getattr(iren, "interactor", None)
         if interactor is None:
-            return False
+            # foamview (fs_view3d.Plotter): своя ручка з тими ж методами
+            # (GetOrigin, SetOrigin, AddObserver), що й у VTK.
+            make = getattr(self.plotter, "add_drag_widget", None)
+            if make is None:
+                return False
+            self._on_move = on_move
+            origin = list(self.volume.center)
+            origin[self.axis] = self.pos
+            wid = make("plane", axis=self.axis, bounds=self._widget_bounds(),
+                       origin=origin, color=pv.Color(INK).float_rgb)
+            wid.AddObserver("InteractionEvent", lambda *_: self._dragged(False))
+            wid.AddObserver("EndInteractionEvent", lambda *_: self._dragged(True))
+            wid.On()
+            self._widget, self._rep = wid, wid
+            return True
         self._on_move = on_move
 
         rep = vtk.vtkImplicitPlaneRepresentation()
@@ -1303,7 +1324,7 @@ def _nice_length(x: float) -> float:
 
 
 def _length_text(metres: float) -> str:
-    return f"{metres * 1000:g} мм" if metres < 1.0 else f"{metres:g} м"
+    return tr("{v:g} мм", v=metres * 1000) if metres < 1.0 else tr("{metres:g} м", metres=metres)
 
 
 def compose(grid: list[list[Frame]], *, title: str, subtitle: str = "",
@@ -1468,24 +1489,23 @@ def slice_report(views: list[CaseView], *, field: str, axis: int = 1,
                            arrows=arrows)
               for v in views]
     fs = views[0].fs
-    head = (f"{name} — " if name else "") + \
-        f"зріз {AXES[axis]} = {pos * 1000:.0f} мм,   U∞ = {fs.u_inf:g} м/с"
+    head = tr("{v}зріз {AXES} = {v2:.0f} мм,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", AXES=AXES[axis], v2=pos * 1000, u_inf=fs.u_inf)
     if subtitle is None:
         cut = sorted({n for f in frames for n in f.cut})
         missed = sorted({n for f in frames for n in f.missed} - set(cut))
         lines = [spec.about] if spec.about else []
         if cut:
-            note = "контур: " + ", ".join(cut)
+            note = tr("контур: {cut}", cut=", ".join(cut))
             if missed:
-                note += " — " + ", ".join(missed) + " на цій відстані вже не перетинається"
+                note += tr(" — {missed} на цій відстані вже не перетинається", missed=", ".join(missed))
             lines.append(note)
         if arrows:
             # Масштаб стрілок — з першого кейса: свій у кожного означав би, що
             # однакові стрілки в двох кадрах — різні швидкості.
             ref = Sampler(views[0].volume, views[0].bodies, axis).inplane_ref(fs)
-            lines.append(f"стрілки — швидкість у площині зрізу; стрілка в "
-                         f"клітинку = {ref:.3g} м/с; червоні — повітря йде "
-                         f"проти потоку (відрив)")
+            lines.append(tr("стрілки — швидкість у площині зрізу; стрілка в "
+                         "клітинку = {ref:.3g} м/с; червоні — повітря йде "
+                         "проти потоку (відрив)", ref=ref))
         subtitle = "\n".join(lines)
     return compose([[f] for f in frames], title=head, subtitle=subtitle,
                    bar=(spec, lim[0], lim[1]), path=path)
@@ -1593,7 +1613,7 @@ def trace(volume, seeds: np.ndarray, *, length: float,
     `direction` — "forward" (за потоком), "backward" (звідки прийшло) або
     "both". Кожна точка отримує швидкість SPEED — для розфарбування."""
     if direction not in ("forward", "backward", "both"):
-        raise ValueError(f"невідомий напрямок ліній: {direction!r}")
+        raise ValueError(tr("невідомий напрямок ліній: {direction!r}", direction=direction))
     lines = volume.streamlines_from_source(
         pv.PolyData(np.asarray(seeds, dtype=float)), vectors="U",
         integration_direction=direction, max_length=float(length),
@@ -1757,7 +1777,7 @@ def seed_points(seeding: Seeding, bounds: tuple, fs: Freestream,
             raise ValueError("Площину зрізу не задано.")
         axis, pos = seeding.plane
         return plane_seeds(int(axis), float(pos), bounds, count)
-    raise ValueError(f"невідоме місце насіння: {mode!r}")
+    raise ValueError(tr("невідоме місце насіння: {mode!r}", mode=mode))
 
 
 def seed_label(seeding: Seeding | None, rotors=()) -> str:
@@ -1777,7 +1797,7 @@ def seed_label(seeding: Seeding | None, rotors=()) -> str:
     else:
         axis = int(seeding.plane[0]) if seeding.plane else 0
         pos = float(seeding.plane[1]) if seeding.plane else 0.0
-        text = f"площина {AXES[axis].upper()} = {pos * 1000:g} мм"
+        text = tr("площина {upper} = {v:g} мм", upper=AXES[axis].upper(), v=pos * 1000)
     if seeding is not None and seeding.direction != "forward":
         text += ", " + dict(SEED_DIRECTIONS)[seeding.direction].lower()
     return text
@@ -1796,7 +1816,7 @@ class SeedWidget:
                  line: tuple | None = None, centre=None,
                  radius: float | None = None, on_change=None):
         if kind not in SEED_DRAGGABLE:
-            raise ValueError(f"тягнути можна лише {SEED_DRAGGABLE}: {kind!r}")
+            raise ValueError(tr("тягнути можна лише {SEED_DRAGGABLE}: {kind!r}", SEED_DRAGGABLE=SEED_DRAGGABLE, kind=kind))
         self.kind = kind
         self.plotter = plotter
         self._on_change = on_change
@@ -1804,9 +1824,24 @@ class SeedWidget:
         self._rep = None
         iren = getattr(plotter, "iren", None)
         interactor = getattr(iren, "interactor", None)
-        if interactor is None:
-            return
         ink = pv.Color(INK).float_rgb
+        if interactor is None:
+            # foamview (fs_view3d.Plotter): свої ручки з тими ж методами VTK.
+            make = getattr(plotter, "add_drag_widget", None)
+            if make is None:
+                return
+            if kind == "line":
+                p0, p1 = line
+                w = make("line", point1=p0, point2=p1, bounds=bounds, color=ink,
+                         line_width=3.0)
+                self._widget = w
+            else:
+                w = make("sphere", centre=centre, radius=float(radius), bounds=bounds,
+                         color=ink)
+                self._widget, self._rep = w, w
+            w.AddObserver("EndInteractionEvent", lambda *_: self._released())
+            w.On()
+            return
         if kind == "line":
             w = vtk.vtkLineWidget()
             w.SetInteractor(interactor)
@@ -2101,11 +2136,11 @@ def streams_report(views: list[CaseView], *, rotors: list[Rotor] | None = None,
         grid.append(row)
     fs = views[0].fs
     spec = replace(spec_by_key("umag"),
-                   label=f"швидкість U,  м/с      (набігаючий потік {fs.u_inf:g})")
+                   label=tr("швидкість U,  м/с      (набігаючий потік {u_inf:g})", u_inf=fs.u_inf))
     seeded = seed_label(seeding, rotors)
-    head = (f"{name} — " if name else "") + f"лінії потоку,   U∞ = {fs.u_inf:g} м/с"
-    cols = (f"гвинт «{rotors[0].name}» зблизька" if rotors else "3D", "згори")
-    return compose(grid, title=head, subtitle=f"засів: {seeded}",
+    head = tr("{v}лінії потоку,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", u_inf=fs.u_inf)
+    cols = (tr("гвинт «{name}» зблизька", name=rotors[0].name) if rotors else "3D", "згори")
+    return compose(grid, title=head, subtitle=tr("засів: {seeded}", seeded=seeded),
                    bar=(spec, limits[0], limits[1]), col_labels=cols, path=path)
 
 
@@ -2152,8 +2187,8 @@ UNTOUCHED = "#5b636d"
 
 # Підписи полів тіла у вікні. Масиви звуться латиницею (так їх шукає VTK), а
 # людині показується назва з одиницями.
-SEP_TITLE = "Відрив"            # коротко: це й підпис вертикальної шкали,
-DRAG_TITLE = "Опір граней, Па"  # а довша назва там обрізається
+SEP_TITLE = tr("Відрив")        # коротко: це й підпис вертикальної шкали,
+DRAG_TITLE = tr("Опір граней, Па")  # а довша назва там обрізається
 BODY_FIELDS = {SEP_TITLE: SEP, DRAG_TITLE: DRAG}
 
 SEP_SPEC = FieldSpec(
@@ -2794,14 +2829,14 @@ def wash_text(w: WashReach) -> list[tuple[str, str]]:
     for colour, name in zip(wash_colors(len(w.zones)), w.zones):
         share = w.shares[name]
         top, bottom, side = w.sides.get(name, (0, 0, 0))
-        text = f"{name}: {share * 100:.0f}% ліній"
+        text = tr("{name}: {v:.0f}% ліній", name=name, v=share * 100)
         if share > 0:
             bits = [f"{lbl} {v * 100:.0f}%" for lbl, v in
                     (("згори", top), ("знизу", bottom), ("збоку", side)) if v > 0]
             text += "  (" + ", ".join(bits) + ")"
         out.append((colour, text))
-    out.append((UNTOUCHED, f"ще не торкнулася жодної частини  ·  «торкнулася» — "
-                           f"ближче за {w.near * 1000:.0f} мм"))
+    out.append((UNTOUCHED, tr("ще не торкнулася жодної частини  ·  «торкнулася» — "
+                           "ближче за {v:.0f} мм", v=w.near * 1000)))
     return out
 
 
@@ -2916,23 +2951,23 @@ class Overlay:
 def reverse_note(b: Blobs) -> str:
     if not b.cells:
         return "зворотної течії в обʼємі немає (швидше за 2% U∞ назад — ніде)"
-    return (f"зворотна течія: ≈ {b.volume * 1e6:.3g} см³ повітря йде назад "
-            f"({b.cells} комірок)")
+    return (tr("зворотна течія: ≈ {v:.3g} см³ повітря йде назад "
+            "({cells} комірок)", v=b.volume * 1e6, cells=b.cells))
 
 
 def loads_note(loads: SurfaceLoads, fs: Freestream, a_ref: float = 0.0,
                rotors: SurfaceLoads | None = None) -> str:
     """Рядок про суму по поверхні — тим самим числом, що й Cd у forceCoeffs."""
     who = "планер" if rotors is not None else "сума по поверхні"
-    text = (f"{who}: опір {loads.drag:.4g} Н = тиск "
-            f"{loads.pressure:.4g} + тертя {loads.friction:.4g}")
+    text = (tr("{who}: опір {drag:.4g} Н = тиск "
+            "{pressure:.4g} + тертя {friction:.4g}", who=who, drag=loads.drag, pressure=loads.pressure, friction=loads.friction))
     if a_ref > 0:
         text += f",  Cd = {loads.cd(fs.dynamic_pressure, a_ref):.5f}"
     if not loads.has_friction:
         text += "  (тертя в кейсі не записане — лише тиск)"
     if rotors is not None:
-        text += (f";   гвинти вздовж потоку: {rotors.drag:+.4g} Н"
-                 f" (мінус — тяга)")
+        text += (tr(";   гвинти вздовж потоку: {drag:+.4g} Н"
+                 " (мінус — тяга)", drag=rotors.drag))
     return text
 
 
@@ -2941,8 +2976,8 @@ def separation_note(loads: SurfaceLoads) -> str:
         return ("відриву на поверхні не показати: у моменті немає "
                 "wallShearStress (функція не була ввімкнена в прогоні)")
     share = loads.separated / loads.area if loads.area > 0 else 0.0
-    return (f"пристінкова течія йде назад на {share * 100:.1f}% поверхні "
-            f"({loads.separated * 1e4:.3g} см²)")
+    return (tr("пристінкова течія йде назад на {v:.1f}% поверхні "
+            "({v2:.3g} см²)", v=share * 100, v2=loads.separated * 1e4))
 
 
 # --- кадри тіла --------------------------------------------------------------
@@ -3075,10 +3110,9 @@ def stall_report(view: CaseView, *, name: str = "", path: str | None = None,
     frames = [[render_body_frame(body, fs, view=v, field=field, blobs=tuple(blobs),
                                  lines=tuple(lines), size=size, label=lbl)
                for v, lbl in (("top", "згори"), ("iso", "3D"))]]
-    head = (f"{name} — " if name else "") + \
-        f"де течія відривається,   U∞ = {fs.u_inf:g} м/с"
-    legend = [(REVERSE_COLOR, "червоні бульбашки — зворотна течія в обʼємі "
-                              f"(U∥ < −{REVERSE_LEVEL * 100:g}% U∞)")]
+    head = tr("{v}де течія відривається,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", u_inf=fs.u_inf)
+    legend = [(REVERSE_COLOR, tr("червоні бульбашки — зворотна течія в обʼємі "
+                              "(U∥ < −{v:g}% U∞)", v=REVERSE_LEVEL * 100))]
     if lines:
         legend.append((INK_DIM,
                        "темні лінії на тілі — куди біжить повітря біля стінки "
@@ -3114,13 +3148,12 @@ def drag_report(view: CaseView, *, name: str = "", a_ref: float = 0.0,
                                      limits=lim, blobs=tuple(blobs), size=size,
                                      label="3D, зі слідом"))
     frames = [row]
-    head = (f"{name} — " if name else "") + \
-        f"звідки береться опір,   U∞ = {fs.u_inf:g} м/с"
+    head = tr("{v}звідки береться опір,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", u_inf=fs.u_inf)
     legend = []
     if blobs:
-        legend.append((LOSS_COLOR, f"блакитна оболонка — слід: повітря "
-                                   f"загубило понад {LOSS_LEVEL * 100:g}% "
-                                   f"напору (сюди йде робота опору)"))
+        legend.append((LOSS_COLOR, tr("блакитна оболонка — слід: повітря "
+                                   "загубило понад {v:g}% "
+                                   "напору (сюди йде робота опору)", v=LOSS_LEVEL * 100)))
     return compose(frames, title=head, subtitle="\n".join(notes),
                    bar=(DRAG_SPEC, lim[0], lim[1]),
                    legend=tuple(legend), path=path)
@@ -3140,11 +3173,10 @@ def wash_report(view: CaseView, rotors, *, name: str = "",
                                 zones={**zones, **rot}, size=size, label=lbl,
                                 behind=0.3)
               for v, lbl in (("iso", "3D"), ("top", "згори"))]
-    head = (f"{name} — " if name else "") + \
-        f"куди йде обдув гвинтів,   U∞ = {view.fs.u_inf:g} м/с"
-    sub = (f"{w.seeds} ліній від дисків {len(rotors)} гвинт(ів), кільця "
-           f"{', '.join('%g' % r for r in WASH_RINGS)} радіуса; колір лінії — "
-           f"частина, якої вона вже торкнулася")
+    head = tr("{v}куди йде обдув гвинтів,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", u_inf=view.fs.u_inf)
+    sub = (tr("{seeds} ліній від дисків {n_rotors} гвинт(ів), кільця "
+           "{join} радіуса; колір лінії — "
+           "частина, якої вона вже торкнулася", seeds=w.seeds, n_rotors=len(rotors), join=', '.join('%g' % r for r in WASH_RINGS)))
     if w.split:
         sub += "\nтіло — один патч, тож поділене на третини вздовж потоку"
     return compose([frames], title=head, subtitle=sub,
@@ -3202,7 +3234,7 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
         rows = [(i, "", PART_STYLES[0], c.series[q])
                 for i, c in enumerate(cases) if len(c.series.get(q, ())) > 1]
         if rows:
-            panels.append((names.get(q, q) + ", сумарно", rows))
+            panels.append((tr("{q}, сумарно", q=names.get(q, q)), rows))
     for q in quantities:
         rows = []
         for i, c in enumerate(cases):
@@ -3211,7 +3243,7 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
                 if len(pts) > 1:
                     rows.append((i, part, PART_STYLES[k % len(PART_STYLES)], pts))
         if rows and len({r[1] for r in rows}) > 1:
-            panels.append((names.get(q, q) + ", по частинах", rows))
+            panels.append((tr("{q}, по частинах", q=names.get(q, q)), rows))
     if not panels:
         raise ValueError("Немає рядів коефіцієнтів: у postProcessing/forceCoeffs "
                          "порожньо або кейс ще не рахувався.")
@@ -3228,8 +3260,7 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
     top = 0.13
     gap, bottom = 0.045, 0.085
     ph = (1.0 - top - bottom - gap * (len(panels) - 1)) / len(panels)
-    fig.text(40 / w, 1 - 40 / h, (f"{name} — " if name else "")
-             + "сили за ітераціями", color=INK, fontsize=15.5,
+    fig.text(40 / w, 1 - 40 / h, tr("{v}сили за ітераціями", v=f"{name} — " if name else ""), color=INK, fontsize=15.5,
              fontweight="bold", va="top", ha="left")
     fig.text(40 / w, 1 - 74 / h,
              "світла смуга праворуч — вікно, за яким береться середнє; "

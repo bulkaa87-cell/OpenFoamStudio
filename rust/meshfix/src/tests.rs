@@ -751,6 +751,49 @@ fn repair_uses_alpha_wrap_only_for_defects() {
     assert!(is_clean(&m));
 }
 
+/// The forced methods of the «Полагодити» menu: each runs on a clean cube
+/// too (the pipeline would not run a fallback there), and each gives a
+/// clean, closed result with about the volume of the cube.
+#[test]
+fn forced_alpha_wrap_on_a_clean_cube() {
+    forced_method_on_a_clean_cube(Method::AlphaWrap);
+}
+
+#[test]
+fn forced_volume_on_a_clean_cube() {
+    forced_method_on_a_clean_cube(Method::Volume);
+}
+
+#[test]
+fn method_names() {
+    assert_eq!(Method::from_name("meshfix"), Some(Method::Pipeline));
+    assert_eq!(Method::from_name("volume").map(Method::name), Some("volume"));
+    assert_eq!(Method::from_name("x"), None);
+}
+
+fn forced_method_on_a_clean_cube(method: Method) {
+    {
+        let mut m = cube(10.0, [0.0; 3]);
+        let o = RepairOptions { method, volume_cells: Some(96), ..Default::default() };
+        let r = repair(&mut m, &o, |_, _| {}).unwrap();
+        let want = if method == Method::AlphaWrap { Stage::AlphaWrap } else { Stage::VolumeRemesh };
+        assert_eq!(r.fallback, Some(want), "{method:?}");
+        assert!(is_clean(&m), "{method:?}");
+        // The QEM decimation of the remesh gives the 12 cube faces again.
+        assert!(m.triangles.len() >= 12, "{method:?}");
+        let v = volume(&m);
+        assert!((v - 1000.0).abs() < 60.0, "{method:?} volume {v}");
+        // The forced wrap does not run the 12 steps; the forced remesh
+        // runs the steps up to CloseAllHoles.
+        let steps: Vec<Stage> = r.stages.iter().map(|s| s.stage).collect();
+        if method == Method::AlphaWrap {
+            assert_eq!(steps, vec![Stage::AlphaWrap]);
+        } else {
+            assert!(steps.contains(&Stage::CloseAllHoles) && !steps.contains(&Stage::Wrap), "{steps:?}");
+        }
+    }
+}
+
 // ---- volumetric remesh (volume.rs) ------------------------------------
 
 fn turned_box(s: f64, shift: Vec3, az: f64) -> Mesh {

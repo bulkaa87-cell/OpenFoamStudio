@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fs_i18n import tr
 
 
 @dataclass(frozen=True)
@@ -27,25 +28,25 @@ class Help:
     typical: str = ""
 
     def tooltip(self) -> str:
-        parts = [self.what]
+        parts = [tr(self.what)]
         if self.affects:
-            parts.append("Впливає на: " + self.affects)
+            parts.append(tr("Впливає на: {affects}", affects=self.affects))
         if self.typical:
-            parts.append("Типово: " + self.typical)
+            parts.append(tr("Типово: {typical}", typical=self.typical))
         return "\n\n".join(parts)
 
     def html(self) -> str:
-        rows = [f'<p style="margin:2px 0">{self.what}</p>']
+        rows = [f'<p style="margin:2px 0">{tr(self.what)}</p>']
         if self.affects:
-            rows.append(f'<p style="margin:2px 0"><b>Впливає на:</b> '
-                        f'{self.affects}</p>')
+            rows.append(tr("<p style=\"margin:2px 0\"><b>Впливає на:</b> "
+                        "{affects}</p>", affects=self.affects))
         if self.low:
-            rows.append(f'<p style="margin:2px 0">↓ <i>замало:</i> {self.low}</p>')
+            rows.append(tr("<p style=\"margin:2px 0\">↓ <i>замало:</i> {low}</p>", low=self.low))
         if self.high:
-            rows.append(f'<p style="margin:2px 0">↑ <i>забагато:</i> {self.high}</p>')
+            rows.append(tr("<p style=\"margin:2px 0\">↑ <i>забагато:</i> {high}</p>", high=self.high))
         if self.typical:
-            rows.append(f'<p style="margin:2px 0"><b>Типово:</b> '
-                        f'{self.typical}</p>')
+            rows.append(tr("<p style=\"margin:2px 0\"><b>Типово:</b> "
+                        "{typical}</p>", typical=self.typical))
         return "".join(rows)
 
 

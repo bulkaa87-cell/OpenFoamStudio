@@ -61,6 +61,20 @@ def surface_lines(points, tris, vectors, normals, seeds, max_length: float,
         float(spacing), float(min_length))
 
 
+def parse_log(text: str, state: dict) -> "dict | None":
+    """Розбір блоку рядків журналу (Rust), див. RunState.feed_text.
+
+    None — нехай розбирає Python: foamrs немає (чи він старий), або в блоці
+    є те, що точно розбирає лише Python.
+    """
+    if not has("parse_log"):
+        return None
+    try:
+        return _rs.parse_log(text, state)
+    except Exception:                      # pragma: no cover - захист від збою
+        return None
+
+
 def why_not() -> str:
     if _rs is not None:
         return ""

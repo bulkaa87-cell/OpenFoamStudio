@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable
 
 import fs_physics as phys
+from fs_i18n import tr
 
 # Яку частку памʼяті дозволяємо зайняти задачі.
 #
@@ -84,14 +85,14 @@ class MemRow:
     def line(self) -> str:
         h = self.host
         what = ("snappyHexMesh" if self.stage == "snappy"
-                else f"розвʼязувач × {h.ranks}")
-        head = (f"{what} на {h.name}: {phys.fmt_cells(self.cells)} комірок, "
-                f"~{self.need_gb:.1f} ГБ")
+                else tr("розвʼязувач × {ranks}", ranks=h.ranks))
+        head = (tr("{what} на {name}: {cells} комірок, "
+                "~{need_gb:.1f} ГБ", what=what, name=h.name, cells=phys.fmt_cells(self.cells), need_gb=self.need_gb))
         if not h.known:
-            return head + " — памʼять машини ще невідома"
+            return tr("{head} — памʼять машини ще невідома", head=head)
         verdict = "влізе" if self.fits else "НЕ ВЛІЗЕ"
-        return (f"{head} з {fmt_gb(h.ram_gb)} ГБ (під задачу "
-                f"{fmt_gb(h.budget_gb)}) — {verdict}")
+        return (tr("{head} з {ram_gb} ГБ (під задачу "
+                "{budget_gb}) — {verdict}", head=head, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb), verdict=verdict))
 
 
 @dataclass
@@ -134,16 +135,16 @@ class MemFit:
             h = w.host
             if w.stage == "snappy":
                 bits.append(
-                    f"⚠ сітка не влізе на {h.name}: snappyHexMesh "
-                    f"~{w.need_gb:.1f} ГБ, памʼяті {fmt_gb(h.ram_gb)} ГБ "
-                    f"(під задачу {fmt_gb(h.budget_gb)})")
+                    tr("⚠ сітка не влізе на {name}: snappyHexMesh "
+                    "~{need_gb:.1f} ГБ, памʼяті {ram_gb} ГБ "
+                    "(під задачу {budget_gb})", name=h.name, need_gb=w.need_gb, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb)))
             else:
                 src = "збереженої сітки " if self.saved else ""
                 bits.append(
-                    f"⚠ розвʼязувач не влізе на {h.name}: "
-                    f"{phys.fmt_cells(w.cells)} комірок {src}~{w.need_gb:.1f} ГБ, "
-                    f"памʼяті {fmt_gb(h.ram_gb)} ГБ "
-                    f"(під задачу {fmt_gb(h.budget_gb)})")
+                    tr("⚠ розвʼязувач не влізе на {name}: "
+                    "{cells} комірок {src}~{need_gb:.1f} ГБ, "
+                    "памʼяті {ram_gb} ГБ "
+                    "(під задачу {budget_gb})", name=h.name, cells=phys.fmt_cells(w.cells), src=src, need_gb=w.need_gb, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb)))
         names = []
         for r in self.unknown:
             if r.host.name not in names:
@@ -151,17 +152,16 @@ class MemFit:
         if names:
             dist = len(self.solver_rows()) > 1 and any(
                 r.stage == "solver" for r in self.unknown)
-            bits.append("ℹ памʼять " + ", ".join(names)
-                        + " ще невідома — там памʼять не перевіряю"
-                        + (" (кнопка «Перевірити машини»)" if dist else ""))
+            bits.append(tr("ℹ памʼять {names} ще невідома — там памʼять "
+                           "не перевіряю{v}", names=", ".join(names), v=" (кнопка «Перевірити машини»)" if dist else ""))
         return "   ".join(bits)
 
     def details(self) -> str:
         """Усе по машинах — для підказки й діалогу перед запуском."""
-        lines = ["Памʼять (оцінка):"]
+        lines = [tr("Памʼять (оцінка):")]
         if self.saved:
-            lines.append(f"  сітка збережена ({phys.fmt_cells(self.cells)} "
-                         "комірок) — snappyHexMesh не запускається")
+            lines.append(tr("  сітка збережена ({cells} "
+                         "комірок) — snappyHexMesh не запускається", cells=phys.fmt_cells(self.cells)))
         for r in self.rows:
             lines.append("  " + r.line())
         sol = self.solver_rows()
@@ -170,14 +170,14 @@ class MemFit:
             known = [r.host for r in sol if r.host.known]
             ram = sum(h.ram_gb for h in known)
             if len(known) == len(sol):
-                tail = f" з {fmt_gb(ram)} ГБ"
+                tail = tr(" з {ram} ГБ", ram=fmt_gb(ram))
             elif known:
-                tail = (f" (памʼять відома лише для {len(known)} з них: "
-                        f"{fmt_gb(ram)} ГБ)")
+                tail = (tr(" (памʼять відома лише для {n_known} з них: "
+                        "{ram} ГБ)", n_known=len(known), ram=fmt_gb(ram)))
             else:
                 tail = ""
-            lines.append(f"  разом розвʼязувач: ~{need:.1f} ГБ на "
-                         f"{len(sol)} машинах{tail}")
+            lines.append(tr("  разом розвʼязувач: ~{need:.1f} ГБ на "
+                         "{n_sol} машинах{tail}", need=need, n_sol=len(sol), tail=tail))
         return "\n".join(lines)
 
 

@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtWidgets
 
 import fs_anim as fa
 import fs_views as fv
+from fs_i18n import tr
 
 
 class AnimBar(QtWidgets.QGroupBox):
@@ -93,8 +94,8 @@ class AnimBar(QtWidgets.QGroupBox):
         row.addWidget(QtWidgets.QLabel("На тілі:"))
         self.chk_bfield = {}
         for key, title in fa.BODY_TITLES.items():
-            c = QtWidgets.QCheckBox(fa.BODY_FIELDS[key][0].split(",")[0])
-            c.setToolTip(title)
+            c = QtWidgets.QCheckBox(tr(fa.BODY_FIELDS[key][0]).split(",")[0])
+            c.setToolTip(tr(title))
             c.setChecked(key == "cp")
             self.chk_bfield[key] = c
             row.addWidget(c)
@@ -105,9 +106,9 @@ class AnimBar(QtWidgets.QGroupBox):
         self.chk_sfield = {}
         for key in fa.SLICE_KEYS:
             spec = fv.spec_by_key(key)
-            short = spec.title.split("  ")[0]
+            short = tr(spec.title).split("  ")[0]
             c = QtWidgets.QCheckBox(short)
-            c.setToolTip(spec.title + "\n" + spec.about)
+            c.setToolTip(tr(spec.title) + "\n" + tr(spec.about))
             c.setChecked(key == "dU")
             self.chk_sfield[key] = c
             row.addWidget(c)
@@ -200,7 +201,7 @@ class AnimBar(QtWidgets.QGroupBox):
             self.cmb_to.setCurrentIndex(len(self._times) - 1)
         self.btn_reconstruct.setVisible(bool(self._missing))
         self.btn_reconstruct.setText(
-            f"Зібрати ще {len(self._missing)} моментів (reconstructPar)")
+            tr("Зібрати ще {n_missing} моментів (reconstructPar)", n_missing=len(self._missing)))
         self.setEnabled(len(self._times) >= 2 or bool(self._missing))
         self._sync_count()
 
@@ -214,7 +215,7 @@ class AnimBar(QtWidgets.QGroupBox):
 
     def _sync_count(self):
         n = len(self.chosen_times())
-        self.lbl_count.setText(f"{n} кадрів" if n else "")
+        self.lbl_count.setText(tr("{n} кадрів", n=n) if n else "")
 
     def _prepare(self):
         self.prepare_requested.emit({
@@ -237,9 +238,9 @@ class AnimBar(QtWidgets.QGroupBox):
         self.slider.blockSignals(False)
         for combo, keys, titles in (
                 (self.cmb_body, list(frames.body_vals),
-                 {k: fa.BODY_FIELDS[k][0] for k in fa.BODY_FIELDS}),
+                 {k: tr(fa.BODY_FIELDS[k][0]) for k in fa.BODY_FIELDS}),
                 (self.cmb_slice, list(frames.slice_vals),
-                 {k: fv.spec_by_key(k).title.split("  ")[0]
+                 {k: tr(fv.spec_by_key(k).title).split("  ")[0]
                   for k in fa.SLICE_KEYS})):
             combo.blockSignals(True)
             combo.clear()
@@ -255,8 +256,7 @@ class AnimBar(QtWidgets.QGroupBox):
         self.setup_box.setVisible(False)
         mb = frames.nbytes() / 1e6
         how = "напряму з файлів" if frames.fast else "через VTK"
-        self.lbl_info.setText(f"{frames.n} кадрів, {mb:.0f} МБ, {how}."
-                              + ("  " + " ".join(frames.notes)
+        self.lbl_info.setText(tr("{n} кадрів, {mb:.0f} МБ, {how}.{v}", n=frames.n, mb=mb, how=how, v="  " + " ".join(frames.notes)
                                  if frames.notes else ""))
 
     def show_frame(self, i: int, t: float):
@@ -264,7 +264,7 @@ class AnimBar(QtWidgets.QGroupBox):
         self.slider.setValue(i)
         self.slider.blockSignals(False)
         n = self.slider.maximum() + 1
-        self.lbl_time.setText(f"t = {t:.6g} с   {i + 1}/{n}")
+        self.lbl_time.setText(tr("t = {t:.6g} с   {v}/{n}", t=t, v=i + 1, n=n))
 
     def _play(self, on: bool):
         self.btn_play.setText("⏸" if on else "▶")

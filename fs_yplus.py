@@ -32,6 +32,8 @@ import math
 from dataclasses import dataclass, field, replace
 
 import fs_physics as phys
+import fs_i18n
+from fs_i18n import tr
 
 # ---------------------------------------------------------------------------
 # Wall treatments
@@ -73,19 +75,19 @@ def why_not_treatment(model: str, treatment: str) -> str:
         return ""
     if treatment == WALLFN:
         if fam == "transition":
-            return (f"{model} рахує перехід і потребує розвʼязаного шару "
-                    f"(y+ ≈ 1), а закон стінки його перестрибує.")
+            return (tr("{model} рахує перехід і потребує розвʼязаного шару "
+                    "(y+ ≈ 1), а закон стінки його перестрибує.", model=model))
         if fam == "les":
-            return (f"{model} — LES: закон лог-шару тут не годиться. Беріть "
-                    f"Spalding (модель стінки) або Low-Re (y+ ≈ 1).")
+            return (tr("{model} — LES: закон лог-шару тут не годиться. Беріть "
+                    "Spalding (модель стінки) або Low-Re (y+ ≈ 1).", model=model))
         if fam in ("sa", "lowre"):
-            return (f"nutkWallFunction рахує тертя з k, а {model} поля k не "
-                    f"розвʼязує (або демпфує стінку сама).")
+            return (tr("nutkWallFunction рахує тертя з k, а {model} поля k не "
+                    "розвʼязує (або демпфує стінку сама).", model=model))
         return ""
     if treatment == LOWRE:
         if fam == "ke":
-            return (f"{model} не має пристінного демпфування: на y+ ≈ 1 вона "
-                    f"хибна. Для розвʼязаного шару візьміть kOmegaSST.")
+            return (tr("{model} не має пристінного демпфування: на y+ ≈ 1 вона "
+                    "хибна. Для розвʼязаного шару візьміть kOmegaSST.", model=model))
         return ""
     return "Невідома обробка стінки."
 
@@ -179,111 +181,111 @@ def _rule(model: str, treatment: str, y: float) -> YplusCheck:
     ys = _g(y)
 
     def mk(level, text, fixes=(), short=""):
-        return YplusCheck(level, y, short or f"y+ ≈ {ys} не для {model}",
+        return YplusCheck(level, y, short or tr("y+ ≈ {ys} не для {model}", ys=ys, model=model),
                           text, list(fixes))
 
     if fam == "transition":
         if y <= 1.0:
-            return mk("ok", f"y+ ≈ {ys} — шар розвʼязано до стінки, як і "
-                            f"треба для {model}.")
+            return mk("ok", tr("y+ ≈ {ys} — шар розвʼязано до стінки, як і "
+                            "треба для {model}.", ys=ys, model=model))
         if y <= 2.0:
             return mk("warn", (
-                f"y+ ≈ {ys} — на межі для {model}. Модель переходу хоче "
-                f"y+ ≤ 1 на всьому тілі (настанова Ленгтрі–Ментера), а на "
-                f"носку й кромках y+ вищий за середній."), [FIX_Y1],
-                short=f"y+ ≈ {ys} на межі для {model} (треба ≤ 1)")
+                tr("y+ ≈ {ys} — на межі для {model}. Модель переходу хоче "
+                "y+ ≤ 1 на всьому тілі (настанова Ленгтрі–Ментера), а на "
+                "носку й кромках y+ вищий за середній.", ys=ys, model=model)), [FIX_Y1],
+                short=tr("y+ ≈ {ys} на межі для {model} (треба ≤ 1)", ys=ys, model=model))
         return mk("error", (
-            f"{model} рахує перехід ламінарного шару в турбулентний і "
-            f"потребує y+ ≈ 1 (не більше 1–2) на всьому тілі. При y+ ≈ {ys} "
-            f"шар не розвʼязано: перехід вийде хибним, а два зайві рівняння "
-            f"лише сповільнять рахунок."), [FIX_Y1, FIX_SST],
-            short=f"y+ ≈ {ys} не для {model} (треба ≈ 1)")
+            tr("{model} рахує перехід ламінарного шару в турбулентний і "
+            "потребує y+ ≈ 1 (не більше 1–2) на всьому тілі. При y+ ≈ {ys} "
+            "шар не розвʼязано: перехід вийде хибним, а два зайві рівняння "
+            "лише сповільнять рахунок.", model=model, ys=ys)), [FIX_Y1, FIX_SST],
+            short=tr("y+ ≈ {ys} не для {model} (треба ≈ 1)", ys=ys, model=model))
 
     if fam == "les":
         if y <= 2.0:
-            return mk("ok", f"y+ ≈ {ys} — LES бачить пристінні вихори.")
+            return mk("ok", tr("y+ ≈ {ys} — LES бачить пристінні вихори.", ys=ys))
         return mk("warn", (
-            f"{model} — LES. При y+ ≈ {ys} пристінні вихори не розвʼязано: "
-            f"біля стінки працює nutUSpalding як модель стінки (це вже "
-            f"WMLES). Для чесного LES потрібен y+ ≈ 1, а сітка тоді в рази "
-            f"більша."), [FIX_Y1],
-            short=f"y+ ≈ {ys}: {model} стає WMLES (треба ≈ 1)")
+            tr("{model} — LES. При y+ ≈ {ys} пристінні вихори не розвʼязано: "
+            "біля стінки працює nutUSpalding як модель стінки (це вже "
+            "WMLES). Для чесного LES потрібен y+ ≈ 1, а сітка тоді в рази "
+            "більша.", model=model, ys=ys)), [FIX_Y1],
+            short=tr("y+ ≈ {ys}: {model} стає WMLES (треба ≈ 1)", ys=ys, model=model))
 
     if fam == "lowre" or (treatment == LOWRE and fam != "ke"):
-        what = (f"модель {model} має пристінне демпфування"
+        what = (tr("модель {model} має пристінне демпфування", model=model)
                 if fam == "lowre" else "nutLowReWallFunction")
         # A chosen low-Re wall can go back to Spalding; a low-Re model cannot.
         alt = [FIX_SPALDING] if fam != "lowre" else []
         if y <= 1.0:
-            return mk("ok", f"y+ ≈ {ys} — шар розвʼязано до стінки.")
+            return mk("ok", tr("y+ ≈ {ys} — шар розвʼязано до стінки.", ys=ys))
         if y <= 5.0:
             return mk("warn", (
-                f"y+ ≈ {ys}: {what} і хоче y+ ≈ 1. У вʼязкому підшарі ще "
-                f"працює, але грубо."), [FIX_Y1] + alt,
-                short=f"y+ ≈ {ys} грубо для {model} (треба ≈ 1)")
+                tr("y+ ≈ {ys}: {what} і хоче y+ ≈ 1. У вʼязкому підшарі ще "
+                "працює, але грубо.", ys=ys, what=what)), [FIX_Y1] + alt,
+                short=tr("y+ ≈ {ys} грубо для {model} (треба ≈ 1)", ys=ys, model=model))
         return mk("error", (
-            f"Шар розвʼязується до стінки ({what}), тому потрібен y+ ≈ 1. "
-            f"При y+ ≈ {ys} перша комірка вже поза вʼязким підшаром, і тертя "
-            f"буде хибним."), [FIX_Y1] + alt,
-            short=f"y+ ≈ {ys} не для {model} (треба ≈ 1)")
+            tr("Шар розвʼязується до стінки ({what}), тому потрібен y+ ≈ 1. "
+            "При y+ ≈ {ys} перша комірка вже поза вʼязким підшаром, і тертя "
+            "буде хибним.", what=what, ys=ys)), [FIX_Y1] + alt,
+            short=tr("y+ ≈ {ys} не для {model} (треба ≈ 1)", ys=ys, model=model))
 
     # From here on: the wall is modelled (ke, sa, komega).
     high = None
     if y > 1000.0:
         high = mk("error", (
-            f"y+ ≈ {ys} — далеко за лог-шаром: закон стінки тут не діє, "
-            f"тертя недостовірне. Цільтеся в 30–150."), [FIX_Y50],
-            short=f"y+ ≈ {ys}: далеко за лог-шаром")
+            tr("y+ ≈ {ys} — далеко за лог-шаром: закон стінки тут не діє, "
+            "тертя недостовірне. Цільтеся в 30–150.", ys=ys)), [FIX_Y50],
+            short=tr("y+ ≈ {ys}: далеко за лог-шаром", ys=ys))
     elif y > 300.0:
         high = mk("warn", (
-            f"y+ ≈ {ys} — зависоко: перша комірка на краю лог-шару, точність "
-            f"тертя падає. Цільтеся в 30–150."), [FIX_Y50],
-            short=f"y+ ≈ {ys}: зависоко (треба 30–150)")
+            tr("y+ ≈ {ys} — зависоко: перша комірка на краю лог-шару, точність "
+            "тертя падає. Цільтеся в 30–150.", ys=ys)), [FIX_Y50],
+            short=tr("y+ ≈ {ys}: зависоко (треба 30–150)", ys=ys))
     if high is not None:
         return high
     if y >= 30.0:
         tail = "" if y <= 150.0 else " Допустимо, але 30–150 точніше."
-        return mk("ok", f"y+ ≈ {ys} — лог-шар, закон стінки працює.{tail}")
+        return mk("ok", tr("y+ ≈ {ys} — лог-шар, закон стінки працює.{tail}", ys=ys, tail=tail))
 
     buffer_text = (
-        f"y+ ≈ {ys} — буферний шар (5–30): ні вʼязкий підшар, ні лог-шар, "
-        f"найгірша зона для закону стінки.")
+        tr("y+ ≈ {ys} — буферний шар (5–30): ні вʼязкий підшар, ні лог-шар, "
+        "найгірша зона для закону стінки.", ys=ys))
 
     if fam == "ke":
         if y < 5.0:
             return mk("warn", (
-                f"{model} не має пристінного демпфування: дрібна перша "
-                f"комірка (y+ ≈ {ys}) їй не допомагає, тертя однаково рахує "
-                f"закон стінки. Цільтеся в 30–150 або візьміть kOmegaSST, "
-                f"якщо потрібен розвʼязаний шар."), [FIX_Y50, FIX_SST],
-                short=f"y+ ≈ {ys}: {model} хоче 30–150")
-        return mk("warn", buffer_text + " Цільтеся в 30–150.", [FIX_Y50],
-                  short=f"y+ ≈ {ys}: буферний шар")
+                tr("{model} не має пристінного демпфування: дрібна перша "
+                "комірка (y+ ≈ {ys}) їй не допомагає, тертя однаково рахує "
+                "закон стінки. Цільтеся в 30–150 або візьміть kOmegaSST, "
+                "якщо потрібен розвʼязаний шар.", model=model, ys=ys)), [FIX_Y50, FIX_SST],
+                short=tr("y+ ≈ {ys}: {model} хоче 30–150", ys=ys, model=model))
+        return mk("warn", tr("{buffer_text} Цільтеся в 30–150.", buffer_text=buffer_text), [FIX_Y50],
+                  short=tr("y+ ≈ {ys}: буферний шар", ys=ys))
 
     if treatment == SPALDING:
         if y <= 5.0:
             return mk("ok", (
-                f"y+ ≈ {ys} — вʼязкий підшар. nutUSpalding і "
-                f"omegaWallFunction тут працюють, це точніший варіант."))
+                tr("y+ ≈ {ys} — вʼязкий підшар. nutUSpalding і "
+                "omegaWallFunction тут працюють, це точніший варіант.", ys=ys)))
         if fam == "sa":
             return mk("ok", (
-                f"y+ ≈ {ys}. SpalartAllmaras з nutUSpalding працює в усьому "
-                f"діапазоні, і в буферному шарі теж."))
-        return mk("warn", buffer_text + (
-            " nutUSpalding його зшиває, тож рахунок не зламається, але "
-            "точність тут найменша. Краще y+ ≈ 1 або 30–150."),
-            [FIX_Y1, FIX_Y50], short=f"y+ ≈ {ys}: буферний шар")
+                tr("y+ ≈ {ys}. SpalartAllmaras з nutUSpalding працює в усьому "
+                "діапазоні, і в буферному шарі теж.", ys=ys)))
+        return mk("warn", tr("{buffer_text} nutUSpalding його зшиває, "
+                             "тож рахунок не зламається, але точність "
+                             "тут найменша. Краще y+ ≈ 1 або 30–150.", buffer_text=buffer_text),
+            [FIX_Y1, FIX_Y50], short=tr("y+ ≈ {ys}: буферний шар", ys=ys))
 
     # Standard log-law wall function.
     if y < 5.0:
         return mk("warn", (
-            f"y+ ≈ {ys}: nutkWallFunction вважає, що перша комірка в "
-            f"лог-шарі, а вона у вʼязкому підшарі. Цільтеся в 30–150 або "
-            f"візьміть неперервну функцію (nutUSpalding)."),
+            tr("y+ ≈ {ys}: nutkWallFunction вважає, що перша комірка в "
+            "лог-шарі, а вона у вʼязкому підшарі. Цільтеся в 30–150 або "
+            "візьміть неперервну функцію (nutUSpalding).", ys=ys)),
             [FIX_Y50, FIX_SPALDING],
-            short=f"y+ ≈ {ys}: замало для закону стінки")
-    return mk("warn", buffer_text + " Цільтеся в 30–150.",
-              [FIX_Y50, FIX_SPALDING], short=f"y+ ≈ {ys}: буферний шар")
+            short=tr("y+ ≈ {ys}: замало для закону стінки", ys=ys))
+    return mk("warn", tr("{buffer_text} Цільтеся в 30–150.", buffer_text=buffer_text),
+              [FIX_Y50, FIX_SPALDING], short=tr("y+ ≈ {ys}: буферний шар", ys=ys))
 
 
 def check_yplus(model: str, treatment: str = "", target: float = 0.0,
@@ -330,25 +332,25 @@ def model_hint(model: str, treatment: str = "") -> str:
     treatment = treatment or case_wall_treatment(model)
     fam = model_family(model)
     if fam == "transition":
-        return (f"{model} — модель переходу: цільтеся в y+ ≈ 1 на всьому "
-                f"тілі (не більше 1–2). З пристінною функцією вона безсила.")
+        return (tr("{model} — модель переходу: цільтеся в y+ ≈ 1 на всьому "
+                "тілі (не більше 1–2). З пристінною функцією вона безсила.", model=model))
     if fam == "les":
-        return (f"{model} — LES: для розвʼязаних пристінних вихорів y+ ≈ 1. "
-                f"Більший y+ робить з неї WMLES.")
+        return (tr("{model} — LES: для розвʼязаних пристінних вихорів y+ ≈ 1. "
+                "Більший y+ робить з неї WMLES.", model=model))
     if fam == "lowre" or (treatment == LOWRE and fam != "ke"):
-        return f"{model}: шар розвʼязується до стінки — цільтеся в y+ ≈ 1."
+        return tr("{model}: шар розвʼязується до стінки — цільтеся в y+ ≈ 1.", model=model)
     if fam == "ke":
-        return (f"{model} — лише з законом стінки: y+ 30–150 (до 300). "
-                f"Дрібніша стінка їй не допоможе, а 5–30 — буферний шар.")
+        return (tr("{model} — лише з законом стінки: y+ 30–150 (до 300). "
+                "Дрібніша стінка їй не допоможе, а 5–30 — буферний шар.", model=model))
     if treatment == SPALDING and fam == "sa":
-        return (f"{model} з nutUSpalding працює від y+ ≈ 1 до ~300: точніше "
-                f"біля 1, дешевше 30–150.")
+        return (tr("{model} з nutUSpalding працює від y+ ≈ 1 до ~300: точніше "
+                "біля 1, дешевше 30–150.", model=model))
     if treatment == SPALDING:
-        return (f"{model} з nutUSpalding: або y+ ≤ 5 (шар розвʼязано, "
-                f"точніше), або 30–150 (до 300, дешевше). 5–30 — буферний "
-                f"шар, найменш точна зона.")
-    return (f"{model} із законом стінки: y+ 30–150 (до 300). Не ставте 5–30 "
-            f"— це буферний шар.")
+        return (tr("{model} з nutUSpalding: або y+ ≤ 5 (шар розвʼязано, "
+                "точніше), або 30–150 (до 300, дешевше). 5–30 — буферний "
+                "шар, найменш точна зона.", model=model))
+    return (tr("{model} із законом стінки: y+ 30–150 (до 300). Не ставте 5–30 "
+            "— це буферний шар.", model=model))
 
 
 # ---------------------------------------------------------------------------
@@ -380,11 +382,11 @@ def best_yplus(model: str, treatment: str, u: float, length: float,
     treatment = treatment or case_wall_treatment(model)
     fam = model_family(model)
     if fam == "transition":
-        return 1.0, f"{model} потребує розвʼязаного шару"
+        return 1.0, tr("{model} потребує розвʼязаного шару", model=model)
     if fam == "les":
-        return 1.0, f"{model}: LES розвʼязує вихори біля стінки"
+        return 1.0, tr("{model}: LES розвʼязує вихори біля стінки", model=model)
     if fam == "lowre" or (treatment == LOWRE and fam != "ke"):
-        return 1.0, f"{model}: шар розвʼязується до стінки"
+        return 1.0, tr("{model}: шар розвʼязується до стінки", model=model)
 
     top = log_layer_top(u, length, nu)
     if top >= LOG_WINDOW_MIN:
@@ -392,12 +394,12 @@ def best_yplus(model: str, treatment: str, u: float, length: float,
         # layer also where the local friction differs from the mean.
         y = max(30.0, min(100.0, math.sqrt(30.0 * top)))
         y = round(y / 5.0) * 5.0
-        return y, f"{model}: закон стінки, середина лог-шару 30–{top:.0f}"
+        return y, tr("{model}: закон стінки, середина лог-шару 30–{top:.0f}", model=model, top=top)
     if fam == "ke" or treatment == WALLFN:
-        return 30.0, (f"{model}: лог-шар при цьому Re вузький (до y+ ≈ "
-                      f"{top:.0f}), тому нижній край")
-    return 1.0, (f"лог-шар при цьому Re завузький (до y+ ≈ {top:.0f}) — "
-                 f"{model} з nutUSpalding краще розвʼязати до стінки")
+        return 30.0, (tr("{model}: лог-шар при цьому Re вузький (до y+ ≈ "
+                      "{top:.0f}), тому нижній край", model=model, top=top))
+    return 1.0, (tr("лог-шар при цьому Re завузький (до y+ ≈ {top:.0f}) — "
+                 "{model} з nutUSpalding краще розвʼязати до стінки", top=top, model=model))
 
 
 # ---------------------------------------------------------------------------
@@ -424,11 +426,7 @@ class AutoPick:
 
 
 def plural_layers(n: int) -> str:
-    if n % 10 == 1 and n % 100 != 11:
-        return f"{n} шар"
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return f"{n} шари"
-    return f"{n} шарів"
+    return fs_i18n.plural(n, "{n} шар", "{n} шари", "{n} шарів").format(n=n)
 
 
 def _ref_length(cfg) -> float:
@@ -497,8 +495,8 @@ def auto_pick(cfg, fits=None, layer_cap: int = LAYER_CAP) -> AutoPick:
     if reached and target >= 30.0 and n == 1 and y < 0.6 * target:
         if fam in ("komega", "sa") and treat == SPALDING:
             target = 1.0
-            reason = (f"комірка на поверхні така дрібна, що й один шар дає "
-                      f"y+ ≈ {_g(y)} — дешевше розвʼязати шар до стінки")
+            reason = (tr("комірка на поверхні така дрібна, що й один шар дає "
+                      "y+ ≈ {y} — дешевше розвʼязати шар до стінки", y=_g(y)))
             pick.target, pick.reason = target, reason
             got = solve(target)
             n, e, y, reached = got
@@ -509,10 +507,10 @@ def auto_pick(cfg, fits=None, layer_cap: int = LAYER_CAP) -> AutoPick:
     if not reached:
         pick.level = "error" if _resolved_family(model, treat) else "warn"
         pick.problem = (
-            f"Цільового y+ ≈ {_g(target)} не досягти: {plural_layers(n)} з "
-            f"expansionRatio {e:.2f} дають лише y+ ≈ {_g(y)}. Перший шар "
-            f"упирається в комірку на поверхні ({phys.fmt_len(cell)}): "
-            f"підніміть рівень поверхні або зменшіть finalLayerThickness.")
+            tr("Цільового y+ ≈ {target} не досягти: {n} з "
+            "expansionRatio {e:.2f} дають лише y+ ≈ {y}. Перший шар "
+            "упирається в комірку на поверхні ({cell}): "
+            "підніміть рівень поверхні або зменшіть finalLayerThickness.", target=_g(target), n=plural_layers(n), e=e, y=_g(y), cell=phys.fmt_len(cell)))
 
     # Mesh size and memory.
     trial = copy.copy(cfg)
@@ -528,8 +526,8 @@ def auto_pick(cfg, fits=None, layer_cap: int = LAYER_CAP) -> AutoPick:
     else:
         est = trial.estimate()
         if est.total > cfg.mesh.max_global_cells:
-            why = (f"оцінка {phys.fmt_cells(est.total)} комірок більша за "
-                   f"maxGlobalCells {phys.fmt_cells(cfg.mesh.max_global_cells)}")
+            why = (tr("оцінка {total} комірок більша за "
+                   "maxGlobalCells {max_global_cells}", total=phys.fmt_cells(est.total), max_global_cells=phys.fmt_cells(cfg.mesh.max_global_cells)))
     if why:
         if target <= 2.0:
             pick.level = "error"
@@ -537,28 +535,28 @@ def auto_pick(cfg, fits=None, layer_cap: int = LAYER_CAP) -> AutoPick:
                    " Або перейдіть на kOmegaSST із законом стінки (y+ ≈ 50): "
                    "шарів буде в кілька разів менше.")
             pick.problem = (
-                f"Розвʼязаний шар (y+ ≈ 1, {plural_layers(n)}) не влазить: "
-                f"{why.lstrip('⚠ ')}. Дайте більше памʼяті (машини розподілу, "
-                f"maxGlobalCells) або грубішу поверхню.{alt}")
+                tr("Розвʼязаний шар (y+ ≈ 1, {n}) не влазить: "
+                "{lstrip}. Дайте більше памʼяті (машини розподілу, "
+                "maxGlobalCells) або грубішу поверхню.{alt}", n=plural_layers(n), lstrip=why.lstrip('⚠ '), alt=alt))
             pick.fixes = [FIX_SST] if fam in ("transition", "les",
                                                "lowre") else []
         else:
             pick.level = "warn"
-            pick.problem = f"Сітка не влазить: {why.lstrip('⚠ ')}."
+            pick.problem = tr("Сітка не влазить: {lstrip}.", lstrip=why.lstrip('⚠ '))
     return pick
 
 
 def auto_line(pick: AutoPick, model: str) -> str:
     """The result line under the y+ field, one short line."""
     if pick.skipped:
-        return "Авто: " + pick.problem
-    line = (f"Авто: y+ ≈ {_g(pick.target)} ({pick.reason}) → "
-            f"{plural_layers(pick.n_layers)}, 1-й "
-            f"{phys.fmt_len(pick.first_abs)}")
+        return tr("Авто: {problem}", problem=pick.problem)
+    line = (tr("Авто: y+ ≈ {target} ({reason}) → "
+            "{n_layers}, 1-й "
+            "{first_abs}", target=_g(pick.target), reason=pick.reason, n_layers=plural_layers(pick.n_layers), first_abs=phys.fmt_len(pick.first_abs)))
     if abs(pick.expansion - 1.2) > 1e-9:
         line += f", expansionRatio {pick.expansion:.2f}"
     if pick.yplus and abs(pick.yplus - pick.target) > 0.3 * pick.target:
-        line += f", вийде y+ ≈ {_g(pick.yplus)}"
+        line += tr(", вийде y+ ≈ {yplus}", yplus=_g(pick.yplus))
     return line + "."
 
 
@@ -606,4 +604,4 @@ def guard(cfg) -> list[tuple[str, str]]:
     if c.ok:
         return []
     fix = "; ".join(label for _, _, label in c.fixes)
-    return [("warn", c.text + (f" Що зробити: {fix}." if fix else ""))]
+    return [("warn", c.text + (tr(" Що зробити: {fix}.", fix=fix) if fix else ""))]

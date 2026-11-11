@@ -1,5 +1,9 @@
 """Обгортання геометрії алгоритмом CGAL Alpha Wrapping — через `wrapwrap.exe`.
 
+NOT IN THE WINDOW SINCE T15: the method «alpha wrap» of the «Полагодити» menu
+is our Rust alpha wrap (fs_meshfix, method="alphawrap"). This module stays
+for the tests and for comparisons with CGAL.
+
 Навіщо окремим модулем, а не в `fs_geometry`: причина та сама, що й у
 `fs_winfix` — це не наш алгоритм, а виклик чужої програми. Її може не бути на
 цій машині, вона йде хвилинами й говорить своїм текстом у stdout; нічому з
@@ -81,6 +85,7 @@ from pathlib import Path
 
 import numpy as np
 import pyvista as pv
+from fs_i18n import tr
 
 EXE_NAME = "wrapwrap.exe" if sys.platform == "win32" else "wrapwrap"
 
@@ -113,14 +118,12 @@ def available() -> bool:
 
 def why_not() -> str:
     """Чому кнопка неактивна — людськими словами."""
-    return ("Немає " + EXE_NAME + " — це окрема програма, збірка CGAL Alpha "
-            "Wrapping." + "\n\n"
-            "Завантажити: github.com/ipadjen/wrapwrap (розділ Releases, "
-            "готовий " + EXE_NAME + " для Windows, ~1.3 МБ) і покласти у "
-            "теку:" + "\n\n"
-            "    " + str(Path(__file__).parent / "tools") + "\n\n"
-            "Ремонт службою Windows («Полагодити як слайсер») і воксельне "
-            "«Обгорнути…» працюють і без цього.")
+    return (tr("Немає {EXE_NAME} — це окрема програма, збірка CGAL Alpha "
+               "Wrapping.\n\nЗавантажити: github.com/ipadjen/wrapwrap "
+               "(розділ Releases, готовий {EXE_NAME} для Windows, ~1.3 "
+               "МБ) і покласти у теку:\n\n    {str}\n\nКнопка «Полагодити» "
+               "(meshfix, alpha wrap на Rust, Windows, обʼємна "
+               "перебудова) працює і без цього.", EXE_NAME=EXE_NAME, str=str(Path(__file__).parent / "tools")))
 
 
 # --------------------------------------------------------------------------
@@ -186,9 +189,9 @@ def _run(argv: list[str], say) -> str:
     text = "\n".join(tail)
     if code != 0:
         raise RuntimeError(
-            f"wrapwrap відмовив (код {code}):" + "\n\n" + text[-600:] + "\n\n"
-            "Найчастіше це замалий alpha на дуже дрібній деталі. Спробуйте "
-            "більший alpha, або «Полагодити як слайсер».")
+            tr("wrapwrap відмовив (код {code}):\n\n{text}\n\nНайчастіше це "
+               "замалий alpha на дуже дрібній деталі. Спробуйте більший "
+               "alpha, або «Полагодити» (meshfix).", code=code, text=text[-600:]))
     return text
 
 
@@ -214,7 +217,7 @@ def repair(mesh: pv.PolyData, alpha: float, offset: float,
     src, dst = work / "in.stl", work / "out.stl"
     try:
         count = _to_stl(mesh, src)
-        say(f"подаю {count} трикутників у alpha wrap (alpha={alpha:g})")
+        say(tr("подаю {count} трикутників у alpha wrap (alpha={alpha:g})", count=count, alpha=alpha))
         _run([str(exe), "-i", str(src), "-alpha", f"{alpha:g}",
               "-offset", f"{offset:g}", "-o", str(dst)], say)
         if not dst.is_file():

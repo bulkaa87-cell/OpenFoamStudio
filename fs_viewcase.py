@@ -22,6 +22,7 @@ import numpy as np
 import fs_library as lib
 import fs_post as post
 import fs_views as fv
+from fs_i18n import tr
 
 # Границі, які тілом не є: їх у кадр не кладемо, навіть якщо про тіла нічого
 # не відомо. Назви — ті, що дає сама програма й blockMesh за замовчуванням.
@@ -139,21 +140,19 @@ def load_case(case_dir: str | Path, *, time: float | None = None,
     good, stale = post.matching_times(str(case_dir))
     times = good or list(res.times)
     if not times:
-        raise ValueError(f"У кейсі {name} немає часових каталогів з результатами.")
+        raise ValueError(tr("У кейсі {name} немає часових каталогів з результатами.", name=name))
     t = float(time) if time is not None else float(times[-1])
     if t not in times:
-        why = (f" (зрізи {', '.join('%g' % x for x in stale)} — від іншої сітки)"
+        why = (tr(" (зрізи {join} — від іншої сітки)", join=', '.join('%g' % x for x in stale))
                if stale else "")
-        raise ValueError(f"Моменту {t:g} у кейсі {name} нема; є: "
-                         + ", ".join(f"{x:g}" for x in times[-5:]) + why + ".")
+        raise ValueError(tr("Моменту {t:g} у кейсі {name} нема; є: {join}{why}.", t=t, name=name, join=", ".join(f"{x:g}" for x in times[-5:]), why=why))
     volume = res.internal(t)
     if volume is None:
-        raise ValueError(f"У кейсі {name} не читається обʼєм сітки.")
+        raise ValueError(tr("У кейсі {name} не читається обʼєм сітки.", name=name))
 
     notes: list = []
     if stale:
-        notes.append("зрізи " + ", ".join("%g" % x for x in stale)
-                     + " від іншої сітки — пропущено")
+        notes.append(tr("зрізи {join} від іншої сітки — пропущено", join=", ".join("%g" % x for x in stale)))
     manifest = lib.read_manifest(case_dir)
     cfg = lib.cfg_from_dict(manifest.get("cfg")) if manifest else None
     facts = control_facts(case_dir)
@@ -165,8 +164,8 @@ def load_case(case_dir: str | Path, *, time: float | None = None,
         speed = u_inf if u_inf is not None else facts.get("u_inf")
         if speed is None:
             raise ValueError(
-                f"Кейс {name} не каже швидкості потоку (немає studio.json, у "
-                f"controlDict нема magUInf). Задайте її: --u-inf.")
+                tr("Кейс {name} не каже швидкості потоку (немає studio.json, у "
+                "controlDict нема magUInf). Задайте її: --u-inf.", name=name))
         nu = kinematic_viscosity(case_dir) or 1.47e-5
         # Густинні розвʼязувачі (rhoSimpleFoam, rhoPimpleFoam, rhoCentralFoam)
         # тримають АБСОЛЮТНИЙ тиск у паскалях, а не кінематичний. Без цього
@@ -193,7 +192,7 @@ def load_case(case_dir: str | Path, *, time: float | None = None,
     unknown = [n for n in wanted if n not in present]
     wanted = [n for n in wanted if n in present]
     if unknown:
-        notes.append("немає такої границі: " + ", ".join(unknown))
+        notes.append(tr("немає такої границі: {unknown}", unknown=", ".join(unknown)))
     if not wanted:
         wanted = [n for n in present if n not in NOT_BODIES]
     bodies = {n: res.patch(t, n) for n in wanted}
@@ -217,8 +216,8 @@ def load_history(case_dir: str | Path, label: str = "") -> fv.HistoryCase:
     series = be.read_force_coeffs(str(case_dir))
     parts = be.read_body_coeffs(str(case_dir))
     if not series and not parts:
-        raise ValueError(f"У кейсі {case_dir.name} немає postProcessing з "
-                         f"коефіцієнтами: він не рахувався або їх прибрали.")
+        raise ValueError(tr("У кейсі {name} немає postProcessing з "
+                         "коефіцієнтами: він не рахувався або їх прибрали.", name=case_dir.name))
     manifest = lib.read_manifest(case_dir)
     if manifest and manifest.get("cfg"):
         steady = bool(lib.cfg_from_dict(manifest["cfg"]).solver.steady)
