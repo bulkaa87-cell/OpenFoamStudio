@@ -29,6 +29,11 @@
 !/requirements.txt
 !/OpenFOAM Studio.bat
 
+# Translations of the interface (the program reads them at run time)
+!/i18n/
+/i18n/*
+!/i18n/en/
+
 # Rust modules: only the source and the build files
 !/rust/
 /rust/*/*
