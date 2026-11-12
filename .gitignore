@@ -29,6 +29,7 @@
 !/requirements.txt
 !/OpenFOAM Studio.bat
 !/MeshFix Studio.bat
+!/ofs.cmd
 
 # Translations of the interface (the program reads them at run time)
 !/i18n/
