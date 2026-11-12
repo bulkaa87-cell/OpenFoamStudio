@@ -1833,6 +1833,11 @@ SKEW_FATAL = 8.0
 NONORTHO_FATAL = 75.0
 RE_FAILED = re.compile(r"FOAM FATAL (ERROR|IO ERROR)")
 RE_LAYERS = re.compile(r"Added (\d+) out of (\d+) cells")
+# "Extruding 167600 out of 244274 faces (68.6%)": the faces that got at least
+# one layer. "Added N out of M cells" is NOT this number: M is faces x
+# requested layers, so it is the share of the planned layer CELLS (T38:
+# 32 layers, 69% of the faces extruded, but only 9.8% of the cells).
+RE_EXTRUDE = re.compile(r"Extruding (\d+) out of (\d+) faces")
 
 # Банер фатальної помилки не несе ніякої інформації: сам текст іде
 # НАСТУПНИМИ рядками, а назва словника — у рядку «file: ... at line N».
@@ -1886,6 +1891,10 @@ class RunState:
     max_nonortho: float = 0.0
     negative_volumes: bool = False
     layer_coverage: float = -1.0
+    # Share of the wall faces with at least one layer (the last
+    # "Extruding N out of M faces" line), -1 when not seen. Not in _PARSED:
+    # foamrs does not read it, feed_text reads it with one regex search.
+    layer_faces: float = -1.0
     # Збирання тексту фатальної помилки, див. _feed_fatal.
     _fatal_open: bool = False
     _fatal_parts: list[str] = field(default_factory=list)
@@ -1912,7 +1921,10 @@ class RunState:
                                 "{n_skew_faces} faces", max_skewness=self.max_skewness, n_skew_faces=self.n_skew_faces))
             if self.max_nonortho:
                 parts.append(tr("non-orthogonality {max_nonortho:.1f}", max_nonortho=self.max_nonortho))
-            return ("warn", ", ".join(parts) or tr("has remarks"))
+            # fs_i18n.join keeps the keys: the status line follows a live
+            # change of the language (T38).
+            from fs_i18n import join
+            return ("warn", join(", ", parts) if parts else tr("has remarks"))
         return ("ok", "")
 
     @property
@@ -2061,6 +2073,9 @@ class RunState:
             self.layer_coverage = added / total if total else 0.0
             changed = True
 
+        if self._feed_extrude(line):
+            changed = True
+
         if "SIMPLE solution converged" in line or "solution converged in" in line:
             self.converged = True
             changed = True
@@ -2087,12 +2102,26 @@ class RunState:
             out = fast.parse_log(text, self._parse_state())
             if out is not None:
                 self._take_parse(out)
-                return bool(out["changed"])
+                faces = self._feed_extrude(text)
+                return bool(out["changed"]) or faces
         changed = False
         for line in text.split("\n"):
             if self.feed(line):
                 changed = True
         return changed
+
+    def _feed_extrude(self, text: str) -> bool:
+        """The last "Extruding N out of M faces" in `text` -> layer_faces."""
+        if "Extruding " not in text:
+            return False
+        last = None
+        for last in RE_EXTRUDE.finditer(text):
+            pass
+        if last is None:
+            return False
+        done, total = int(last.group(1)), int(last.group(2))
+        self.layer_faces = done / total if total else 0.0
+        return True
 
     def _parse_state(self) -> dict:
         st = {k: getattr(self, k) for k in self._PARSED}

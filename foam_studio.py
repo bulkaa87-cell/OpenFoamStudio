@@ -1307,6 +1307,9 @@ class RunWorker(QtCore.QObject):
             mesh_key = (be.mesh_key(case_dir) if case_dir
                         and be.mesh_cache_supported(backend) else "")
         self.mesh_key = mesh_key
+        # The settings of THIS run (a copy made at the start). None: not
+        # known here (attach) -> MainWindow._run_cfg reads the case manifest.
+        self.cfg: "fc.CaseCfg | None" = None
         self.runner: be.Runner | None = None
         # Звідки читати postProcessing під час прогону. Коли кейс у рідній ФС
         # WSL, Windows бачить його через \\wsl.localhost.
@@ -7045,6 +7048,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                 name=self.cfg.name,
                                 stop_on_bad_mesh=self.cfg.solver.stop_on_bad_mesh,
                                 mesh_key=mkey)
+        # The advice after the run is about THIS run, also when the fields
+        # change while it goes (T38).
+        self.worker.cfg = lib.cfg_from_dict(lib.cfg_to_dict(self.cfg))
         self.thread = QtCore.QThread(self)
         self.thread.setObjectName("run")
         self.worker.moveToThread(self.thread)
@@ -7203,6 +7209,8 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             parts = [tr("Run finished.") if ok else tr("Stopped: {msg}", msg=msg)]
         st = self.worker.runner.state if (self.worker and self.worker.runner) else None
+        run_cfg = self._run_cfg()
+        pending_fix = None
         if st:
             if st.cells:
                 parts.append(tr("Cells: {cells}", cells=phys.fmt_cells(st.cells)))
@@ -7213,15 +7221,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 parts.append(tr("checkMesh: {why} — within normal limits.", why=why))
             elif st.mesh_ok:
                 parts.append(tr("checkMesh: no issues."))
-            if st.layer_coverage >= 0:
+            self._layer_fix = None
+            self.panel_run.show_layer_fix(None)
+            if st.layer_coverage >= 0 and run_cfg is not None:
                 # Не просто «замало»: розбір каже, чого саме замало, чим це
                 # погано для результату і що підкрутити — а кнопка нижче
-                # підкручує.
-                self._layer_fix = adv.layer_diagnosis(
-                    self.cfg, st.layer_coverage, self.diag)
-                parts.append(self._layer_fix.report())
-                self.panel_run.show_layer_fix(self._layer_fix)
-            if ok and not st.converged:
+                # підкручує. Числа — з налаштувань САМОГО прогону (T38:
+                # після «Підключитися» у вікні був інший проєкт). Кнопку
+                # дає _offer_layer_fix нижче: після підключення вікно саме
+                # відкриває кейс прогону (T37), і тоді поля вже ті.
+                diag = self.diag if self._same_model(run_cfg) else None
+                fix = adv.layer_diagnosis(
+                    run_cfg, st.layer_coverage, diag,
+                    faces=getattr(st, "layer_faces", -1.0))
+                parts.append(fix.report())
+                if fix.fixable and fix.level in ("warn", "bad"):
+                    pending_fix = fix
+            elif st.layer_coverage >= 0:
+                # A run we attached to, without its case on this computer:
+                # the share only, no numbers from settings we do not know.
+                parts.append(tr("Layers: {pct:.0f}% of the planned layer "
+                                "cells grew.", pct=st.layer_coverage * 100))
+                self.panel_run.show_layer_fix(None)
+            else:
+                self.panel_run.show_layer_fix(None)
+            # The residual threshold stops only a steady run. A transient
+            # run ends at endTime, and its residuals do not go below the
+            # threshold (T38).
+            steady = (run_cfg.solver.steady if run_cfg is not None
+                      else float(getattr(st, "moment", 0.0)).is_integer())
+            if ok and steady and not st.converged:
                 parts.append(tr("⚠ The residuals did not drop below the "
                                 "threshold — convergence is not reached, "
                                 "this is not the final result."))
@@ -7243,13 +7272,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # the settings of the window found no body patch and showed an empty
         # view (T37).
         opening = (self._attach_open
-                   if self.worker is not None and self.worker.attach_to else "")
+                   if getattr(self.worker, "attach_to", "") else "")
         self._attach_open = ""
         if ok and opening and lib.read_manifest(opening) is not None:
             self._open_attached(opening)
         elif ok:
             self.load_results()
             self.tabs_right.setCurrentWidget(self.results_view)
+        if pending_fix is not None:
+            self._offer_layer_fix(pending_fix, parts)
         if self._series is not None:
             self._series_after_run(
                 ok, msg, (self.worker.case_dir if self.worker else "")
@@ -7317,10 +7348,89 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_run.btn_soft_stop.setEnabled(False)
         self.panel_run.lbl_status.setText(tr("Stopping with time step: {why}.", why=why))
 
+    _LAYER_FIELDS = ("add_layers", "n_layers", "expansion", "final_layer_rel",
+                     "min_thickness_rel")
+
+    def _run_cfg(self) -> "fc.CaseCfg | None":
+        """The settings of the run that has just ended (T38).
+
+        A run started here keeps a copy (RunWorker.cfg). A run we attached
+        to: the manifest (studio.json) of its case, written when the case
+        was written. None: an attached run without its case here — then we
+        do not know its settings, and the window ones are of another run.
+        """
+        w = self.worker
+        if w is None:
+            return self.cfg
+        cfg = getattr(w, "cfg", None)
+        if cfg is not None:
+            return cfg
+        case_dir = getattr(w, "case_dir", "") or ""
+        if getattr(w, "attach_to", "") or case_dir:
+            data = lib.read_manifest(case_dir) if case_dir else None
+            if data and isinstance(data.get("cfg"), dict):
+                try:
+                    return lib.cfg_from_dict(data["cfg"])
+                except Exception:                          # noqa: BLE001
+                    pass
+            if getattr(w, "attach_to", ""):
+                return None
+        return self.cfg
+
+    def _same_model(self, run_cfg) -> bool:
+        """The window holds the same model as `run_cfg` (bodies, extent)."""
+        if run_cfg is None:
+            return False
+        if run_cfg is self.cfg:
+            return True
+        a, b = run_cfg, self.cfg
+        if [x.name for x in a.bodies] != [x.name for x in b.bodies]:
+            return False
+        size = max(a.body_length, a.body_span, a.body_height)
+        return all(abs(p - q) <= 1e-6 * max(size, 1e-9) + 1e-9
+                   for p, q in zip(tuple(a.bbox_min) + tuple(a.bbox_max),
+                                   tuple(b.bbox_min) + tuple(b.bbox_max)))
+
+    def _same_layer_cfg(self, run_cfg) -> bool:
+        """Same model and the same layer settings as the run: only then do
+        the "Repair Layers" numbers belong to the fields in the window."""
+        if not self._same_model(run_cfg):
+            return False
+        return all(getattr(run_cfg.mesh, k) == getattr(self.cfg.mesh, k)
+                   for k in self._LAYER_FIELDS + ("surface_level_max",)) \
+            and run_cfg.domain.base_cells_along_x == \
+            self.cfg.domain.base_cells_along_x
+
+    def _offer_layer_fix(self, fix, parts: list) -> None:
+        """«Repair Layers» only when the window holds the settings of the
+        run; else say why there is no button (T38)."""
+        if self._same_layer_cfg(fix.source):
+            self._layer_fix = fix
+            self.panel_run.show_layer_fix(fix)
+            return
+        self.panel_run.lbl_status.setText(fs_i18n.join("\n", parts + [tr(
+            "The settings in the window are not the settings of this run "
+            "(case “{name}”), so “Repair Layers” is not shown. Open this "
+            "case from “Saved” to change it.", name=fix.source.name)]))
+
     def fix_layers(self):
         """Застосовує правки шарів із розбору минулого прогону."""
         diagnosis = getattr(self, "_layer_fix", None)
         if diagnosis is None or not diagnosis.fixable:
+            return
+        # The fields changed after the advice (or another project is open):
+        # the numbers of the advice are no longer about these fields.
+        if diagnosis.source is not None and not self._same_layer_cfg(
+                diagnosis.source):
+            self.panel_run.show_layer_fix(None)
+            self._layer_fix = None
+            self.panel_run.lbl_status.setText(tr(
+                "The layer settings were changed after the run, so the "
+                "advice is no longer valid. Run again to get a new one."))
+            return
+        # A mesh from the project (T16): new layers mean a new mesh. Ask
+        # as the locked fields ask.
+        if not self.mesh_guard(tr("Repair Layers")):
             return
         adv.apply_layer_fix(self.cfg, diagnosis)
         # A layer fix from the last run is a hand choice: auto y+ must not
@@ -7329,8 +7439,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reload_panels()
         self.refresh_all()
         self.panel_run.show_layer_fix(None)
-        changed = ", ".join(f"{t.what} {t.current} → {t.suggested}"
-                            for t in diagnosis.tips)
+        self._layer_fix = None
+        changed = adv.tips_text(diagnosis.tips)
         self.panel_run.lbl_status.setText(
             tr("Changed: {changed}. The mesh must be rebuilt — click "
                "“Run”, the case will be overwritten and snappy will run "

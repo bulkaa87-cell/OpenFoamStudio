@@ -24,6 +24,7 @@ import fs_memfit as memfit
 import fs_physics as phys
 import fs_yplus as fy
 from fs_i18n import tr
+import fs_i18n
 
 # Скільки комірок на довжину тіла хочемо на поверхні. 150 — робочий компроміс
 # між «видно форму» і «влазить у памʼять» для зовнішньої аеродинаміки.
@@ -555,7 +556,11 @@ def _flow_notes(cfg: fc.CaseCfg, diag, notes: list, target_yplus: float,
 # Плямисті шари: що з ними робити
 # --------------------------------------------------------------------------
 
-# Частка граней, які справді отримали призми. Пороги не з голови:
+# Частка ЗАПЛАНОВАНИХ КОМІРОК шарів, що справді наросли («Added N out of M
+# cells», M = грані x шари), а не частка граней (T38: devlog ZNAHIDKY §8
+# дає 3.66 шару з 10 = 36.6%, тобто це завжди було «середнє шарів / шари»).
+# Частку граней дає окремий рядок «Extruding N out of M faces»
+# (RunState.layer_faces). Пороги не з голови:
 #   gui_wing (чисте крило, одна оболонка)      — 89.7%
 #   plane5 (збірка з 44 частин), 3 шари        — 78.6%
 #   plane5, 5 шарів                            — 65.2%
@@ -574,10 +579,12 @@ class LayerDiagnosis:
     coverage: float = 0.0
     level: str = "ok"                   # ok | warn | bad
     headline: str = ""
+    detail: str = ""                    # layers per face, share of faces
     effect: str = ""
     tips: list[Tip] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     cfg: fc.CaseCfg | None = None       # конфіг із застосованими правками
+    source: fc.CaseCfg | None = None    # конфіг прогону, з якого розбір
 
     @property
     def fixable(self) -> bool:
@@ -589,21 +596,36 @@ class LayerDiagnosis:
         Окремими рядками, а не суцільним абзацом: це читають один раз і
         похапцем, одразу після прогону.
         """
+        # fs_i18n.join, not str.join: the text must change with a live
+        # change of the language (T38: "\n".join gave a plain str).
         lines = [self.headline]
+        if self.detail:
+            lines.append(self.detail)
         if self.effect:
             lines.append(self.effect)
         if self.tips:
-            lines.append(tr("What to adjust: {join}.", join="; ".join(
-                f"{t.what} {t.current} → {t.suggested}" for t in self.tips)))
+            lines.append(tr("What to adjust: {join}.",
+                            join=tips_text(self.tips, "; ")))
         lines.extend(self.notes)
-        return "\n".join(lines)
+        return fs_i18n.join("\n", lines)
+
+
+def tips_text(tips, sep: str = ", "):
+    """"Layers 5 → 3, minThickness 0.05 → 0.02" as one TrStr."""
+    return fs_i18n.join(sep, [t.what + " " + t.current + " → " + t.suggested
+                              for t in tips])
 
 
 def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
-                    diag=None) -> LayerDiagnosis:
+                    diag=None, faces: float = -1.0) -> LayerDiagnosis:
     """Що робити, коли шари наросли не всюди.
 
-    `coverage` — частка граней із «Added N out of M cells» у логу snappy.
+    `coverage` — «Added N out of M cells» у логу snappy: частка
+    запланованих комірок шарів (середнє шарів на грань / шари), а НЕ частка
+    граней. `faces` — частка граней хоч з одним шаром («Extruding N out of
+    M faces»), -1 — невідомо. `cfg` — конфіг САМОГО прогону (із маніфесту
+    кейсу), а не вікна: після «Підключитися» у вікні може бути інший
+    проєкт (T38).
     Саме її раніше показував рядок стану словом «замало», не кажучи ні чого
     замало, ні що з цим робити.
 
@@ -616,7 +638,7 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
     """
     import copy
 
-    out = LayerDiagnosis(coverage=coverage)
+    out = LayerDiagnosis(coverage=coverage, source=cfg)
     m, f = cfg.mesh, cfg.flow
     L = f.l_ref or cfg.body_length
     pct = coverage * 100
@@ -625,8 +647,20 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
         out.headline = tr("No layers were requested — the boundary layer is on a “bare” mesh.")
         return out
 
+    # Середнє шарів: на всіх гранях і на тих, де шари є.
+    mean_all = coverage * m.n_layers
+    mean_grown = mean_all / faces if faces > 0 else mean_all
+    if faces >= 0:
+        out.detail = tr("On average {mean:.1f} of {n} layers per face; "
+                        "{faces:.0f}% of the faces got at least one layer.",
+                        mean=mean_all, n=m.n_layers, faces=faces * 100)
+    else:
+        out.detail = tr("On average {mean:.1f} of {n} layers per face.",
+                        mean=mean_all, n=m.n_layers)
+
     if coverage >= LAYER_FINE:
-        out.headline = tr("Layers grew on {pct:.0f}% of faces — normal.", pct=pct)
+        out.headline = tr("Layers: {pct:.0f}% of the planned layer cells "
+                          "grew — normal.", pct=pct)
         out.notes.append(
             tr("The rest are sharp edges and joints where there is no space for a prism."))
         return out
@@ -636,25 +670,46 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
     yp_layers = stack.yplus(f.u_inf, L, f.nu)
     yp_bare = phys.yplus_for_wall_distance(cfg.surface_cell / 2.0,
                                            f.u_inf, L, f.nu)
-    out.effect = (
-        tr("Where there are no layers (that is {v:.0f}% of the surface), "
-           "the first cell is equal to the surface cell — {surface_cell} "
-           "instead of {first_abs}, so the local y+ jumps from "
-           "{yp_layers:.0f} to {yp_bare:.0f}. Skin friction drag on "
-           "these areas is too low, and the y+ from the “Mesh” tab is "
-           "not valid for them.", v=100 - pct, surface_cell=phys.fmt_len(cfg.surface_cell), first_abs=phys.fmt_len(stack.first_abs), yp_layers=yp_layers, yp_bare=yp_bare))
+    effect = []
+    bare = (1.0 - faces) * 100 if faces >= 0 else -1.0
+    common = dict(surface_cell=phys.fmt_len(cfg.surface_cell),
+                  first_abs=phys.fmt_len(stack.first_abs),
+                  yp_layers=yp_layers, yp_bare=yp_bare)
+    if bare >= 0.5:
+        effect.append(
+            tr("Where there are no layers (that is {v:.0f}% of the surface), "
+               "the first cell is equal to the surface cell — {surface_cell} "
+               "instead of {first_abs}, so the local y+ jumps from "
+               "{yp_layers:.0f} to {yp_bare:.0f}. Skin friction drag on "
+               "these areas is too low, and the y+ from the “Mesh” tab is "
+               "not valid for them.", v=bare, **common))
+    elif bare < 0:
+        effect.append(
+            tr("Where there are no layers, the first cell is equal to the "
+               "surface cell — {surface_cell} instead of {first_abs}, so "
+               "the local y+ jumps from {yp_layers:.0f} to {yp_bare:.0f}. "
+               "Skin friction drag on these areas is too low, and the y+ "
+               "from the “Mesh” tab is not valid for them.", **common))
+    if mean_grown < 0.9 * m.n_layers:
+        effect.append(
+            tr("Where layers grew, there are {mean:.1f} of {n} on average: "
+               "the y+ from the “Mesh” tab is valid only where the full "
+               "stack grew.", mean=mean_grown, n=m.n_layers))
+    out.effect = fs_i18n.join(" ", effect)
 
     if coverage >= LAYER_WORKABLE:
         out.level = "warn"
-        out.headline = (tr("Layers grew on {pct:.0f}% of faces — usable, "
-                           "but not uniform.", pct=pct))
+        out.headline = (tr("Layers: {pct:.0f}% of the planned layer cells "
+                           "grew — usable, but not uniform.", pct=pct))
     elif coverage >= LAYER_POOR:
         out.level = "warn"
-        out.headline = tr("Layers grew on only {pct:.0f}% of faces — too little.", pct=pct)
+        out.headline = tr("Layers: only {pct:.0f}% of the planned layer "
+                          "cells grew — too little.", pct=pct)
     else:
         out.level = "bad"
-        out.headline = (tr("Layers grew on only {pct:.0f}% of faces — "
-                           "the boundary layer is in fact not resolved.", pct=pct))
+        out.headline = (tr("Layers: only {pct:.0f}% of the planned layer "
+                           "cells grew — the boundary layer is in fact not "
+                           "resolved.", pct=pct))
 
     # ---- правки ----
     #
@@ -709,7 +764,24 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
 
     if tips:
         after = new.layer_stack
-        if after.total < stack.total * 0.95:
+        same_first = (first_before > 0 and abs(after.first_abs / first_before
+                                               - 1.0) <= 0.1)
+        if after.total < stack.total * 0.95 and not same_first:
+            # finalLayerThickness hit its limit (0.05 or 1.0): the first
+            # layer does change, so do not say "almost the same" (T38: 32
+            # layers, 4.0 µm -> 7.4 µm).
+            out.notes.append(
+                tr("After the changes: first layer {first_abs} (was "
+                   "{first_before}), so y+ ≈ {yp_after:.0f} instead of "
+                   "{yp_layers:.0f}: finalLayerThickness is at its limit, "
+                   "so the first layer cannot stay the same. The stack "
+                   "gets shorter from {total} to {total2}.",
+                   first_abs=phys.fmt_len(after.first_abs),
+                   first_before=phys.fmt_len(first_before),
+                   yp_after=after.yplus(f.u_inf, L, f.nu),
+                   yp_layers=yp_layers, total=phys.fmt_len(stack.total),
+                   total2=phys.fmt_len(after.total)))
+        elif after.total < stack.total * 0.95:
             out.notes.append(
                 tr("After the changes: first layer {first_abs} (was "
                    "{first_before}), so y+ ≈ {u_inf:.0f} instead of "
