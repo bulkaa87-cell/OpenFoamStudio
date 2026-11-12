@@ -20,7 +20,7 @@ The user interface of the program is in English and Ukrainian.
 - Geometry repair:
   - Built-in repair (VTK)
   - "Repair as a slicer": the mesh repair service of Windows (WinRT `Printing3D`), optional
-  - meshfix: the same repair steps in Rust (**experimental**, see "Known problems")
+  - meshfix: the own repair of the program in Rust. The result is close to the Windows 3D-model repair; this is checked by measurements on test meshes (**experimental**, see "Known problems")
   - Alpha wrap through the external `wrapwrap` program (CGAL), optional
 - Domain and background mesh, `snappyHexMesh` with refinement levels and prism layers
 - Solvers: `simpleFoam`, `pimpleFoam`, `rhoSimpleFoam`, `rhoPimpleFoam`, `rhoCentralFoam` (supersonic)
