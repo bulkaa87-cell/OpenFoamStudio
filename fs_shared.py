@@ -21,7 +21,7 @@ import sys
 
 # The versions of requirements.txt. A different installed version gives a
 # note in the log (version_note()), not an error.
-PINNED = {"meshfix": "0.3.0", "foamview": "0.3.0"}
+PINNED = {"meshfix": "0.3.1", "foamview": "0.3.1"}
 
 _SUFFIXES = (".pyd", ".so")
 

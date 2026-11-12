@@ -37,7 +37,6 @@ from pathlib import Path
 
 import numpy as np
 
-import fs_backend as be
 import fs_caseguard as guard
 import fs_coeffs as coeffs
 import fs_library as lib
@@ -54,8 +53,9 @@ JUDGED = ("Cd", "Cl", "CmPitch")
 # spread of 0.001 looks like an oscillation of 33 %.
 FLOOR = {"Cl": 0.1, "Cd": 0.01, "CmPitch": 0.05, "Cs": 0.05}
 
-STEADY_N = 50              # the window of the Library (post.summarise_coeffs)
-TRANSIENT_FRAC = 0.25      # the last quarter of the computed time
+# The averaging window: one rule with the Library and «Results» (fs_coeffs).
+STEADY_N = coeffs.STEADY_N
+TRANSIENT_FRAC = coeffs.TRANSIENT_FRAC
 # A transient mean that moves by more than this between the two halves of
 # the window is not a mean yet.
 TRANSIENT_DRIFT = 0.02
@@ -96,26 +96,9 @@ def merge(segments: list[Segment], steady: bool) -> tuple[dict, dict, bool]:
 # Averaging and convergence
 # ==========================================================================
 
-def _weights(t: np.ndarray) -> np.ndarray:
-    """Time weights of samples with a variable time step (trapezoid)."""
-    if t.size < 2:
-        return np.ones_like(t)
-    d = np.diff(t)
-    w = np.zeros_like(t)
-    w[:-1] += 0.5 * d
-    w[1:] += 0.5 * d
-    if not np.any(w > 0):
-        return np.ones_like(t)
-    return w
-
-
-def _wstats(t: np.ndarray, v: np.ndarray, timed: bool) -> tuple[float, float]:
-    if v.size == 0:
-        return float("nan"), float("nan")
-    w = _weights(t) if timed else np.ones_like(v)
-    mean = float(np.average(v, weights=w))
-    std = float(math.sqrt(max(np.average((v - mean) ** 2, weights=w), 0.0)))
-    return mean, std
+# The averaging of fs_coeffs (T51, K2b: one rule for the program).
+_weights = coeffs.weights
+_wstats = coeffs.mean_std
 
 
 @dataclass
@@ -144,27 +127,14 @@ def window_of(series: dict, steady: bool, *, steady_n: int = STEADY_N,
     pts = series.get("Cd") or next(iter(series.values()), [])
     if not pts:
         return Window(steady)
-    t = np.array([p[0] for p in pts], dtype=float)
-    if steady:
-        n = max(1, min(int(steady_n), t.size))
-        return Window(True, float(t[-n]), float(t[-1]), n, float(t[0]))
-    t0, t1 = float(t[0]), float(t[-1])
-    if t_from is not None and t_from > 0:
-        start = min(max(float(t_from), t0), t1)
-    else:
-        f = min(max(float(frac), 0.01), 1.0)
-        start = t1 - f * (t1 - t0)
-    n = int(np.count_nonzero(t >= start - 1e-15))
-    return Window(False, start, t1, n, t0)
+    t = [p[0] for p in pts]
+    start, n = coeffs.window(t, steady, steady_n=steady_n, frac=frac,
+                             t_from=t_from)
+    return Window(bool(steady), start, float(t[-1]), n, float(t[0]))
 
 
 def _in_window(pts, win: Window) -> tuple[np.ndarray, np.ndarray]:
-    arr = np.array(pts, dtype=float).reshape(-1, 2)
-    if win.steady:
-        arr = arr[-win.count:] if win.count else arr[:0]
-    else:
-        arr = arr[arr[:, 0] >= win.start - 1e-15]
-    return arr[:, 0], arr[:, 1]
+    return coeffs.window_values(pts, win.steady, win.start, win.count)
 
 
 def transient_verdict(t: np.ndarray, v: np.ndarray,

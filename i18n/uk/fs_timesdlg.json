@@ -50,8 +50,5 @@
  "yes": "так",
  "{n} times, about {size}": "моментів: {n}, близько {size}",
  "{server}, run folder {remote}: {n} times, {cells:,} cells, {nproc} processor* folders.": "{server}, тека прогону {remote}: моментів {n}, комірок {cells:,}, тек processor*: {nproc}.",
- "{server}, run folder {remote}: {n} times, {nproc} processor* folders.": "{server}, тека прогону {remote}: моментів {n}, тек processor*: {nproc}.",
- "{v:.0f} MB": "{v:.0f} МБ",
- "{v:.0f} kB": "{v:.0f} кБ",
- "{v:.1f} GB": "{v:.1f} ГБ"
+ "{server}, run folder {remote}: {n} times, {nproc} processor* folders.": "{server}, тека прогону {remote}: моментів {n}, тек processor*: {nproc}."
 }

@@ -3563,8 +3563,6 @@ def block_mesh_dict(cfg: CaseCfg) -> str:
 def snappy_dict(cfg: CaseCfg) -> str:
     m = cfg.mesh
     stl = cfg.stl_file
-    patch = cfg.patch
-    ename = stl.rsplit(".", 1)[0]
 
     # Кожна частина тіла — окрема поверхня з власним іменем. Без роздільних
     # патчів список має рівно один запис, і текст виходить той самий, що й

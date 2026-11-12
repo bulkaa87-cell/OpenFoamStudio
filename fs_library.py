@@ -38,6 +38,7 @@ import fs_fastzip as fz
 import fs_case as fc
 import fs_post as post
 import fs_i18n
+import fs_fmt as fmt
 from fs_i18n import tr
 
 MANIFEST = "studio.json"
@@ -1063,7 +1064,9 @@ def read_case(path: str | os.PathLike, with_size: bool = True,
         info.size = dir_size(root)
     if with_coeffs:
         try:
-            info.coeffs = post.summarise_coeffs(be.read_force_coeffs(str(root)))
+            info.coeffs = post.summarise_coeffs(
+                be.read_force_coeffs(str(root)),
+                steady=info.steady if info.has_cfg else None)
         except (OSError, ValueError):
             info.coeffs = {}
     return info
@@ -1347,29 +1350,10 @@ def series_notes(angles: list[float]) -> list[str]:
 # Форматування для таблиці
 # ==========================================================================
 
-def fmt_size(n: int) -> str:
-    if n <= 0:
-        return "—"
-    for unit, div in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
-        if n >= div:
-            return f"{n / div:.1f} {unit}"
-    return tr("{n} B", n=n)
-
-
-def fmt_time(stamp: float) -> str:
-    if not stamp:
-        return "—"
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))
-
-
-def fmt_seconds(s: float) -> str:
-    if not s:
-        return "—"
-    if s < 90:
-        return tr("{s:.0f} s", s=s)
-    if s < 3600:
-        return tr("{v:.1f} min", v=s / 60)
-    return tr("{v:.1f} h", v=s / 3600)
+# The formats for the person: fs_fmt (T51, one place for the program).
+fmt_size = fmt.bytes_text
+fmt_time = fmt.stamp
+fmt_seconds = fmt.duration
 
 
 # ==========================================================================

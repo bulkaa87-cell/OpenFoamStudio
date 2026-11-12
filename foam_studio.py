@@ -69,6 +69,7 @@ import fs_slicebar as slicebar
 import fs_statusbar as sbar
 import fs_views as fv
 import fs_yplus as fy
+import fs_fmt as fmt
 from fs_i18n import tr
 
 import fs_paths
@@ -980,7 +981,7 @@ class Viewport(QtWidgets.QWidget):
         if count:
             chk.setEnabled(True)
             chk.setText(tr("{label} {count}", label=label,
-                           count=f"{count:,}".replace(",", " ")))
+                           count=fmt.count(count)))
             chk.setStyleSheet(f"color:{colour}; font-weight:bold;")
             chk.setToolTip(advice)
         else:
@@ -2719,9 +2720,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_pmesh()
         same = self._pmesh.baseline == key
         self.log.push(
-            tr("Mesh from project {key} ({cells:,} cells) is locked: the "
-               "run uses it, snappyHexMesh will not run.", key=key, cells=self._pmesh.cells)
-            .replace(",", " ")
+            tr("Mesh from project {key} ({cells} cells) is locked: the "
+               "run uses it, snappyHexMesh will not run.", key=key,
+               cells=fmt.count(self._pmesh.cells))
             + ("" if same else
                tr(" This version of the program would write the settings "
                   "a bit differently (key {baseline}), but you changed "
@@ -4614,11 +4615,12 @@ class MainWindow(QtWidgets.QMainWindow):
         target = max(need * 2, 20_000)
         ans = QtWidgets.QMessageBox.question(
             self, tr("Decimate the geometry?"),
-            tr("The model has {have:,} triangles, but with a cell of "
-               "{cell} about {need:,} are enough.\n\nExtra tessellation "
+            tr("The model has {have} triangles, but with a cell of "
+               "{cell} about {need} are enough.\n\nExtra tessellation "
                "does not add accuracy, but it slows down snappyHexMesh "
-               "and the program itself.\n\nDecimate to {target:,} "
-               "triangles?", have=have, cell=phys.fmt_len(cell), need=need, target=target).replace(",", " "),
+               "and the program itself.\n\nDecimate to {target} "
+               "triangles?", have=fmt.count(have), cell=phys.fmt_len(cell),
+               need=fmt.count(need), target=fmt.count(target)),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes)
         if ans != QtWidgets.QMessageBox.Yes:
@@ -5120,7 +5122,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # зі згенерованих словників вихідні налаштування не відновити.
             lib.write_manifest(case_dir, self.cfg,
                                stl_source=self.stl_source or self.stl_path)
-        except Exception as exc:
+        except Exception:
             QtWidgets.QMessageBox.critical(self, tr("Could not write the case"),
                                            traceback.format_exc(limit=3))
             return None
@@ -5132,8 +5134,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, tr("Case created"),
                 tr("{case_dir}\n\nCells (estimate): {total}\nsnappy memory: "
-                   "   {snappy_peak_gb:.1f} GB\nSTL triangles:    "
-                   "{n_cells:,}", case_dir=case_dir, total=phys.fmt_cells(est.total), snappy_peak_gb=est.snappy_peak_gb, n_cells=self.mesh.n_cells).replace(",", " "))
+                   "   {snappy_peak_gb} GB\nSTL triangles:    "
+                   "{n_cells}", case_dir=case_dir, total=phys.fmt_cells(est.total),
+                   snappy_peak_gb=fmt.decimal(est.snappy_peak_gb, 1),
+                   n_cells=fmt.count(self.mesh.n_cells)))
         return self.case_dir
 
     def _ssh_hosts(self) -> list[str]:
@@ -5208,15 +5212,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if worth:
             self.sessions_seen.emit(worth)
 
-    @staticmethod
-    def _how_long(seconds: int) -> str:
-        if seconds < 0:
-            return tr("some time ago")
-        if seconds < 90:
-            return tr("just now")
-        if seconds < 5400:
-            return tr("{v} min ago", v=seconds // 60)
-        return tr("{v} h ago", v=seconds // 3600)
+    # How long ago: fs_fmt (T51).
+    _how_long = staticmethod(fmt.ago)
 
     @QtCore.Slot(object)
     def _say_sessions(self, found):
@@ -7422,8 +7419,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         # The step limit of a transient pre-run lives in the case (system/),
         # so each backend takes it with the case. Not in a main run.
-        if pre and not self.cfg.solver.steady:
-            prerun.write_limit_file(self.case_dir)
+        if pre:
+            try:
+                prerun.prepare_case(self.case_dir, self.cfg)
+            except (OSError, ValueError) as exc:
+                QtWidgets.QMessageBox.critical(
+                    self, tr("Run with a pre-run (tuning)"),
+                    tr("Could not limit the pre-run: {exc}", exc=exc))
+                return False
         else:
             prerun.remove_limit_file(self.case_dir)
 
@@ -7861,7 +7864,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         backend = self.panel_run.current_backend()
         try:
-            coeffs = post.summarise_coeffs(be.read_force_coeffs(case_dir))
+            coeffs = post.summarise_coeffs(be.read_force_coeffs(case_dir),
+                                           steady=self._case_steady(case_dir))
         except OSError:
             coeffs = {}
         # The folder of this run on the server (T43, be.run_server_dir).
@@ -8103,18 +8107,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slice_bar.setEnabled(True)
 
         coeffs = be.read_force_coeffs(self.case_dir)
-        stats = post.summarise_coeffs(coeffs)
+        steady = bool(self.cfg.solver.steady)
+        stats = post.summarise_coeffs(coeffs, steady=steady)
         self._cop = be.center_of_pressure(
             stats, self.cfg.flow.l_ref, self.cfg.flow.aoa_deg,
             self.cfg.flow.cofr)
         if stats:
             txt = []
-            steady = bool(self.cfg.solver.steady)
             for name in ("Cd", "Cl", "CmPitch"):
                 if name in stats:
                     mean, spread = stats[name]
-                    txt.append(tr("{name} = {mean:+.5f}  (spread over "
-                                  "the last 50 iterations {spread:.2e})", name=name, mean=mean, spread=spread))
+                    if steady:
+                        txt.append(tr("{name} = {mean:+.5f}  (spread over "
+                                      "the last 50 iterations {spread:.2e})", name=name, mean=mean, spread=spread))
+                    else:
+                        # T51 (K2b): the time mean of the polars.
+                        txt.append(tr("{name} = {mean:+.5f}  (time mean over "
+                                      "the last quarter of the run, spread "
+                                      "{spread:.2e})", name=name, mean=mean, spread=spread))
                     # Саме число «0.35» нічого не каже: це може бути й
                     # недобіглий прогін, і коливання, і лікуються вони
                     # протилежно. Тому поряд із розкидом пишемо, ЩО ЦЕ.
@@ -8129,7 +8139,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # потрапляє в обидві. Про це краще знати, ніж дивуватися.
             for body, series in sorted(be.read_body_coeffs(
                     self.case_dir).items()):
-                part = post.summarise_coeffs(series)
+                part = post.summarise_coeffs(series, steady=steady)
                 if "Cd" in part:
                     bits = [f"{n} = {part[n][0]:+.5f}"
                             for n in ("Cd", "Cl") if n in part]
@@ -9822,6 +9832,15 @@ def end_process(win, rc: int, grace_ms: int = 5000) -> None:
             except Exception:                                # noqa: BLE001
                 pass
         os._exit(rc)
+    # Delete the windows while the QApplication lives: a window or dialog
+    # that lived on to the end of Python crashed the exit with PySide6 6.12
+    # (0xC0000005, T51).
+    for w in QtWidgets.QApplication.topLevelWidgets():
+        try:
+            w.deleteLater()
+        except RuntimeError:
+            pass
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
     crashlog.finish()
     sys.exit(rc)
 

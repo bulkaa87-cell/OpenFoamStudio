@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pyvista as pv
 import vtk
+import fs_fmt as fmt
 from fs_i18n import tr
 
 
@@ -971,8 +972,8 @@ def diagnosis_rows(d: Diagnosis) -> list[tuple[str, str, str]]:
 
     sx, sy, sz = d.size
     rows = [
-        (tr("Triangles"), f"{d.n_triangles:,}".replace(",", " "), "ok"),
-        (tr("Vertices"), f"{d.n_points:,}".replace(",", " "), "ok"),
+        (tr("Triangles"), fmt.count(d.n_triangles), "ok"),
+        (tr("Vertices"), fmt.count(d.n_points), "ok"),
         (tr("Closed"), tr("yes") if d.closed else tr("NO"), lvl(not d.closed)),
         (tr("Open edges"), str(d.open_edges), lvl(d.open_edges > 0)),
         (tr("Holes / largest"),

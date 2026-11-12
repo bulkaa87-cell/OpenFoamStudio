@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import fs_panels as panels
+import fs_fmt as fmt
 from fs_i18n import tr
 import fs_i18n
 
@@ -207,7 +208,8 @@ class ProjectMesh:
 
     def label(self) -> str:
         if self.active:
-            return (tr("Mesh from the project: {v:.2f} M cells, locked", v=self.cells / 1e6)).replace(".", ",")
+            return tr("Mesh from the project: {v} M cells, locked",
+                      v=fmt.decimal(self.cells / 1e6, 2))
         if self.released:
             return (tr("Not using the mesh from the project: the mesh "
                     "settings changed, the run will build a new mesh"))

@@ -1,5 +1,5 @@
 {
- "Mesh from the project: {v:.2f} M cells, locked": "Сітка з проєкту: {v:.2f} млн комірок, зафіксована",
+ "Mesh from the project: {v} M cells, locked": "Сітка з проєкту: {v} млн комірок, зафіксована",
  "Not using the mesh from the project: the mesh settings changed, the run will build a new mesh": "Сітку з проєкту не використовую: налаштування сітки змінено, прогін збудує нову",
  "🔒 Changes the mesh from the project — a click asks whether to rebuild it.{v}": "🔒 Змінює сітку з проєкту — клік спитає, чи перебудувати її.{v}"
 }

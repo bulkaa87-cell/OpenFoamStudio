@@ -61,7 +61,6 @@
  "{n} iterations take about {t} (processes: {p}).": "{n} ітерацій займуть близько {t} (процесів: {p}).",
  "{n} time steps": "кроків за часом: {n}",
  "{p:.0f}% of the planned layer cells": "{p:.0f}% запланованих комірок шарів",
- "{s:.2g} s": "{s:.2g} с",
  "{v} per iteration": "{v} на ітерацію",
  "{v} per step": "{v} на крок",
  "{w} warm start iterations, then {n} time steps": "{w} ітерацій теплого старту, потім {n} кроків за часом",

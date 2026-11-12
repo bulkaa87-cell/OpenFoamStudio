@@ -15,14 +15,21 @@ had its own parser).
   time wins, and the steady warm start of a transient run is dropped
   (`warm_start_files`).
 * `read_series(case_dir, name)` — `merge(read_segments(...))[0]`.
+* `summarise(series, steady)` — THE averaging rule of the program (T51,
+  K2b): steady — the last STEADY_N iterations; transient — the last
+  TRANSIENT_FRAC of the computed time, weighted by the time step. The
+  Library, the «Results» tab, the run record and the polars use it.
 """
 
 from __future__ import annotations
 
+import math
 import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import numpy as np
 
 # Coefficients that are read (the names of the OpenFOAM columns).
 COEFFS = ("Cl", "Cd", "CmPitch", "Cs")
@@ -188,3 +195,105 @@ def read_series(case_dir, name: str = "forceCoeffs"
                 ) -> dict[str, list[tuple[float, float]]]:
     """{coefficient: [(time, value), …]} of the function `name`."""
     return merge(read_segments(case_dir, name))[0]
+
+
+# ==========================================================================
+# The averaging window (one rule for the Library, «Results» and the polars)
+# ==========================================================================
+
+STEADY_N = 50              # steady: the last N iterations
+TRANSIENT_FRAC = 0.25      # transient: the last quarter of the computed time
+
+
+def is_steady(series: dict) -> bool:
+    """True when each time is a whole number (iterations, not seconds)."""
+    for pts in series.values():
+        if pts:
+            return all(float(t).is_integer() for t, _ in pts)
+    return True
+
+
+def window(times, steady: bool, *, steady_n: int = STEADY_N,
+           frac: float = TRANSIENT_FRAC,
+           t_from: float | None = None) -> tuple[float, int]:
+    """(first time in the window, records in the window) of a run.
+
+    Steady: the last `steady_n` records. Transient: the times from
+    `t_from` (when given), else the last `frac` of the computed time.
+    """
+    t = np.asarray(times, dtype=float)
+    if t.size == 0:
+        return 0.0, 0
+    if steady:
+        n = max(1, min(int(steady_n), t.size))
+        return float(t[-n]), n
+    t0, t1 = float(t[0]), float(t[-1])
+    if t_from is not None and t_from > 0:
+        start = min(max(float(t_from), t0), t1)
+    else:
+        f = min(max(float(frac), 0.01), 1.0)
+        start = t1 - f * (t1 - t0)
+    return start, int(np.count_nonzero(t >= start - 1e-15))
+
+
+def window_values(pts, steady: bool, start: float, count: int
+                  ) -> tuple[np.ndarray, np.ndarray]:
+    """(times, values) of `pts` in the window of `window()`."""
+    arr = np.array(pts, dtype=float).reshape(-1, 2)
+    if steady:
+        arr = arr[-count:] if count else arr[:0]
+    else:
+        arr = arr[arr[:, 0] >= start - 1e-15]
+    return arr[:, 0], arr[:, 1]
+
+
+def weights(t: np.ndarray) -> np.ndarray:
+    """Time weights of samples with a variable time step (trapezoid)."""
+    if t.size < 2:
+        return np.ones_like(t)
+    d = np.diff(t)
+    w = np.zeros_like(t)
+    w[:-1] += 0.5 * d
+    w[1:] += 0.5 * d
+    if not np.any(w > 0):
+        return np.ones_like(t)
+    return w
+
+
+def mean_std(t: np.ndarray, v: np.ndarray, timed: bool) -> tuple[float, float]:
+    """Mean and standard deviation; `timed`: weighted by the time step."""
+    if v.size == 0:
+        return float("nan"), float("nan")
+    w = weights(t) if timed else np.ones_like(v)
+    mean = float(np.average(v, weights=w))
+    std = float(math.sqrt(max(np.average((v - mean) ** 2, weights=w), 0.0)))
+    return mean, std
+
+
+def summarise(series: dict, steady: bool | None = None, *,
+              steady_n: int = STEADY_N, frac: float = TRANSIENT_FRAC
+              ) -> dict[str, tuple[float, float]]:
+    """{coefficient: (mean, spread)} over the averaging window.
+
+    The mean is the mean of the polars (weighted by the time step in a
+    transient run). The spread is max − min in the same window: the sign
+    that a run did not settle. `steady` None: from the times
+    (`is_steady`).
+    """
+    if steady is None:
+        steady = is_steady(series)
+    pts = series.get("Cd") or next(iter(series.values()), [])
+    if not pts:
+        return {}
+    start, count = window([p[0] for p in pts], steady,
+                          steady_n=steady_n, frac=frac)
+    out = {}
+    for name, pts in series.items():
+        if not pts:
+            continue
+        t, v = window_values(pts, steady, start, count)
+        if v.size == 0:
+            continue
+        out[name] = (mean_std(t, v, not steady)[0],
+                     float(v.max() - v.min()))
+    return out

@@ -1,7 +1,4 @@
 {
- "GB": "ГБ",
- "KB": "КБ",
- "MB": "МБ",
  "a sideslip angle of {aos_deg:g}° is set: the pitch neutral point is found at zero sideslip, and such cases are not used in the calculation. Set sideslip to 0 on the “Flow” tab.": "стоїть кут ковзання {aos_deg:g}°: нейтральна точка по тангажу шукається при нульовому ковзанні, і такі кейси в розрахунок не підуть. Поставте ковзання 0 на вкладці «Потік».",
  "aborted": "обірвано",
  "angle {t}° is outside −90…90°": "кут {t}° поза межами −90…90°",
@@ -31,15 +28,11 @@
  "you need at least two different angles": "потрібно щонайменше два різні кути",
  "{end_time:g} s": "{end_time:g} с",
  "{end_time:g} s in {iterations} steps": "{end_time:g} с за {iterations} кроків",
- "{n} B": "{n} Б",
  "{n} run|{n} runs": [
   "{n} прогін",
   "{n} прогони",
   "{n} прогонів"
  ],
- "{s:.0f} s": "{s:.0f} с",
- "{v:.1f} h": "{v:.1f} год",
- "{v:.1f} min": "{v:.1f} хв",
  "“{name}” has a different Lref, Aref or moment center than “{name2}”: the coefficients are normalized differently, you cannot compare them": "у «{name}» інші Lref, Aref чи центр моментів, ніж у «{name2}»: коефіцієнти нормовані по-різному, порівнювати їх не можна",
  "“{name}”: no coefficients — case skipped": "«{name}»: коефіцієнтів немає — кейс пропущено",
  "“{name}”: no manifest, settings unknown — case skipped": "«{name}»: маніфесту немає, налаштування невідомі — кейс пропущено",

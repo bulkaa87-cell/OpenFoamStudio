@@ -2,7 +2,7 @@
 #
 #   powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 `
 #       -Python C:\path\to\venv\Scripts\python.exe -Out X:\some\build `
-#       [-Version 0.2.0] [-Iscc C:\path\to\ISCC.exe] [-CargoTarget X:\some\target] `
+#       [-Version 0.2.1] [-Iscc C:\path\to\ISCC.exe] [-CargoTarget X:\some\target] `
 #       [-SkipRust] [-SkipInstaller]
 #
 # Steps:
@@ -22,7 +22,7 @@
 param(
     [string]$Python = "",
     [string]$Out = "",
-    [string]$Version = "0.2.0",
+    [string]$Version = "0.2.1",
     [string]$Iscc = "",
     [string]$CargoTarget = "",
     [switch]$SkipRust,

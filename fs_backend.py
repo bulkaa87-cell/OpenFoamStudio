@@ -2628,7 +2628,6 @@ def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
     вікна означало б, що відʼєднаний прогін спокійно рахує добу на сітці,
     яку відʼєднаним його ж і не пустили б.
     """
-    s = f'"{remote_dir}/{STUDIO}"'
     lines = [
         "#!/bin/bash",
         "# Складено OpenFOAM Studio. Правити не треба: його перезаписує",

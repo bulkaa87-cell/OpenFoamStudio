@@ -29,6 +29,7 @@ from pathlib import Path
 
 import fs_backend as be
 import fs_caseguard as guard
+import fs_fmt as fmt
 from fs_i18n import tr
 
 RUNNER_LOCAL = Path(__file__).resolve().with_name("fs_queue_runner.py")
@@ -450,9 +451,8 @@ def _job_text(job: dict, now: "float | None" = None) -> str:
 
 
 def fmt_time(t: float) -> str:
-    if not t:
-        return ""
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(t)))
+    """Date and time of a job; "" when there is none (fs_fmt.stamp)."""
+    return fmt.stamp(t, empty="")
 
 
 def machine_text(job: dict, queue: str) -> str:

@@ -16,19 +16,14 @@ from PySide6 import QtCore, QtWidgets
 import fs_i18n
 import fs_servertimes as fst
 import fs_timeline as ftl
+import fs_fmt as fmt
 from fs_i18n import tr
 
 fs_i18n.install()
 
 
-def human_bytes(n: float) -> str:
-    """Bytes as text with a unit in the interface language (ГБ, МБ, кБ)."""
-    n = float(n)
-    if n >= 1e9:
-        return tr("{v:.1f} GB", v=n / 1e9)
-    if n >= 1e6:
-        return tr("{v:.0f} MB", v=n / 1e6)
-    return tr("{v:.0f} kB", v=n / 1e3)
+# Bytes as text with a unit in the interface language: fs_fmt (T51).
+human_bytes = fmt.bytes_text
 
 
 class _Job(QtCore.QObject):

@@ -59,6 +59,7 @@ import fs_i18n
 import fs_icons
 import fs_meshfix
 import fs_repair
+import fs_fmt as fmt
 from fs_i18n import tr
 
 APP_NAME = "MeshFix Studio"
@@ -79,9 +80,8 @@ _NOT_HERE = ("domain", "box", "point", "flow")
 
 
 def _num(n) -> str:
-    """A whole number with groups of three digits."""
-    text = f"{int(n):,}"
-    return text.replace(",", " ") if fs_i18n.language() == "uk" else text
+    """A whole number with groups of three digits (fs_fmt.count)."""
+    return fmt.count(n)
 
 
 def _real(x: float) -> str:
@@ -92,8 +92,7 @@ def _real(x: float) -> str:
     if not 1e-3 <= a < 1e12:
         return f"{x:.4g}"
     digits = max(0, 3 - math.floor(math.log10(a)))
-    text = f"{x:,.{digits}f}"
-    return text.replace(",", " ") if fs_i18n.language() == "uk" else text
+    return fmt.decimal(x, digits)
 
 
 def _seconds(sec: float) -> str:

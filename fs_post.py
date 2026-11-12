@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pyvista as pv
 
+import fs_coeffs
 import fs_rsmesh
 import fs_timeline as ftl
 from fs_i18n import tr
@@ -543,21 +544,20 @@ def net_force_line(cfg, cd: float | None, engines: dict,
 
 
 def summarise_coeffs(series: dict[str, list[tuple[float, float]]],
-                     window: int = 50) -> dict[str, tuple[float, float]]:
-    """Середнє й розкид коефіцієнтів на останніх `window` ітераціях.
+                     window: int = fs_coeffs.STEADY_N,
+                     steady: bool | None = None
+                     ) -> dict[str, tuple[float, float]]:
+    """Середнє й розкид коефіцієнтів у вікні усереднення.
 
     Розкид — це головний індикатор: якщо Cd гуляє на відсотки, розрахунок
     ще не зійшовся, і одне «останнє значення» нічого не варте.
+
+    T51 (K2b): одне правило з полярами, `fs_coeffs.summarise`. Стаціонар —
+    останні `window` ітерацій (як і було); нестаціонар — остання чверть
+    порахованого часу, середнє з вагою кроку часу (раніше — останні 50
+    записів, тобто лише кінчик прогону). `steady` None — за часами.
     """
-    out = {}
-    for name, pts in series.items():
-        if not pts:
-            continue
-        vals = np.array([v for _, v in pts[-window:]])
-        if vals.size == 0:
-            continue
-        out[name] = (float(vals.mean()), float(vals.max() - vals.min()))
-    return out
+    return fs_coeffs.summarise(series, steady, steady_n=window)
 
 
 # Пороги зняті з ПОМІРЯНИХ прогонів, а не вигадані. Той самий літак, дві
@@ -603,9 +603,9 @@ def coeff_verdict(pts: list[tuple[float, float]],
     if len(pts) < 20:
         return "few", tr("too few records to judge convergence")
     arr = np.array(pts, dtype=float)
-    it, vals = arr[:, 0], arr[:, 1]
+    vals = arr[:, 1]
     cut = max(len(vals) - max(50, len(vals) // 4), 0)
-    tail, t_it = vals[cut:], it[cut:]
+    tail = vals[cut:]
     mean = float(tail.mean())
     scale = abs(mean) if abs(mean) > 1e-12 else 1.0
     # `floor` (fs_polars): a coefficient near zero (Cl at 0°, Cm near trim)

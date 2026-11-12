@@ -50,6 +50,7 @@ import fs_backend as be
 import fs_case as fc
 import fs_yplus as fy
 import fs_i18n
+import fs_fmt as fmt
 from fs_i18n import tr
 
 # Length of the pre-run.
@@ -58,6 +59,7 @@ MIN_ITERS = 60          # steady: not shorter (the trend needs points)
 PRE_STEPS = 40          # transient: time steps. Measured crashes of the
                         # user cases came at steps 11, 13 and 23.
 PRE_WARM = 100          # warm start: steady iterations before the transient
+GUARD_EXTRA = 5         # the step limit script acts this many steps later
 
 # The file that limits a transient pre-run to PRE_STEPS time steps. It is
 # in system/, so each backend copies it with the case.
@@ -379,7 +381,10 @@ def prerun_steps(steps: list, cfg: fc.CaseCfg, n: int = PRE_STEPS) -> list:
            if s.solver and not s.name.endswith(be.WARM_SUFFIX)]
     if idx:
         i = idx[-1]
-        out[i] = replace(out[i], command=limit_command(out[i].command, n))
+        # The dictionaries stop the run at step n (prepare_case). The
+        # script is the second guard, a few steps later.
+        out[i] = replace(out[i], command=limit_command(out[i].command,
+                                                         n + GUARD_EXTRA))
     return out
 
 
@@ -403,6 +408,65 @@ def write_limit_file(case_dir) -> None:
     from pathlib import Path
     p = Path(case_dir) / LIMIT_FILE
     p.write_text(LIMIT_SCRIPT, encoding="utf-8", newline="\n")
+
+
+# Top-level entries of a controlDict (column 0). The function objects have
+# their own indented writeControl / writeInterval: they stay as they are.
+_TOP = {
+    "stopAt": re.compile(r"^stopAt[ \t]+[A-Za-z]+;", re.M),
+    "writeControl": re.compile(r"^writeControl[ \t]+[A-Za-z]+;", re.M),
+    "writeInterval": re.compile(r"^writeInterval[ \t]+[^;\n]+;", re.M),
+}
+_TRANSIENT = re.compile(r"^adjustTimeStep[ \t]+", re.M)
+
+
+def limit_control_dict(text: str, n: int = PRE_STEPS) -> str:
+    """A transient controlDict that stops by itself after `n` time steps.
+
+    `stopAt nextWrite` with a write each `n` time steps: the solver ends at
+    step `n` (or at endTime, if that comes first). This is in the file
+    BEFORE the start, so it does not depend on how fast OpenFOAM reads a
+    changed controlDict during the run. Measured 2026-11-12: with 2.5 ms per
+    step (cavity 20x20) the change of the step limit script came too late,
+    and the run went to its endTime. The script stays as a second guard.
+    """
+    want = {"stopAt": "stopAt          nextWrite;",
+            "writeControl": "writeControl    timeStep;",
+            "writeInterval": f"writeInterval   {int(n)};"}
+    for key, rx in _TOP.items():
+        text, count = rx.subn(want[key], text)
+        if count != 1:
+            raise ValueError(f"controlDict: {count} top-level {key} entries")
+    return text
+
+
+def prepare_case(case_dir, cfg: fc.CaseCfg, n: int = PRE_STEPS) -> list:
+    """Make the written case a pre-run case. Returns the changed files.
+
+    Transient: each transient controlDict (system/controlDict, or
+    system/controlDict.stage2 of a warm start) stops after `n` time
+    steps, and the step limit script is written as a second guard.
+    Steady: nothing to do, the pre-run copy already has endTime = its
+    iteration count (prerun_cfg).
+    """
+    from pathlib import Path
+    root = Path(case_dir)
+    if cfg.solver.steady:
+        remove_limit_file(root)
+        return []
+    changed = []
+    for rel in ("system/controlDict", "system/controlDict.stage2"):
+        f = root / rel
+        if not f.is_file():
+            continue
+        text = f.read_text(encoding="utf-8")
+        if not _TRANSIENT.search(text):
+            continue                    # the steady warm-start stage
+        f.write_text(limit_control_dict(text, n), encoding="utf-8",
+                     newline="\n")
+        changed.append(rel)
+    write_limit_file(root)
+    return changed
 
 
 def remove_limit_file(case_dir) -> None:
@@ -480,15 +544,8 @@ class RunFacts:
     mesh_cache: bool = True     # the backend keeps meshes
 
 
-def fmt_seconds(s: float) -> str:
-    # The same keys as fs_library.fmt_seconds (no import of that module).
-    if s < 10:
-        return tr("{s:.2g} s", s=s)
-    if s < 90:
-        return tr("{s:.0f} s", s=s)
-    if s < 3600:
-        return tr("{v:.1f} min", v=s / 60)
-    return tr("{v:.1f} h", v=s / 3600)
+# One format of a time span for the program (fs_fmt, T51).
+fmt_seconds = fmt.duration
 
 
 def _nice(v: float, step: float) -> float:

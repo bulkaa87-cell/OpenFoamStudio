@@ -11,9 +11,9 @@ matplotlib>=3.8
 # збірка: python tools/build_wheels.py <ця тека>/wheels у клоні MeshFix
 # Studio) і серед файлів випуску на GitHub.
 --find-links wheels
---find-links https://github.com/bulkaa87-cell/MeshFixStudio/releases/expanded_assets/v0.3.0
-meshfix-core==0.3.0
-foamview==0.3.0
+--find-links https://github.com/bulkaa87-cell/MeshFixStudio/releases/expanded_assets/v0.3.1
+meshfix-core==0.3.1
+foamview==0.3.1
 
 # Ремонт службою Windows — кнопка «Полагодити як слайсер» (fs_winfix.py).
 # Необовʼязкове: без цих пакунків кнопка просто неактивна, решта працює.

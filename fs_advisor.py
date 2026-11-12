@@ -23,6 +23,7 @@ import fs_case as fc
 import fs_memfit as memfit
 import fs_physics as phys
 import fs_yplus as fy
+import fs_fmt as fmt
 from fs_i18n import tr
 import fs_i18n
 
@@ -128,7 +129,6 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
 
     L = cfg.body_length
     span = cfg.body_span
-    height = cfg.body_height
 
     # ---------------------------------------------------------------- домен
     # Для тіла з великим подовженням слід довший: вихор із законцівки треба
@@ -250,9 +250,6 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
             cfg.flow.turbulence, fy.cfg_treatment(cfg), cfg.flow.u_inf,
             cfg.flow.l_ref or L,
             cfg.flow.nu)
-    n_layers = phys.layers_for_target_yplus(
-        target_yplus, cfg.flow.u_inf, cfg.flow.l_ref or L, cfg.flow.nu,
-        new.surface_cell, new.mesh.expansion, new.mesh.final_layer_rel)
 
     if diag is not None and not diag.closed and diag.largest_hole > new.surface_cell:
         # Нема сенсу нарощувати шари на поверхні, крізь яку тече.
@@ -357,7 +354,7 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
     usable = cores - 2 if cores > 4 else cores
     n_procs = max(1, min(usable, max(1, est.total // 40_000)))
     _add(tips, "Solver", tr("Processes", ctx="count"), cfg.solver.n_procs, n_procs,
-         tr("{replace} cells per process; of {cores} cores, two are left to the system", replace=f"~{est.total // max(n_procs, 1):,}".replace(",", " "), cores=cores))
+         tr("{replace} cells per process; of {cores} cores, two are left to the system", replace="~" + fmt.count(est.total // max(n_procs, 1)), cores=cores))
     new.solver.n_procs = n_procs
 
     iters = 1000 if est.total < 1_000_000 else 2000
