@@ -1,0 +1,12 @@
+{
+ "Net forward force: thrust {thrust:.2f} N − airframe drag {drag:.2f} N = {net:+.2f} N ({how}).": "Чиста сила вперед: тяга {thrust:.2f} Н − опір планера {drag:.2f} Н = {net:+.2f} Н ({how}).",
+ "accelerates": "розганяється",
+ "decelerates": "гальмує",
+ "settled (spread {v:.1f}% of the value)": "усталилося (розмах {v:.1f}% від значення)",
+ "spread {v:.0f}% of the value — the steady solver has reached its limit: there is no solution point here, you need a transient one": "розмах {v:.0f}% від значення — стаціонарний розвʼязувач дійшов до своєї межі: точки розвʼязку тут уже немає, потрібен нестаціонарний",
+ "spread {v:.0f}% — this is the oscillation of the flow itself; average over whole periods": "розмах {v:.0f}% — це коливання самої течії; усереднюйте по цілих періодах",
+ "the mean drifts one way ({v:.1f}% over the tail, {v2:.0f}% of steps in the same direction)": "середнє повзе в один бік ({v:.1f}% за хвіст, {v2:.0f}% кроків туди само)",
+ "too few records to judge convergence": "записів замало, щоб судити про збіжність",
+ "{moving} — the run did not finish, give it more iterations": "{moving} — прогін не добіг, дайте більше ітерацій",
+ "{moving} — the start-up transient has not died out yet, too early to average": "{moving} — пусковий перехідний процес ще не згас, усереднювати рано"
+}

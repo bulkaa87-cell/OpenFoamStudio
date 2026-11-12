@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from fs_i18n import tr
+import fs_paths
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
@@ -101,6 +102,78 @@ SSH_OPTS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
 
 def ssh_argv(host: str, command: str) -> list[str]:
     return ["ssh", *SSH_OPTS, host, command]
+
+
+# --------------------------------------------------------------------------
+# OpenFOAM in a container on a server (docker or podman)
+# --------------------------------------------------------------------------
+#
+# The same way as the distributed run (rust/foamdist, Engine::run): each
+# OpenFOAM command runs in `<engine> run --rm` of the image, with the
+# OpenFOAM bashrc of the image. Differences from foamdist:
+# - The folder $HOME/openfoam-studio is mounted at the SAME path, and the
+#   container starts in the current folder. Thus the paths in the commands
+#   (the case, the mesh store) are the same inside and outside, and
+#   `signal_script` finds the processes by their working folder (the
+#   container processes are processes of this user on the server).
+# - HOME stays the home folder of the user (foamdist uses /tmp).
+
+CONTAINER_ENGINES = ("docker", "podman")
+CONTAINER_ROOT = "$HOME/openfoam-studio"
+CONTAINER_BASHRC = "/usr/lib/openfoam/openfoam*/etc/bashrc"
+CONTAINER_LABEL = "openfoam-studio=1"
+# hwloc in the image looks for GPUs through X and hangs without a display
+# (the foamdist trap, rust/foamdist/src/main.rs HWLOC).
+CONTAINER_HWLOC = "HWLOC_COMPONENTS=-gl,-opencl,-cuda,-nvml,-rsmi,-levelzero"
+
+
+def _shq(text: str) -> str:
+    """Single quotes for bash."""
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def container_run(engine: str, image: str, script: str) -> str:
+    """bash: run `script` (bash text) in `image`, in the current folder.
+
+    The bashrc of the image comes first. The current folder must be inside
+    CONTAINER_ROOT (the cases of the program are there).
+    """
+    if engine not in CONTAINER_ENGINES:
+        raise ValueError(engine)
+    if engine == "podman":
+        user = "--userns=keep-id"
+    else:
+        # docker: the files stay the files of the user; ssh and MPI need a
+        # passwd entry for the uid (podman keep-id adds one, docker not).
+        user = ('--user "$(id -u):$(id -g)" -v /etc/passwd:/etc/passwd:ro '
+                '-v /etc/group:/etc/group:ro')
+    inner = f"source {CONTAINER_BASHRC} >/dev/null 2>&1; {script}"
+    return (f'{engine} run --rm --network=host --ipc=host '
+            f'--label {CONTAINER_LABEL} {user} -e HOME="$HOME" '
+            f'-e {CONTAINER_HWLOC} '
+            f'-v "{CONTAINER_ROOT}:{CONTAINER_ROOT}:z" -w "$PWD" '
+            f'--entrypoint bash {_shq(image)} -c {_shq(inner)}')
+
+
+def parse_container(text: str) -> tuple[str, str]:
+    """"docker|image" -> ("docker", "image"). ("", "") if not valid."""
+    engine, _, image = (text or "").partition("|")
+    engine, image = engine.strip(), image.strip()
+    if engine in CONTAINER_ENGINES and re.match(r"^[\w./:@-]+$", image):
+        return engine, image
+    return "", ""
+
+
+def containers_setting(text: str) -> dict:
+    """{host: "engine|image"} from the setting «ssh_containers» (JSON)."""
+    try:
+        data = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()
+            if parse_container(str(v))[0]}
 
 
 def container_name(case_dir: str) -> str:
@@ -234,10 +307,11 @@ def soft_check_command() -> str:
         '[ "$n" = 0 ] && continue; '
         'if [ -z "$t" ] || awk -v a="$n" -v b="$t" "BEGIN{exit !(a+0>b+0)}"; '
         'then t=$n; fi; done; '
-        '[ -n "$t" ] || { echo "зрізу в корені кейсу немає"; exit 1; }; '
+        f'[ -n "$t" ] || {{ echo "{MARK} snap=none"; exit 1; }}; '
         '{ [ -s "$t/U" ] || [ -s "$t/U.gz" ]; } || '
-        '{ echo "у зрізі $t немає поля U"; exit 1; }; '
-        'echo "зріз $t: $(ls "$t" | wc -l) полів, $(du -sh "$t" | cut -f1)"'
+        f'{{ echo "{MARK} snap=noU time=$t"; exit 1; }}; '
+        f'echo "{MARK} snap=ok time=$t fields=$(ls "$t" | wc -l) '
+        'size=$(du -sh "$t" | cut -f1)"'
     )
 
 
@@ -275,12 +349,12 @@ def soft_check_local(case_dir: str) -> tuple[bool, str]:
         except ValueError:
             pass
     if not times:
-        return (False, "зрізу в корені кейсу немає")
+        return (False, tr("no time directory in the case root"))
     t, d = max(times)
     if not any((d / f).is_file() and (d / f).stat().st_size
                for f in ("U", "U.gz")):
-        return (False, tr("у зрізі {name} немає поля U", name=d.name))
-    return (True, tr("зріз {name}: {n_list} полів", name=d.name, n_list=len(list(d.iterdir()))))
+        return (False, tr("time directory {name} has no U field", name=d.name))
+    return (True, tr("time directory {name}: {n_list} fields", name=d.name, n_list=len(list(d.iterdir()))))
 
 
 def soft_restore_file(case_dir: str) -> None:
@@ -306,8 +380,28 @@ class Backend:
     setvars: str = ""
     image: str = ""
     host: str = ""            # для ssh: імʼя з ~/.ssh/config або user@host
+    # ssh only: OpenFOAM in a container on the server ("" = native install).
+    engine: str = ""          # docker | podman
     ready: bool = True
     detail: str = ""
+
+    @property
+    def id(self) -> str:
+        """Stable name of this backend that does not depend on the language.
+
+        The session and the settings keep this, not `label`: the label is
+        for the person and changes with the interface language (and with
+        the OpenFOAM version on a server).
+        """
+        if self.kind == "wsl":
+            return f"wsl:{self.distro}"
+        if self.kind == "ssh":
+            return f"ssh:{self.host}"
+        if self.kind == "docker":
+            return f"docker:{self.image}"
+        if self.kind == "bluecfd":
+            return f"bluecfd:{self.version}"
+        return self.kind
 
     # --- побудова команди ------------------------------------------------
 
@@ -323,7 +417,11 @@ class Backend:
             # тут не зручність, а обовʼязок; запасний варіант потрібен лише
             # щоб розпізнавання й перевірки могли скласти команду без кейсу.
             wd = native_dir or f"$HOME/openfoam-studio/{Path(case_dir).name}"
-            inner = f'source "{self.bashrc}" && cd "{wd}" && {command}'
+            if self.engine:
+                inner = (f'cd "{wd}" && '
+                         + container_run(self.engine, self.image, command))
+            else:
+                inner = f'source "{self.bashrc}" && cd "{wd}" && {command}'
             return ssh_argv(self.host, inner)
 
         if self.kind == "bluecfd":
@@ -427,7 +525,7 @@ def detect_wsl() -> list[Backend]:
         if not paths:
             found.append(Backend(kind="wsl", label=f"WSL / {d}", distro=d,
                                  ready=False,
-                                 detail="дистрибутив є, OpenFOAM не знайдено"))
+                                 detail="distribution found, OpenFOAM not found"))
             continue
         bashrc = sorted(paths)[-1]
         rc, ver = _run(
@@ -467,40 +565,105 @@ def detect_docker() -> list[Backend]:
     cands = [ln.strip() for ln in imgs.splitlines()
              if "openfoam" in ln.lower() or "foam" in ln.lower()]
     if not cands:
-        return [Backend(kind="docker", label="Docker (без образу OpenFOAM)",
+        return [Backend(kind="docker", label="Docker (no OpenFOAM image)",
                         ready=False, detail=out.strip().splitlines()[0]
-                        if out.strip() else "docker є")]
+                        if out.strip() else "docker found")]
     return [Backend(kind="docker", label=f"Docker / {c}", image=c, detail=c)
             for c in cands]
 
 
-def detect_ssh(hosts: "list[str] | tuple[str, ...]" = ()) -> list[Backend]:
+# Server side: the OpenFOAM images of docker and podman, "engine|image".
+_IMAGES_PROBE = (
+    "for e in podman docker; do command -v $e >/dev/null 2>&1 || continue; "
+    "timeout 20 $e images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null "
+    "| grep -i openfoam | sed \"s/^/$e|/\"; done")
+
+
+def pick_container(lines: "list[str]") -> str:
+    """The best "engine|image" of a list: the run image first (smaller,
+    the one foamdist uses), then default, then dev. "" if none."""
+    cands = [ln.strip() for ln in lines if parse_container(ln.strip())[0]]
+
+    def rank(c: str) -> tuple:
+        img = c.split("|", 1)[1]
+        kind = (0 if "openfoam-run" in img else 1 if "openfoam-default" in img
+                else 2 if "openfoam-dev" in img else 3)
+        return (kind, c.split("|", 1)[0] != "podman", img)
+    return sorted(cands, key=rank)[0] if cands else ""
+
+
+def image_version(image: str) -> str:
+    """"opencfd/openfoam-run:2512" -> "v2512" (the tag), else the tag."""
+    tag = image.rsplit(":", 1)[-1] if ":" in image.rsplit("/", 1)[-1] else ""
+    return ("v" + tag) if re.match(r"^\d{4}$", tag) else (tag or "?")
+
+
+def _container_backend(host: str, container: str) -> Backend:
+    """A server with OpenFOAM in a container: the image must be there."""
+    engine, image = parse_container(container)
+    check = (f"if {engine} image inspect {_shq(image)} >/dev/null 2>&1; "
+             "then echo IMG=yes; else echo IMG=no; fi; nproc")
+    rc, text = _run(ssh_argv(host, check), timeout=25)
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if rc != 0 or "IMG=yes" not in lines:
+        why = ("no connection" if rc != 0 and "IMG=no" not in lines
+               else tr("the image {image} is not on the server", image=image))
+        return Backend(kind="ssh", label=tr("Server {host}", host=host),
+                       host=host, engine=engine, image=image, ready=False,
+                       detail=(lines[-1][:120] if rc != 0 and lines else why))
+    version = image_version(image)
+    cores = lines[-1] if lines[-1].isdigit() else "?"
+    return Backend(
+        kind="ssh", host=host, engine=engine, image=image, version=version,
+        bashrc=CONTAINER_BASHRC,
+        label=tr("Server {host} / {version} ({engine})", host=host,
+                 version=version, engine=engine),
+        detail=tr("{engine} image {image}, cores {cores}", engine=engine,
+                  image=image, cores=cores))
+
+
+def detect_ssh(hosts: "list[str] | tuple[str, ...]" = (),
+               containers: "dict | None" = None) -> list[Backend]:
     """Сервери зі списку, на яких знайшовся OpenFOAM.
 
     Недоступний сервер повертається теж, але з ready=False і поясненням:
     мовчки зникнути зі списку — найгірше, що може зробити налаштований
     користувачем пункт, бо шукати причину тоді ніде.
+
+    `containers` ({host: "engine|image"}, the setting «ssh_containers» that
+    the server wizard writes): that server runs OpenFOAM in that image. A
+    server without such an entry and without a native OpenFOAM: the program
+    takes an OpenFOAM image of docker or podman, if the server has one.
     """
+    containers = containers or {}
     out: list[Backend] = []
     for host in hosts:
         host = (host or "").strip()
         if not host:
+            continue
+        if host in containers:
+            out.append(_container_backend(host, containers[host]))
             continue
         probe = ("for g in " + " ".join(FOAM_BASHRC_GLOBS) + "; do "
                  '[ -f "$g" ] && echo "$g" && break; done')
         rc, text = _run(ssh_argv(host, f"shopt -s nullglob; {probe}"),
                         timeout=25)
         if rc != 0:
-            out.append(Backend(kind="ssh", label=tr("Сервер {host}", host=host), host=host,
+            out.append(Backend(kind="ssh", label=tr("Server {host}", host=host), host=host,
                                ready=False,
                                detail=(text.strip().splitlines() or
-                                       ["немає звʼязку"])[-1][:120]))
+                                       ["no connection"])[-1][:120]))
             continue
         bashrc = (text.strip().splitlines() or [""])[-1].strip()
         if not bashrc:
-            out.append(Backend(kind="ssh", label=tr("Сервер {host}", host=host), host=host,
+            rc, imgs = _run(ssh_argv(host, _IMAGES_PROBE), timeout=45)
+            best = pick_container(imgs.splitlines()) if rc == 0 else ""
+            if best:
+                out.append(_container_backend(host, best))
+                continue
+            out.append(Backend(kind="ssh", label=tr("Server {host}", host=host), host=host,
                                ready=False,
-                               detail="звʼязок є, але OpenFOAM не знайдено"))
+                               detail="connection OK, but OpenFOAM not found"))
             continue
         rc, ver = _run(ssh_argv(
             host, f'source "{bashrc}" >/dev/null 2>&1; '
@@ -508,14 +671,14 @@ def detect_ssh(hosts: "list[str] | tuple[str, ...]" = ()) -> list[Backend]:
         lines = [l.strip() for l in ver.strip().splitlines() if l.strip()]
         version = lines[0] if lines else ""
         cores = lines[1] if len(lines) > 1 else "?"
-        out.append(Backend(kind="ssh", label=tr("Сервер {host} / {version}", host=host, version=version),
+        out.append(Backend(kind="ssh", label=tr("Server {host} / {version}", host=host, version=version),
                            host=host, bashrc=bashrc, version=version,
-                           detail=tr("{bashrc}, ядер {cores}", bashrc=bashrc, cores=cores)))
+                           detail=tr("{bashrc}, cores {cores}", bashrc=bashrc, cores=cores)))
     return out
 
 
 def detect_all(ssh_hosts: "list[str] | tuple[str, ...]" = (),
-               progress=None) -> list[Backend]:
+               progress=None, containers: "dict | None" = None) -> list[Backend]:
     """Усі бекенди: WSL, blueCFD, Docker і сервери зі списку.
 
     `progress(name, i, n)` (за бажання) кличеться ПЕРЕД кожною перевіркою:
@@ -525,7 +688,7 @@ def detect_all(ssh_hosts: "list[str] | tuple[str, ...]" = (),
     hosts = [h.strip() for h in ssh_hosts if (h or "").strip()]
     steps = [("WSL", detect_wsl), ("blueCFD", detect_bluecfd),
              ("Docker", detect_docker)]
-    steps += [(h, lambda h=h: detect_ssh([h])) for h in hosts]
+    steps += [(h, lambda h=h: detect_ssh([h], containers)) for h in hosts]
     found: list[Backend] = []
     for i, (name, check) in enumerate(steps, 1):
         if progress is not None:
@@ -533,6 +696,51 @@ def detect_all(ssh_hosts: "list[str] | tuple[str, ...]" = (),
         found += check()
     found.sort(key=lambda b: (not b.ready, b.kind != "wsl"))
     return found
+
+
+BACKEND_KINDS = ("wsl", "ssh", "docker", "bluecfd", "native")
+# Server labels of older versions, in each interface language
+# ("Сервер {host}", "Server {host}"). The host is the first word after it.
+_LEGACY_SERVER = re.compile(r"^(?:Сервер|Server)\s+(\S+)")
+
+
+def is_backend_id(text: str) -> bool:
+    kind = (text or "").split(":", 1)[0]
+    return kind in BACKEND_KINDS and (":" in text or kind == "native")
+
+
+def backend_id_from_label(label: str) -> str:
+    """The `Backend.id` for a label that an older version stored.
+
+    Older versions kept the label (for a server: "Сервер myserver / v2512"
+    or, in English, "Server myserver / v2512"). The id comes from the part of
+    the label that does not change with the language. "" if unknown.
+    """
+    t = (label or "").strip()
+    for mark in _LEGACY_NOT_READY:
+        if t.endswith(mark):
+            t = t[:-len(mark)].strip()
+    if is_backend_id(t):
+        return t
+    if t.startswith("WSL / "):
+        return "wsl:" + t[len("WSL / "):].strip()
+    if t.startswith("Docker / "):
+        return "docker:" + t[len("Docker / "):].strip()
+    if t.startswith("Docker ("):
+        return "docker:"
+    if t.startswith("blueCFD-Core (") and t.endswith(")"):
+        return "bluecfd:" + t[len("blueCFD-Core ("):-1]
+    m = _LEGACY_SERVER.match(t)
+    if m:
+        return "ssh:" + m.group(1)
+    return ""
+
+
+def backend_matches(backend: "Backend | None", want: str) -> bool:
+    """True if `want` (an id, or a label of an older version) names `backend`."""
+    if backend is None or not want:
+        return False
+    return backend.id == backend_id_from_label(want)
 
 
 # Версію не зашиваємо: репозиторій ESI поповнюється двічі на рік. Але просто
@@ -591,6 +799,223 @@ class Step:
 
 
 MESH_HIT_FLAG = "mesh_hit"
+
+
+# --------------------------------------------------------------------------
+# Step names and log markers that do not depend on the interface language
+# --------------------------------------------------------------------------
+#
+# The program reads back what the run script and the step commands write
+# (run.log, studio/status, studio/step). Thus these texts are a PROTOCOL, not
+# texts for the person: they are ASCII and they never change with the
+# interface language. The person sees `step_title()` and `render_line()`,
+# which translate them with fs_i18n.tr().
+#
+# A step name is an id: an OpenFOAM tool name ("snappyHexMesh"), one of
+# STEP_TITLES, or "<solver>-warm" / "<solver>-stable". The log file of a
+# step is logs/<id>.log.
+#
+# A marker is one line "@@FS key=value key=value ..." (values without
+# spaces):
+#     @@FS step=<id>                         a step starts (header)
+#     @@FS done                              the script is at its end
+#     @@FS optional step=<id> rc=<n>         an optional step failed
+#     @@FS mesh=skip|miss key=<k>            stored mesh: not used / none
+#     @@FS mesh=hit key=<k> cells=<n> date=<YYYY-MM-DDTHH:MM>
+#     @@FS mesh=stored key=<k> size=<du -sh>
+#     @@FS snap=none | snap=noU time=<t> | snap=ok time=<t> fields=<n> size=<s>
+#     @@FS fail=rc rc=<n> | fail=negvol | fail=skew value=<v>
+#          | fail=nonortho value=<v>       (reason in studio/status)
+#
+# Versions before 2026-11-11 wrote Ukrainian texts here («===== очищення
+# =====», «є збережена сітка …»). A run that such a version started on a
+# server can still be attached: `step_heads` reads both header forms and
+# `step_id` maps the old Ukrainian step names to the ids.
+
+MARK = "@@FS"
+STEP_DONE = "done"
+STEP_CLEAN = "clean"
+STEP_MESH_CHECK = "meshCacheCheck"
+STEP_MESH_LOAD = "meshCacheLoad"
+STEP_MESH_STORE = "meshCacheStore"
+STEP_PROMOTE = "promoteToZero"
+STEP_SOFT_CHECK = "softCheck"
+WARM_SUFFIX = "-warm"
+STABLE_SUFFIX = "-stable"
+
+# id -> the title that the person sees (step_title translates it).
+STEP_TITLES = {
+    STEP_CLEAN: "cleanup",
+    STEP_MESH_CHECK: "saved mesh?",
+    STEP_MESH_LOAD: "mesh from saved",
+    STEP_MESH_STORE: "save mesh",
+    STEP_PROMOTE: "field → time 0",
+    STEP_SOFT_CHECK: "time step check",
+    STEP_DONE: "done",
+}
+# Old Ukrainian step names (in logs, studio/step and studio/status of runs
+# that an older version started) -> id. They are data of older versions, not
+# texts of this one: they stay Ukrainian (a _LEGACY name: the i18n tools
+# leave them as they are).
+_LEGACY_STEPS = {
+    "очищення": STEP_CLEAN,
+    "збережена сітка?": STEP_MESH_CHECK,
+    "сітка зі збереженої": STEP_MESH_LOAD,
+    "зберегти сітку": STEP_MESH_STORE,
+    "поле → момент 0": STEP_PROMOTE,
+    "перевірка зрізу": STEP_SOFT_CHECK,
+    "готово": STEP_DONE,
+}
+_LEGACY_SOFT = "зупинено зі зрізом"     # the status text of older versions
+_LEGACY_NOT_READY = ("  (не готовий)", "  (not ready)")
+_LEGACY_RC = re.compile(r"^код (\d+)$")
+_LEGACY_WARM = "-теплий старт"
+_LEGACY_STABLE = "-стійкий"
+
+
+def step_id(name: str) -> str:
+    """The id of a step name; an old Ukrainian name gives its id."""
+    name = (name or "").strip()
+    if name in _LEGACY_STEPS:
+        return _LEGACY_STEPS[name]
+    if name.endswith(_LEGACY_WARM):
+        return name[:-len(_LEGACY_WARM)] + WARM_SUFFIX
+    if name.endswith(_LEGACY_STABLE):
+        return name[:-len(_LEGACY_STABLE)] + STABLE_SUFFIX
+    return name
+
+
+def step_title(name: str) -> str:
+    """What the person sees for a step (id or old name), translated."""
+    sid = step_id(name)
+    if sid in STEP_TITLES:
+        return tr(STEP_TITLES[sid])
+    if sid.endswith(WARM_SUFFIX):
+        return tr("{solver}-warm start", solver=sid[:-len(WARM_SUFFIX)])
+    if sid.endswith(STABLE_SUFFIX):
+        return tr("{solver}-stable", solver=sid[:-len(STABLE_SUFFIX)])
+    return sid
+
+
+def step_banner(name: str) -> str:
+    """The header line of a step in the log on the screen."""
+    return f"===== {step_title(name)} ====="
+
+
+def parse_marker(line: str) -> "dict[str, str] | None":
+    """{key: value} of a marker line, or None if `line` is not a marker."""
+    if not line.startswith(MARK):
+        return None
+    rest = line[len(MARK):]
+    if rest and not rest[0].isspace():
+        return None
+    out: dict[str, str] = {}
+    for tok in rest.split():
+        k, _, v = tok.partition("=")
+        out[k] = v
+    return out
+
+
+def _snap_text(m: dict) -> str:
+    snap = m.get("snap", "")
+    if snap == "none":
+        return tr("no time directory in the case root")
+    if snap == "noU":
+        return tr("time directory {name} has no U field", name=m.get("time", "?"))
+    return tr("time directory {name}: {n_list} fields, {size}", name=m.get("time", "?"),
+              n_list=m.get("fields", "?"), size=m.get("size", "?"))
+
+
+def _fail_text(m: dict) -> str:
+    why = m.get("fail", "")
+    if why == "rc":
+        return tr("code {rc}", rc=m.get("rc", "?"))
+    if why == "negvol":
+        return tr("the mesh has cells with zero or negative volume")
+    if why == "skew":
+        return tr("skewness {v}: the solver will almost certainly fail "
+                  "on this mesh", v=m.get("value", "?"))
+    if why == "nonortho":
+        return tr("non-orthogonality {v}", v=m.get("value", "?"))
+    return why
+
+
+def render_marker(m: dict, raw: str = "") -> str:
+    """The text for the person of a parsed marker (translated)."""
+    if "step" in m and len(m) == 1:
+        return step_banner(m["step"])
+    if STEP_DONE in m:
+        return step_banner(STEP_DONE)
+    if "optional" in m:
+        return tr("[{name}] optional step, continuing (code {rc})",
+                  name=step_title(m.get("step", "")), rc=m.get("rc", "?"))
+    mesh = m.get("mesh")
+    if mesh == "skip":
+        return tr("the saved mesh is not used: a new mesh was requested")
+    if mesh == "miss":
+        return tr("no saved mesh {key}: building the mesh", key=m.get("key", ""))
+    if mesh == "hit":
+        return tr("saved mesh {key}: {cells} cells, from {date}; no need "
+                  "to build", key=m.get("key", ""),
+                  cells=m.get("cells", "?"),
+                  date=m.get("date", "?").replace("T", " "))
+    if mesh == "stored":
+        return tr("mesh saved: {key}, {size}", key=m.get("key", ""),
+                  size=m.get("size", "?"))
+    if "snap" in m:
+        return _snap_text(m)
+    if "fail" in m:
+        return _fail_text(m)
+    return raw
+
+
+def render_line(line: str) -> str:
+    """`line` for the screen: a marker becomes a translated text."""
+    if not line.startswith(MARK):
+        return line
+    m = parse_marker(line)
+    return line if m is None else render_marker(m, line)
+
+
+def render_text(text: str) -> str:
+    """`render_line` for each line of `text` (lines joined with "\\n")."""
+    if MARK not in text:
+        return text
+    return "\n".join(render_line(ln) for ln in text.split("\n"))
+
+
+def reason_text(step: str, why: str) -> str:
+    """The reason of a failed run (studio/status) for the person.
+
+    New scripts write a marker (`fail=…`, or the `snap=…` line of the slice
+    check); older scripts wrote a Ukrainian text, which `tr` looks up.
+    """
+    why = (why or "").strip()
+    m = parse_marker(why)
+    if m is None:
+        old = _LEGACY_RC.match(why)          # «код 137» of an older script
+        return tr("code {rc}", rc=old.group(1)) if old else tr(why)
+    text = render_marker(m, why)
+    if step_id(step) == STEP_SOFT_CHECK and "snap" in m:
+        return tr("soft stop: the time step was not written ({v})", v=text)
+    return text
+
+
+def soft_slice_text(detail: str) -> str:
+    """The slice of a soft stop for the person, from the last line of the
+    slice check (a marker), or from the status text of an older version
+    («зупинено зі зрізом — зріз 0.01: 7 полів, 12M»)."""
+    detail = (detail or "").strip()
+    if detail.startswith(MARK):
+        return render_line(detail)
+    if detail.startswith(_LEGACY_SOFT) and "—" in detail:
+        return detail.split("—", 1)[1].strip()
+    return tr(detail)
+
+
+def soft_done_text(slice_text: str) -> str:
+    """The final message of a soft stop that wrote a slice."""
+    return tr("stopped with time step written — {last}", last=slice_text)
 
 
 def cond_test(cond: str) -> str:
@@ -664,9 +1089,9 @@ def _use_stage(backend: Backend, tag: str) -> str:
     return " && ".join(f'cp "{d}.{tag}" "{d}"' for _, d in STAGE_FILES)
 
 
-# Рядок журналу, з якого прогін на сервері вже живе без ноута. Вікно ловить
-# саме його, щоб показати «ноут можна вимикати» на видному місці.
-DETACHED_MARK = "Сесія на сервері:"
+# The window knows that a run on the server lives without the laptop from
+# Runner.on_event("detached", …), not from a log line (that text is
+# translated). See Runner.on_event.
 
 
 def promote_latest_command(backend: Backend, parallel: bool) -> str:
@@ -801,18 +1226,18 @@ def check_machines(ms: "list[DistMachine]") -> "tuple[list[DistMachine], str]":
     seen = set()
     for m in on:
         if not m.addr or not _ADDR_RE.fullmatch(m.addr):
-            return on, tr("«{v}»: адреса «{addr}» — не адреса", v=m.label() or '?', addr=m.addr)
+            return on, tr("“{v}”: address “{addr}” is not an address", v=m.label() or '?', addr=m.addr)
         if m.addr in seen:
-            return on, tr("адреса {addr} двічі", addr=m.addr)
+            return on, tr("address {addr} twice", addr=m.addr)
         seen.add(m.addr)
         if m.procs < 1:
-            return on, tr("«{label}»: нуль процесів", label=m.label())
+            return on, tr("“{label}”: zero processes", label=m.label())
         if m.user and not re.fullmatch(r"[\w.\-]+", m.user):
-            return on, tr("«{label}»: користувач «{user}»", label=m.label(), user=m.user)
+            return on, tr("“{label}”: user “{user}”", label=m.label(), user=m.user)
         if any(c in m.key for c in " ,='\"$`"):
             return on, f"«{m.label()}»: у шляху ключа не можна пробілів і ,='\"$`"
     if len(on) < 2:
-        return on, "потрібно хоча б дві увімкнені машини — інакше це звичайний прогін"
+        return on, tr("at least two enabled machines are necessary — otherwise this is a normal run")
     return on, ""
 
 
@@ -828,7 +1253,7 @@ def _dist_args(hosts, key: str, user: str, net: str = "") -> str:
     spec = ",".join(f"{m.user + '@' if m.user else ''}{m.addr}:{m.procs}"
                     for m in ms)
     own = ",".join(f"{m.addr}={m.key}" for m in ms if m.key and m.key != key)
-    return (f"--hosts {spec} --key {key} --user {user}"
+    return (f"--hosts {spec} --key {key}" + (f" --user {user}" if user else "")
             + (f" --keys {own}" if own else "")
             + (f" --net {net}" if net else ""))
 
@@ -842,14 +1267,14 @@ def parse_dist_hosts(text: str) -> tuple[list[tuple[str, int]], str]:
             continue
         m = re.fullmatch(r"([\w.\-]+):(\d+)", part)
         if not m:
-            return [], (tr("«{part}»: треба адреса:процеси, наприклад "
-                        "10.0.0.21:4", part=part))
+            return [], (tr("“{part}”: address:processes is necessary, "
+                           "for example 10.0.0.21:4", part=part))
         n = int(m.group(2))
         if n < 1:
-            return [], tr("«{part}»: нуль процесів", part=part)
+            return [], tr("“{part}”: zero processes", part=part)
         out.append((m.group(1), n))
     if len(out) < 2:
-        return out, "потрібно хоча б дві машини — інакше це звичайний прогін"
+        return out, tr("at least two machines are necessary — otherwise this is a normal run")
     return out, ""
 
 
@@ -867,10 +1292,10 @@ def ensure_foamdist(backend: Backend, local: Path = FOAMDIST_LOCAL) -> str:
     Повертає порожній рядок або пояснення, чому не вийшло.
     """
     if backend.kind != "ssh":
-        return "розподіл між машинами — лише для прогону на сервері"
+        return tr("distribution across machines — only for a run on a server")
     if not Path(local).is_file():
-        return (tr("немає {local} — зберіть: tools\\build_rust.ps1 "
-                "(збирає й foamdist під Linux)", local=local))
+        return (tr("{local} is missing — build it: tools\\build_rust.ps1 "
+                   "(it also builds foamdist for Linux)", local=local))
     data = Path(local).read_bytes()
     want = hashlib.sha256(data).hexdigest()
     rc, out = _run(ssh_argv(backend.host,
@@ -885,9 +1310,9 @@ def ensure_foamdist(backend: Backend, local: Path = FOAMDIST_LOCAL) -> str:
                            capture_output=True, timeout=300,
                            creationflags=CREATE_NO_WINDOW)
     except (OSError, subprocess.SubprocessError) as exc:
-        return tr("не вдалося покласти foamdist на сервер: {exc}", exc=exc)
+        return tr("cannot put foamdist on the server: {exc}", exc=exc)
     if p.returncode != 0:
-        return (tr("не вдалося покласти foamdist на сервер: {decode}", decode=p.stderr.decode("utf-8", "replace")[-300:]))
+        return (tr("cannot put foamdist on the server: {decode}", decode=p.stderr.decode("utf-8", "replace")[-300:]))
     return ""
 
 
@@ -903,7 +1328,8 @@ def probe_dist(backend: Backend, hosts, key: str, user: str) -> list[dict]:
     own = ",".join(f"{m.addr}={m.key}" for m in ms if m.key and m.key != key)
     rc, out = _run(ssh_argv(backend.host,
                             f'"{FOAMDIST_REMOTE}" probe {addrs} --key {key} '
-                            f"--user {user}" + (f" --keys {own}" if own else "")),
+                            + (f"--user {user}" if user else "")
+                            + (f" --keys {own}" if own else "")),
                    120)
     got = []
     for line in out.splitlines():
@@ -974,7 +1400,7 @@ def scan_dist(backend: Backend, key: str, user: str) -> list[dict]:
     addr, name, user (з config), self (це сам сервер), і поля probe."""
     rc, out = _run(ssh_argv(backend.host, _SCAN_SCRIPT), 90)
     if rc != 0 and "OPEN" not in out:
-        raise RuntimeError(out.strip()[-300:] or "сервер не відповів")
+        raise RuntimeError(out.strip()[-300:] or tr("the server did not reply"))
     sc = parse_scan(out)
     ms = []
     for addr in sc["open"]:
@@ -984,7 +1410,7 @@ def scan_dist(backend: Backend, key: str, user: str) -> list[dict]:
     got = {g.get("host"): g for g in probe_dist(backend, ms, key, user)} if ms else {}
     found = []
     for m in ms:
-        g = dict(got.get(m.addr) or {"ok": False, "error": "не відповіла"})
+        g = dict(got.get(m.addr) or {"ok": False, "error": "did not answer"})
         g.update(addr=m.addr, name=m.name or str(g.get("hostname") or ""),
                  user=m.user, self=m.addr in sc["self"] or g.get("head") == "yes")
         found.append(g)
@@ -1011,22 +1437,22 @@ def scan_to_machines(found: list[dict], existing: "list[DistMachine]") -> list:
         if not g.get("ok"):
             err = " ".join(str(g.get("error", "")).split())
             if "Permission denied" in err:
-                why = "ssh не пускає з ключем сервера (інший користувач чи ключ)"
+                why = tr("ssh does not accept the server key (different user or key)")
             elif "Connection refused" in err or "timed out" in err:
-                why = "ssh не відповідає"
+                why = tr("ssh does not reply")
             else:
-                why = tr("не вдалося: {err}", err=err[:120])
+                why = tr("failed: {err}", err=err[:120])
             ready = False
         elif cores <= 0:
-            why, ready = "ssh пускає, але це не схоже на Linux-машину", False
+            why, ready = "ssh accepts, but this does not look like a Linux machine", False
         elif g.get("image") != "yes":
-            why = (tr("{cores} ядер, але немає образу OpenFOAM "
-                   "(podman pull docker.io/opencfd/openfoam-run:2512)", cores=cores))
+            why = (tr("{cores} cores, but no OpenFOAM image (podman pull "
+                      "docker.io/opencfd/openfoam-run:2512)", cores=cores))
             ready = False
         else:
-            busy = tr(", навантаження {get}", get=g.get('load')) if g.get("load") is not None else ""
-            why = (tr("{v}{cores} ядер / "
-                   "{threads} потоків, {get} ГБ вільно{busy}", v='сервер, ' if g.get('self') else '', cores=cores, threads=threads, get=g.get('mem_gb', '?'), busy=busy))
+            busy = tr(", load {get}", get=g.get('load')) if g.get("load") is not None else ""
+            why = (tr("{v}{cores} cores / {threads} threads, {get} GB "
+                      "free{busy}", v='server, ' if g.get('self') else '', cores=cores, threads=threads, get=g.get('mem_gb', '?'), busy=busy))
             ready = True
         rows.append((m, why, ready, m.addr in have))
     return rows
@@ -1052,7 +1478,7 @@ def dist_weights(backend: Backend, hosts, key: str,
                 return json.loads(line)
             except ValueError:
                 break
-    return {"error": out.strip()[-400:] or tr("foamdist weights: код {rc}", rc=rc)}
+    return {"error": out.strip()[-400:] or tr("foamdist weights: code {rc}", rc=rc)}
 
 
 # --------------------------------------------------------------------------
@@ -1116,15 +1542,15 @@ def _mesh_check_command(key: str, remesh: bool) -> str:
     flag = f'"{STUDIO}/{MESH_HIT_FLAG}"'
     if remesh:
         return (f'mkdir -p "{STUDIO}"; rm -f {flag}; '
-                'echo "збережену сітку не беру: просили перебудувати"')
+                f'echo "{MARK} mesh=skip key={key}"')
     return (
         f'mkdir -p "{STUDIO}"; rm -f {flag}; '
         f'if [ -s {c}/polyMesh/faces ] && [ -s {c}/polyMesh/owner ]; then '
         f'touch {flag} {c}; '
-        f'echo "є збережена сітка {key}: $(grep -ao "nCells:[0-9]*" '
-        f'{c}/polyMesh/owner | head -1 | cut -d: -f2) комірок, від '
-        f'$(date -r {c}/polyMesh/faces "+%Y-%m-%d %H:%M") — будувати не треба"; '
-        f'else echo "збереженої сітки {key} немає — будую"; fi'
+        f'echo "{MARK} mesh=hit key={key} cells=$(grep -ao "nCells:[0-9]*" '
+        f'{c}/polyMesh/owner | head -1 | cut -d: -f2) '
+        f'date=$(date -r {c}/polyMesh/faces "+%Y-%m-%dT%H:%M")"; '
+        f'else echo "{MARK} mesh=miss key={key}"; fi'
     )
 
 
@@ -1149,7 +1575,7 @@ def _mesh_store_command(key: str, par: bool) -> str:
         f'mkdir -p "{MESH_STORE}" && rm -rf {c}.part && mkdir -p {c}.part && '
         f'cp -r constant/polyMesh {c}.part/ && rm -rf {c}.part/polyMesh/sets && '
         f'rm -rf {c} && mv {c}.part {c} && '
-        f'echo "сітку збережено: {key}, $(du -sh {c} | cut -f1)"; '
+        f'echo "{MARK} mesh=stored key={key} size=$(du -sh {c} | cut -f1)"; '
         f'cd "{MESH_STORE}" && ls -1dt */ 2>/dev/null | tail -n +{MESH_KEEP + 1} '
         '| while read -r d; do rm -rf "$d"; done; true'
     )
@@ -1160,7 +1586,8 @@ def _mesh_store_command(key: str, par: bool) -> str:
 # проєкту — назад на сервер. Сервер не вічний (теку кейсу перезаписує кожен
 # прогін, сховище тримає лише MESH_KEEP останніх), а проєкт людина носить із
 # собою.
-LOCAL_MESH_STORE = Path(__file__).resolve().parent / "meshes"
+# Next to the program in a source copy, in Documents in an installed one.
+LOCAL_MESH_STORE = fs_paths.data_dir() / "meshes"
 
 
 def _mesh_complete(d: Path) -> bool:
@@ -1202,14 +1629,14 @@ def fetch_mesh(backend: Backend, key: str) -> str:
     argv = _store_argv(backend, f'cd "{MESH_STORE}" && test -s "{key}/polyMesh/faces" '
                                 f'&& tar czf - "{key}"')
     if argv is None:
-        return "цей бекенд не має сховища сіток"
+        return tr("this backend has no mesh store")
     LOCAL_MESH_STORE.mkdir(parents=True, exist_ok=True)
     tmp = LOCAL_MESH_STORE / f".in-{key}.tgz"
     part = LOCAL_MESH_STORE / f".in-{key}"
     rc, err = _pipe(argv, stdout_path=tmp, timeout=3600)
     try:
         if rc != 0:
-            return tr("сітку не забрано: {v}", v=err.strip()[-200:] or tr("код {rc}", rc=rc))
+            return tr("mesh not downloaded: {v}", v=err.strip()[-200:] or tr("code {rc}", rc=rc))
         shutil.rmtree(part, ignore_errors=True)
         part.mkdir()
         with tarfile.open(tmp, "r:gz") as tar:
@@ -1219,10 +1646,10 @@ def fetch_mesh(backend: Backend, key: str) -> str:
                 if (not (m.isfile() or m.isdir()) or m.name.startswith("/")
                         or ".." in Path(m.name).parts
                         or Path(m.name).parts[0] != key):
-                    return tr("дивний запис в архіві сітки: {name}", name=m.name)
+                    return tr("strange entry in the mesh archive: {name}", name=m.name)
             tar.extractall(part)
         if not _mesh_complete(part / key):
-            return "в архіві сітки чогось бракує"
+            return tr("something is missing in the mesh archive")
         dst = LOCAL_MESH_STORE / key
         shutil.rmtree(dst, ignore_errors=True)
         os.replace(part / key, dst)
@@ -1236,21 +1663,21 @@ def push_mesh(backend: Backend, key: str) -> str:
     """LOCAL_MESH_STORE/key → сховище бекенда. "" — вийшло."""
     src = local_mesh_dir(key)
     if src is None:
-        return "на цьому компʼютері такої сітки немає"
+        return tr("this computer does not have this mesh")
     argv = _store_argv(backend, (
         f'S="{MESH_STORE}"; mkdir -p "$S" && d="$S/.in-$$" && mkdir -p "$d" && '
         f'tar xzf - -C "$d" && test -s "$d/{key}/polyMesh/faces" && '
         f'rm -rf "$S/{key}" && mv "$d/{key}" "$S/{key}"; rc=$?; rm -rf "$d"; '
         'exit $rc'))
     if argv is None:
-        return "цей бекенд не має сховища сіток"
+        return tr("this backend has no mesh store")
     tmp = LOCAL_MESH_STORE / f".out-{key}.tgz"
     try:
         with tarfile.open(tmp, "w:gz", compresslevel=6) as tar:
             tar.add(src, arcname=key)
         rc, err = _pipe(argv, stdin_path=tmp, timeout=3600)
         if rc != 0:
-            return tr("сітку не вивантажено: {v}", v=err.strip()[-200:] or tr("код {rc}", rc=rc))
+            return tr("mesh not uploaded: {v}", v=err.strip()[-200:] or tr("code {rc}", rc=rc))
         return ""
     finally:
         tmp.unlink(missing_ok=True)
@@ -1275,15 +1702,15 @@ def build_steps(n_procs: int, backend: Backend, potential_init: bool,
     def solve(app: str) -> str:
         return f"{dist} {app}" if dist else backend.mpi(n_procs, app)
     steps = [
-        Step("очищення", _clean_command(backend), 0.01),
+        Step(STEP_CLEAN, _clean_command(backend), 0.01),
         # 0/ розкладається з еталона ще до decomposePar: -copyZero копіює саме
         # каталог 0/, а після попереднього прогону там може лишитися сміття.
         Step("restore0", _restore_command(backend, False), 0.01),
     ]
     if cache:
-        steps.append(Step("збережена сітка?",
+        steps.append(Step(STEP_MESH_CHECK,
                           _mesh_check_command(mesh_key, remesh), 0.005))
-        steps.append(Step("сітка зі збереженої",
+        steps.append(Step(STEP_MESH_LOAD,
                           _mesh_load_command(mesh_key, par), 0.03, cond="hit"))
     steps.append(Step("surfaceFeatureExtract", "surfaceFeatureExtract", 0.02,
                       cond=build))
@@ -1307,7 +1734,7 @@ def build_steps(n_procs: int, backend: Backend, potential_init: bool,
     if cache:
         # Необовʼязковий: не вдалося зберегти — рахуємо далі, просто
         # наступного разу сітку збудує знову.
-        steps.append(Step("зберегти сітку", _mesh_store_command(mesh_key, par),
+        steps.append(Step(STEP_MESH_STORE, _mesh_store_command(mesh_key, par),
                           0.03, optional=True, cond="miss"))
 
     # snappyHexMesh -overwrite лишає поля 0/ прив'язаними до старої сітки,
@@ -1330,11 +1757,11 @@ def build_steps(n_procs: int, backend: Backend, potential_init: bool,
         # Теплий старт: стаціонарний етап, його поле — у момент 0, далі
         # нестаціонар зі своїми словниками. 0.orig між ними НЕ відновлюємо.
         steps.append(Step(
-            f"{warm}-теплий старт",
+            warm + WARM_SUFFIX,
             _use_stage(backend, "stage1") + " && "
             + solve(warm), 0.15,
             solver=True, first_stage=True))
-        steps.append(Step("поле → момент 0",
+        steps.append(Step(STEP_PROMOTE,
                           promote_latest_command(backend, par), 0.01))
         steps.append(Step(
             solver,
@@ -1345,7 +1772,7 @@ def build_steps(n_procs: int, backend: Backend, potential_init: bool,
         # Між етапами 0.orig НЕ відновлюємо: другий етап має продовжити з поля,
         # яке дав перший (у controlDict стоїть startFrom latestTime).
         steps.append(Step(
-            f"{solver}-стійкий",
+            solver + STABLE_SUFFIX,
             _use_stage(backend, "stage1") + " && "
             + solve(solver), 0.25,
             solver=True, first_stage=True))
@@ -1471,21 +1898,21 @@ class RunState:
         розвʼязувач на 39-й ітерації. Тому дивимося на величини.
         """
         if self.negative_volumes:
-            return ("fatal", "у сітці є комірки нульового чи відʼємного обʼєму")
+            return ("fatal", tr("the mesh has cells with zero or negative volume"))
         if self.max_skewness >= SKEW_FATAL:
             return ("fatal", (
-                tr("перекіс {max_skewness:.2f} на {n_skew_faces} гранях "
-                "(поріг небезпеки {SKEW_FATAL:.0f})", max_skewness=self.max_skewness, n_skew_faces=self.n_skew_faces, SKEW_FATAL=SKEW_FATAL)))
+                tr("skewness {max_skewness:.2f} on {n_skew_faces} faces "
+                   "(danger threshold {SKEW_FATAL:.0f})", max_skewness=self.max_skewness, n_skew_faces=self.n_skew_faces, SKEW_FATAL=SKEW_FATAL)))
         if self.max_nonortho >= NONORTHO_FATAL:
-            return ("fatal", tr("неортогональність {max_nonortho:.1f}", max_nonortho=self.max_nonortho))
+            return ("fatal", tr("non-orthogonality {max_nonortho:.1f}", max_nonortho=self.max_nonortho))
         if self.mesh_ok is False:
             parts = []
             if self.max_skewness:
-                parts.append(tr("перекіс {max_skewness:.2f} "
-                             "на {n_skew_faces} гранях", max_skewness=self.max_skewness, n_skew_faces=self.n_skew_faces))
+                parts.append(tr("skewness {max_skewness:.2f} on "
+                                "{n_skew_faces} faces", max_skewness=self.max_skewness, n_skew_faces=self.n_skew_faces))
             if self.max_nonortho:
-                parts.append(tr("неортогональність {max_nonortho:.1f}", max_nonortho=self.max_nonortho))
-            return ("warn", ", ".join(parts) or "є зауваження")
+                parts.append(tr("non-orthogonality {max_nonortho:.1f}", max_nonortho=self.max_nonortho))
+            return ("warn", ", ".join(parts) or tr("has remarks"))
         return ("ok", "")
 
     @property
@@ -1970,30 +2397,57 @@ def neutral_point(points: list[tuple[float, float, float, float]],
 _STEP_LINE = re.compile(r"^=====\s+(.+?)\s+=====$")
 
 
-def step_heads(block: str) -> list:
-    """Заголовки кроків у блоці рядків: [(початок, кінець, рядок, збіг)].
+_HEAD_STEP = f"{MARK} step="
+_HEAD_DONE = f"{MARK} {STEP_DONE}"
 
-    Кандидатів шукає str.find (рядок, що починається з «=====»): регулярний
-    вираз з re.M на 40 МБ журналу йде майже секунду. Вирішує _STEP_LINE.
-    """
-    heads = []
-    if block.startswith("====="):
+
+def _head_title(line: str) -> "str | None":
+    """The step id of a header line, or None. Both forms: the marker
+    "@@FS step=<id>" / "@@FS done", and the older «===== <name> =====»."""
+    if line.startswith(MARK):
+        if line.startswith(_HEAD_STEP):
+            name = line[len(_HEAD_STEP):].strip()
+            return name or None
+        if line.rstrip() == _HEAD_DONE:
+            return STEP_DONE
+        return None
+    head = _STEP_LINE.match(line)
+    return step_id(head.group(1)) if head else None
+
+
+def _heads_of(block: str, lead: str, heads: list) -> None:
+    if block.startswith(lead):
         at = 0
     else:
-        at = block.find("\n=====") + 1          # 0: не знайдено
+        at = block.find("\n" + lead) + 1          # 0: не знайдено
         if at == 0:
-            return heads
+            return
     while True:
         end = block.find("\n", at)
         if end < 0:
             end = len(block)
         line = block[at:end]
-        head = _STEP_LINE.match(line)
-        if head:
-            heads.append((at, end, line, head))
-        at = block.find("\n=====", end) + 1
+        title = _head_title(line)
+        if title is not None:
+            heads.append((at, end, line, title))
+        at = block.find("\n" + lead, end) + 1
         if at == 0:
-            return heads
+            return
+
+
+def step_heads(block: str) -> list:
+    """Заголовки кроків у блоці рядків: [(початок, кінець, рядок, id)].
+
+    `id` — step_id (для старого журналу — уже переведений зі старої
+    української назви). Кандидатів шукає str.find (рядок, що починається з
+    «@@FS» або «=====»): регулярний вираз з re.M на 40 МБ журналу йде майже
+    секунду.
+    """
+    heads: list = []
+    _heads_of(block, MARK, heads)
+    _heads_of(block, "=====", heads)
+    heads.sort(key=lambda h: h[0])
+    return heads
 
 
 def read_blocks(stream, chunk: int = 1 << 20):
@@ -2078,6 +2532,14 @@ class RemoteSession:
     # Скільки секунд минуло, відколи стан востаннє змінювався. Для того,
     # що скінчилося, це і є «як давно». -1 — невідомо.
     age: int = -1
+    # "ok" after a soft stop: the slice that was written, for the person.
+    # "" for any other end.
+    soft: str = ""
+
+    @property
+    def step_text(self) -> str:
+        """The current step for the person (translated)."""
+        return step_title(self.step) if self.step else ""
 
     @property
     def running(self) -> bool:
@@ -2116,9 +2578,9 @@ class RemoteSession:
 
     def human(self) -> str:
         if self.stale:
-            return "обірвано"
-        return {"running": "іде", "ok": "готово", "fail": "впав",
-                "stop": "зупинено"}.get(self.status, "невідомо")
+            return tr("aborted")
+        return tr({"running": "running", "ok": "done", "fail": "failed",
+                   "stop": "stopped"}.get(self.status, "unknown"))
 
 
 def _sh_name(name: str) -> str:
@@ -2127,7 +2589,8 @@ def _sh_name(name: str) -> str:
 
 
 def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
-                    meta: dict, stop_on_bad_mesh: bool = True) -> str:
+                    meta: dict, stop_on_bad_mesh: bool = True,
+                    engine: str = "", image: str = "") -> str:
     """bash, який проганяє всі кроки САМ, без жодного звʼязку з вікном.
 
     Журнал пишеться рівно тим самим візерунком, що й локальний виконавець
@@ -2145,7 +2608,12 @@ def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
         "#!/bin/bash",
         "# Складено OpenFOAM Studio. Правити не треба: його перезаписує",
         "# кожен новий запуск цього кейсу.",
-        f'source "{bashrc}"',
+        *([f'source "{bashrc}"'] if not engine else [
+            # OpenFOAM in a container (container_run): each step command
+            # runs in the image; the tests and the log stay on the server.
+            "ofs_in() { " + container_run(engine, image, 'eval "$OFS_CMD"')
+            .replace('-e HOME="$HOME"', '-e HOME="$HOME" -e OFS_CMD')
+            + "; }"]),
         f'D="{remote_dir}"',
         f'S="$D/{STUDIO}"',
         'mkdir -p "$S" "$D/logs"',
@@ -2163,16 +2631,19 @@ def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
         'die() { printf "fail\\t%s\\t%s\\n" "$1" "$2" > "$S/status"; exit 1; }',
         "",
         "run_step() {",
-        '  local title="$1" file="$2" cmd="$3"',
+        '  local title="$1" file="$2" cmd="$3" how="${4:-eval}"',
         '  printf "%s\\n" "$title" > "$S/step"',
         '  say ""',
-        '  say "===== $title ====="',
+        f'  say "{MARK} step=$title"',
         # tee: той самий текст іде і в спільний журнал, і в окремий файл
         # кроку — саме його показує вікно в повідомленні «дивіться
         # logs/checkMesh.log». PIPESTATUS, бо код повернення потрібен від
         # команди, а не від tee.
-        '  ( cd "$D" && eval "$cmd" ) 2>&1 | tee -a "$S/run.log" '
-        '> "$D/logs/$file.log"',
+        # how=in: the command runs in the container (ofs_in reads OFS_CMD).
+        '  if [ "$how" = in ]; then ( cd "$D" && OFS_CMD="$cmd" ofs_in ) '
+        '2>&1 | tee -a "$S/run.log" > "$D/logs/$file.log"',
+        '  else ( cd "$D" && eval "$cmd" ) 2>&1 | tee -a "$S/run.log" '
+        '> "$D/logs/$file.log"; fi',
         '  return ${PIPESTATUS[0]}',
         "}",
         "",
@@ -2180,8 +2651,10 @@ def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
     # Позначка мʼякої зупинки від МИНУЛОГО прогону не має спинити цей.
     lines.append(f'rm -f "$S/{SOFT_FLAG}"; SOFT=""')
     for step in steps:
-        title = step.name.replace('"', "'")
-        file = _sh_name(step.name)
+        # The name is an ASCII id (step_id); the old Ukrainian names are
+        # only read, never written.
+        title = step_id(step.name).replace('"', "'")
+        file = _sh_name(title)
         # Мʼяку зупинку перевіряємо ПЕРЕД кожним кроком, а не лише після
         # розвʼязувача: перший етап міг скінчитися сам саме тоді, коли
         # людина натиснула кнопку, і без цього другий етап узяв би свій
@@ -2198,12 +2671,16 @@ def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
         # на справжніх командах OpenFOAM — тихо не те, бо змінні там є
         # ($FOAM_*, $(nproc)) і потрібні вони саме всередині eval.
         cmd = step.command.replace("'", "'\\''")
-        lines.append(f"run_step \"{title}\" \"{file}\" '{cmd}'")
+        # The distributed run (foamdist) starts its own containers: it
+        # runs on the server, not in the image.
+        how = " in" if engine and FOAMDIST_REMOTE not in step.command else ""
+        lines.append(f"run_step \"{title}\" \"{file}\" '{cmd}'{how}")
         if step.optional:
             lines.append('rc=$?; [ $rc -eq 0 ] || say '
-                         f'"[{title}] крок необовʼязковий, продовжую (код $rc)"')
+                         f'"{MARK} optional step={title} rc=$rc"')
         else:
-            lines.append(f'rc=$?; [ $rc -eq 0 ] || die "{title}" "код $rc"')
+            lines.append(f'rc=$?; [ $rc -eq 0 ] || die "{title}" '
+                         f'"{MARK} fail=rc rc=$rc"')
         if step.name == "checkMesh" and stop_on_bad_mesh:
             lines.extend(_mesh_gate_lines(file))
         if step.cond:
@@ -2219,18 +2696,20 @@ def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
         # лежить у корені, — інакше «готово» було б неправдою.
         'if [ -n "$SOFT" ]; then',
         f"  ( cd \"$D\" && eval '{restore}' )",
-        f"  run_step \"перевірка зрізу\" \"перевірка_зрізу\" '{check}'",
-        '  rc=$?; [ $rc -eq 0 ] || die "перевірка зрізу" '
-        '"мʼяка зупинка: зріз не записався ($(tail -1 "$D/logs/перевірка_зрізу.log"))"',
-        '  M=$(tail -1 "$D/logs/перевірка_зрізу.log")',
+        f"  run_step \"{STEP_SOFT_CHECK}\" \"{STEP_SOFT_CHECK}\" '{check}'",
+        # The last line of the check is a marker "@@FS snap=…": the reason
+        # of "fail" (reason_text) or the slice of "ok" (soft_done_text).
+        '  rc=$?',
+        f'  M=$(tail -1 "$D/logs/{STEP_SOFT_CHECK}.log")',
+        f'  [ $rc -eq 0 ] || die "{STEP_SOFT_CHECK}" "$M"',
         f'  rm -f "$S/{SOFT_FLAG}"',
-        '  printf "ok\\t%s\\n" "зупинено зі зрізом — $M" > "$S/status"',
+        '  printf "ok\\t%s\\n" "$M" > "$S/status"',
         "else",
     ])
     lines.append('echo ok > "$S/status"')
     lines.append("fi")
     lines.append('say ""')
-    lines.append('say "===== готово ====="')
+    lines.append(f'say "{MARK} {STEP_DONE}"')
     return "\n".join(lines) + "\n"
 
 
@@ -2263,12 +2742,11 @@ def _mesh_gate_lines(file: str) -> list[str]:
         f'NEG=$(grep -aciE "negative volume|zero or negative cell volume|'
         f'zero or negative face area" {log} || true)',
         '[ "${NEG:-0}" -gt 0 ] && die "checkMesh" '
-        '"у сітці є комірки нульового чи відʼємного обʼєму"',
+        f'"{MARK} fail=negvol"',
         f"awk -v v=\"${{SKEW:-0}}\" 'BEGIN{{exit !(v+0>={SKEW_FATAL})}}' "
-        '&& die "checkMesh" "перекіс $SKEW, розвʼязувач на такій сітці '
-        'майже напевно зірветься"',
+        f'&& die "checkMesh" "{MARK} fail=skew value=$SKEW"',
         f"awk -v v=\"${{NORT:-0}}\" 'BEGIN{{exit !(v+0>={NONORTHO_FATAL})}}' "
-        '&& die "checkMesh" "неортогональність $NORT"',
+        f'&& die "checkMesh" "{MARK} fail=nonortho value=$NORT"',
     ]
 
 
@@ -2298,14 +2776,14 @@ def launch_detached(backend: Backend, remote_dir: str, script: str) -> int:
         creationflags=CREATE_NO_WINDOW)
     out = up.stdout.decode("utf-8", "replace").strip()
     if up.returncode != 0:
-        raise RuntimeError(tr("не вдалося покласти сценарій: {out}", out=out[:200]))
+        raise RuntimeError(tr("cannot put the script on the server: {out}", out=out[:200]))
     # Звіряємо РОЗМІР, а не код повернення: саме мовчазний нульовий файл і
     # був тією вадою, тож перевіряти тут треба те, що вона ламала.
     got = next((int(t) for t in out.split() if t.isdigit()), 0)
     want = len(script.encode("utf-8"))
     if got != want:
         raise RuntimeError(
-            tr("сценарій дійшов не цілим: {got} байт замість {want}", got=got, want=want))
+            tr("the script arrived incomplete: {got} bytes instead of {want}", got=got, want=want))
 
     rc, out = _run(ssh_argv(backend.host, (
         f'cd "{remote_dir}" && {{ setsid nohup bash '
@@ -2313,7 +2791,7 @@ def launch_detached(backend: Backend, remote_dir: str, script: str) -> int:
         f'> "{remote_dir}/{STUDIO}/boot.log" 2>&1 < /dev/null & echo $!; }}'
     )), timeout=60)
     if rc != 0:
-        raise RuntimeError(tr("не вдалося пустити прогін: {strip}", strip=out.strip()[:200]))
+        raise RuntimeError(tr("cannot start the run: {strip}", strip=out.strip()[:200]))
     for token in reversed(out.split()):
         if token.isdigit():
             return int(token)
@@ -2350,6 +2828,19 @@ def _session_probe(dirs: str) -> str:
         '"$m"; '
         'done'
     )
+
+
+def session_message(status: str, rest: "list[str]") -> str:
+    """The message of studio/status (the fields after the status word) for
+    the person. New scripts write markers, older ones Ukrainian texts."""
+    rest = [r.strip() for r in rest]
+    if status == "fail" and len(rest) >= 2:
+        why = reason_text(rest[0], "\t".join(rest[1:]))
+        return f"{step_title(rest[0])}: {why}" if rest[0] else why
+    text = "\t".join(rest).strip()
+    if status == "ok" and text:
+        return soft_done_text(soft_slice_text(text))
+    return reason_text("", text) if text else ""
 
 
 def _parse_session(line: str, host: str) -> "RemoteSession | None":
@@ -2392,8 +2883,10 @@ def _parse_session(line: str, host: str) -> "RemoteSession | None":
     return RemoteSession(
         name=str(meta.get("name") or Path(path).name),
         remote_dir=path.strip(), status=status,
-        step=step.strip(),
-        message="\t".join(bits[1:]).strip(),
+        step=step_id(step),
+        message=session_message(status, bits[1:]),
+        soft=(soft_slice_text("\t".join(bits[1:]))
+              if status == "ok" and "".join(bits[1:]).strip() else ""),
         started=str(meta.get("started", "")),
         case_dir=str(meta.get("case_dir", "")),
         host=host, pid=pid, alive=alive, log_lines=lines, age=age)
@@ -2410,7 +2903,7 @@ def list_sessions(backend: Backend) -> list[RemoteSession]:
     rc, out = _run(ssh_argv(backend.host,
                             _session_probe(f'"{SESSION_ROOT}"/*')), timeout=45)
     if rc != 0:
-        raise RuntimeError(out.strip()[:300] or "сервер не відповів")
+        raise RuntimeError(out.strip()[:300] or tr("the server did not reply"))
     found = [s for s in (_parse_session(ln, backend.host)
                          for ln in out.splitlines() if _FS in ln) if s]
     found.sort(key=lambda s: (s.started or "", s.name), reverse=True)
@@ -2465,7 +2958,8 @@ class Runner:
     def __init__(self, backend: Backend, case_dir: str,
                  on_line=None, on_step=None, on_done=None,
                  native_dir: str | None = None,
-                 stop_on_bad_mesh: bool = True, on_block=None):
+                 stop_on_bad_mesh: bool = True, on_block=None,
+                 on_event=None):
         self.backend = backend
         self.case_dir = case_dir
         self.native_dir = native_dir
@@ -2475,6 +2969,12 @@ class Runner:
         self.on_block = on_block
         self.on_step = on_step or (lambda name, idx, total: None)
         self.on_done = on_done or (lambda ok, msg: None)
+        # Events for the window, without a text that it must compare:
+        # on_event(name, value). "detached" (value: the folder on the server).
+        self.on_event = on_event or (lambda name, value: None)
+        # After a soft stop with a slice: the slice for the person ("" if the
+        # run did not end so). The window reads this, not the message text.
+        self.soft_result = ""
         self.stop_on_bad_mesh = stop_on_bad_mesh
         self.state = RunState()
         self._proc: subprocess.Popen | None = None
@@ -2486,6 +2986,10 @@ class Runner:
         # Тека сесії на сервері, коли прогін відчеплений. Порожньо
         # означає звичайний прогін, привʼязаний до цього вікна.
         self.remote_dir = ""
+        # True after detach(): the window let the run go (for example at
+        # close). The run continues on the server, so nothing must be
+        # copied back or deleted on this side.
+        self.left = False
         self.log_dir = Path(case_dir) / "logs"
 
     def pause(self, resume: bool = False) -> tuple[bool, str]:
@@ -2493,14 +2997,14 @@ class Runner:
         argv = self.backend.pause_argv(self.case_dir, self.native_dir,
                                        resume=resume)
         if argv is None:
-            return (False, "цей бекенд не вміє ставити прогін на паузу")
+            return (False, tr("this backend cannot pause a run"))
         rc, out = _run(argv, timeout=25)
         if rc != 0:
-            return (False, out.strip()[:200] or "не вдалося")
+            return (False, out.strip()[:200] or tr("failed", ctx="action"))
         self.paused = not resume
         if self.backend.kind == "docker":
-            return (True, "контейнер відживлено" if resume
-                    else "контейнер завмер")
+            return (True, tr("container resumed") if resume
+                    else tr("container paused"))
         # Скрипт друкує, СКІЛЬКИ процесів зачепив. Нуль означає, що рахувати
         # вже нема чого, і мовчазне «готово» тут було б брехнею.
         n = 0
@@ -2510,9 +3014,9 @@ class Runner:
                 break
         if n == 0:
             self.paused = False
-            return (False, "жоден процес цього кейсу не знайдений — "
-                           "можливо, прогін уже скінчився")
-        return (True, tr("{v} процесів: {n}", v='відживлено' if resume else 'завмерло', n=n))
+            return (False, tr("no process of this case found — maybe the "
+                           "run has already ended"))
+        return (True, tr("{v} processes: {n}", v='resumed' if resume else 'paused', n=n))
 
     def detach(self) -> None:
         """Перестати ЧИТАТИ журнал, не чіпаючи самого прогону.
@@ -2526,6 +3030,7 @@ class Runner:
         `stop`, і відчеплений прогін гинув від закритої кришки ноута —
         тобто рівно від того, заради чого його й відчіплювали.
         """
+        self.left = True
         self._stop.set()
         self._kill_local()
 
@@ -2559,20 +3064,21 @@ class Runner:
         else:
             rc, out = _run(argv, timeout=30)
             if rc != 0:
-                return (False, tr("не вдалося дістатися кейсу: {v}", v=out.strip()[:200] or tr("код {rc}", rc=rc)))
+                return (False, tr("cannot reach the case: {v}", v=out.strip()[:200] or tr("code {rc}", rc=rc)))
         word = next((ln.strip() for ln in reversed(out.strip().splitlines())
                      if ln.strip()), "")
         if word == "nosolver":
-            return (False, "розвʼязувач зараз не рахує (іде сітка чи "
-                           "збирання) — зрізу, який варто зберегти, ще "
-                           "немає. Зачекайте або натисніть «Стоп».")
+            return (False, tr("the solver is not computing now (meshing or "
+                           "reconstruction is in progress) — there is no "
+                           "time step worth saving yet. Wait or click "
+                           "“Stop”."))
         if not word.startswith("soft"):
-            return (False, "у system/controlDict немає рядка stopAt — "
-                           "мʼяко зупинити не вийде")
+            return (False, tr("system/controlDict has no stopAt line — a "
+                           "soft stop is not possible"))
         self._soft.set()
-        return (True, "розвʼязувач допише поточний момент і зупиниться "
-                      "(до одного кроку), далі зріз буде зібрано й "
-                      "перевірено")
+        return (True, tr("the solver will finish the current time and stop "
+                      "(up to one step), then the time step will be "
+                      "collected and checked"))
 
     @property
     def soft_stopped(self) -> bool:
@@ -2627,17 +3133,22 @@ class Runner:
             "name": name or Path(self.case_dir).name,
             "case_dir": str(self.case_dir),
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "steps": [s.name for s in steps],
+            "steps": [step_id(s.name) for s in steps],
         }
         script = detached_script(steps, target, self.backend.bashrc, meta,
-                                 stop_on_bad_mesh=self.stop_on_bad_mesh)
-        self.on_line(tr("Пускаю на {host} відчепленим — "
-                     "прогін не залежатиме від цього вікна.", host=self.backend.host))
+                                 stop_on_bad_mesh=self.stop_on_bad_mesh,
+                                 engine=self.backend.engine,
+                                 image=self.backend.image)
+        self.on_line(tr("Starting on {host} detached — the run will not "
+                        "depend on this window.", host=self.backend.host))
         pid = launch_detached(self.backend, target, script)
         self.remote_dir = target
-        self.on_line(f"{DETACHED_MARK} {target} (процес {pid}).")
-        self.on_line("Програму можна закрити: прогін не спиниться, а "
-                     "підключитися до нього можна кнопкою «Підключитися».")
+        self.on_line(tr("Server session: {target} (process {pid}).",
+                        target=target, pid=pid))
+        self.on_event("detached", target)
+        self.on_line(tr("You can close the program: the run will not stop, "
+                     "and you can connect to it again with the “Connect” "
+                     "button."))
         self.attach(target, steps=steps)
 
     def attach(self, remote_dir: str, from_line: int = 1,
@@ -2650,7 +3161,7 @@ class Runner:
         """
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.remote_dir = remote_dir
-        names = [s.name for s in steps] if steps else []
+        names = [step_id(s.name) for s in steps] if steps else []
         total = len(names)
         argv = ssh_argv(self.backend.host,
                         attach_command(remote_dir, from_line))
@@ -2685,38 +3196,38 @@ class Runner:
         self._proc.wait()
 
         if self._stop.is_set():
-            self.on_done(False, "читання журналу спинено")
+            self.on_done(False, tr("log reading stopped"))
             return
         # Вирок беремо з файлу стану, а не з коду виходу ssh: ssh каже лише
         # про звʼязок, а не про те, чим скінчився прогін.
         final = read_session(self.backend, remote_dir)
         if final is None:
-            self.on_done(False, "сервер не сказав, чим усе скінчилося")
+            self.on_done(False, tr("the server did not tell how the run ended"))
         elif final.status == "ok":
-            if final.message:
+            if final.soft:
                 self._soft.set()
-            self.on_done(True, final.message or "готово")
+                self.soft_result = final.soft
+            self.on_done(True, final.message or tr("done"))
         elif final.stale:
             self.on_done(False, (
-                "прогін обірвався: у стані написано «іде», а процесу на "
-                "сервері немає. Так виглядає вбитий перезавантаженням або "
-                "браком памʼяті."))
+                tr("the run broke off: the state says “running”, but there "
+                "is no process on the server. This is how a run killed "
+                "by a reboot or by lack of memory looks.")))
         else:
-            what = final.message or "без пояснення"
-            self.on_done(False, f"{final.step or tr('прогін')}: {what}")
+            what = final.message or tr("no explanation")
+            self.on_done(False, f"{final.step_text or tr('run')}: {what}")
 
     def _attach_block(self, block: str, names: list[str], total: int) -> None:
         """Один блок журналу сесії: рядки кроків — у файли й розбирач,
         заголовки кроків («===== крок =====») — як і раніше, по одному."""
         pos = 0
-        for start, end, line, head in step_heads(block):
+        for start, end, line, title in step_heads(block):
             if start > pos:
                 self._attach_lines(block[pos:start - 1])
-            title = head.group(1).strip()
             if self._attach_fh is not None:
                 self._attach_fh.close()
                 self._attach_fh = None
-            if title != "готово":
+            if title != STEP_DONE:
                 self.current_step = title
                 self.state.reset_step()
                 if names and title in names:
@@ -2727,11 +3238,12 @@ class Runner:
                     # Двійковий файл: ті самі байти, що дав би текстовий
                     # режим (див. _attach_lines), але без його повільного
                     # перекладу кінців рядків.
-                    self._attach_fh = open(self.log_dir / f"{title}.log", "wb")
+                    self._attach_fh = open(
+                        self.log_dir / f"{_sh_name(title)}.log", "wb")
                 except OSError:
                     self._attach_fh = None
             self.state.feed(line)
-            self.on_line(line)
+            self.on_line(step_banner(title))
             pos = end + 1
         if pos <= len(block):
             self._attach_lines(block[pos:])
@@ -2745,6 +3257,7 @@ class Runner:
             self._attach_fh.write(data)
             self._attach_fh.flush()
         self.state.feed_text(text)
+        text = render_text(text)
         if self.on_block is not None:
             self.on_block(text)
         else:
@@ -2756,7 +3269,7 @@ class Runner:
         total = len(steps)
         for i, step in enumerate(steps):
             if self._stop.is_set():
-                self.on_done(False, "зупинено користувачем")
+                self.on_done(False, tr("stopped by the user"))
                 return
             # Після мʼякої зупинки — лише збирання зрізу, без нових етапів.
             if self._soft.is_set() and not step.keep_on_soft:
@@ -2768,9 +3281,9 @@ class Runner:
             ok, msg = self._run_step(step)
             if not ok:
                 if step.optional:
-                    self.on_line(tr("[{name}] крок необовʼязковий, продовжую: {msg}", name=step.name, msg=msg))
+                    self.on_line(tr("[{name}] optional step, continuing: {msg}", name=step_title(step.name), msg=msg))
                     continue
-                self.on_done(False, f"{step.name}: {msg}")
+                self.on_done(False, f"{step_title(step.name)}: {msg}")
                 return
 
             # checkMesh завершується з кодом 0 навіть коли перевірки не
@@ -2781,22 +3294,25 @@ class Runner:
                 level, why = self.state.mesh_severity()
                 if level == "fatal" and self.stop_on_bad_mesh:
                     self.on_done(False, (
-                        tr("сітка непридатна: {why}. Розвʼязувач на ній майже "
-                        "напевно зірветься. Дивіться logs/checkMesh.log.", why=why)))
+                        tr("the mesh is not usable: {why}. The solver "
+                           "will almost certainly diverge on it. See "
+                           "logs/checkMesh.log.", why=why)))
                     return
                 if level == "warn":
                     self.on_line("")
                     tip = ""
                     if self.state.max_skewness > 5.0:
-                        tip = (" Перекіс помітно вище порога: якщо розвʼязувач "
-                               "зірветься в перші сотні ітерацій, вмикайте "
-                               "«Стійкий старт».")
-                    self.on_line(tr("[checkMesh] зауваження: {why}. Для реальної "
-                                 "сітки це в межах норми — продовжую.{tip}", why=why, tip=tip))
+                        tip = (tr(" Skewness is clearly above the "
+                               "threshold: if the solver diverges in the "
+                               "first few hundred iterations, turn on "
+                               "“Stable start”."))
+                    self.on_line(tr("[checkMesh] remarks: {why}. For a "
+                                    "real mesh this is within normal "
+                                    "limits — continuing.{tip}", why=why, tip=tip))
         if self._soft.is_set():
             self._finish_soft()
             return
-        self.on_done(True, "готово")
+        self.on_done(True, tr("done"))
 
     def _cond_ok(self, cond: str) -> bool:
         """Чи виконувати крок з умовою (Step.cond) — питаємо саму теку кейсу."""
@@ -2817,19 +3333,23 @@ class Runner:
             # cmd.exe, а не bash: перевіряємо Python-ом по тій самій мірці.
             ok, last = soft_check_local(self.case_dir)
             self.on_line(last)
-            self.on_done(ok, (f"зупинено зі зрізом — {last}" if ok else
-                              tr("мʼяка зупинка: зріз не записався ({last})", last=last)))
+            if ok:
+                self.soft_result = last
+                self.on_done(True, soft_done_text(last))
+            else:
+                self.on_done(False, tr("soft stop: the time step was not written ({last})", last=last))
             return
-        ok, msg = self._run_step(Step("перевірка зрізу", soft_check_command()))
+        ok, msg = self._run_step(Step(STEP_SOFT_CHECK, soft_check_command()))
+        log = self.log_dir / f"{STEP_SOFT_CHECK}.log"
         last = next((ln for ln in reversed(
-            (self.log_dir / "перевірка зрізу.log").read_text(
-                encoding="utf-8", errors="replace").splitlines())
-            if ln.strip()), "") if (self.log_dir / "перевірка зрізу.log"
-                                    ).exists() else ""
+            log.read_text(encoding="utf-8", errors="replace").splitlines())
+            if ln.strip()), "") if log.exists() else ""
         if not ok:
-            self.on_done(False, tr("мʼяка зупинка: зріз не записався ({v})", v=last or msg))
+            self.on_done(False, tr("soft stop: the time step was not written ({v})",
+                                   v=render_line(last) if last else msg))
             return
-        self.on_done(True, f"зупинено зі зрізом — {last}")
+        self.soft_result = soft_slice_text(last)
+        self.on_done(True, soft_done_text(self.soft_result))
 
     def _run_step(self, step: Step) -> tuple[bool, str]:
         # Скидаємо ряди перед ПЕРШИМ розвʼязувачем. potentialFoam теж рахує
@@ -2840,8 +3360,8 @@ class Runner:
         self.state.reset_step()
         argv = self.backend.shell(self.case_dir, step.command, self.native_dir)
         self.on_line("")
-        self.on_line(f"===== {step.name} =====")
-        log_path = self.log_dir / f"{step.name}.log"
+        self.on_line(step_banner(step.name))
+        log_path = self.log_dir / f"{_sh_name(step_id(step.name))}.log"
 
         try:
             self._proc = subprocess.Popen(
@@ -2865,7 +3385,7 @@ class Runner:
                 fh.write(line + "\n")
                 fh.flush()      # інакше лог порожній, поки крок не завершиться
                 self.state.feed(line)
-                self.on_line(line)
+                self.on_line(render_line(line))
                 if self._stop.is_set():
                     break
 
@@ -2873,7 +3393,7 @@ class Runner:
         if self.state.fatal:
             return (False, self.state.fatal)
         if rc != 0:
-            return (False, tr("код виходу {rc}, див. {log}", rc=rc, log=f"logs/{step.name}.log"))
+            return (False, tr("exit code {rc}, see {log}", rc=rc, log=f"logs/{log_path.name}"))
         return (True, "")
 
 
@@ -2925,7 +3445,7 @@ def sync_to_ssh(backend: Backend, case_dir: str, name: str) -> str:
     src = Path(case_dir)
     items = [i for i in SYNC_INPUTS if (src / i).exists()]
     if not items:
-        raise RuntimeError(tr("у кейсі немає нічого з {SYNC_INPUTS}", SYNC_INPUTS=SYNC_INPUTS))
+        raise RuntimeError(tr("the case has none of {SYNC_INPUTS}", SYNC_INPUTS=SYNC_INPUTS))
     remote = remote_dir_for(name)
     tmp = Path(tempfile.gettempdir()) / f"ofs-{name}.tar"
     try:
@@ -2941,7 +3461,7 @@ def sync_to_ssh(backend: Backend, case_dir: str, name: str) -> str:
     finally:
         tmp.unlink(missing_ok=True)
     if rc != 0:
-        raise RuntimeError(tr("не вдалося покласти кейс на сервер: {strip}", strip=err.strip()[:200]))
+        raise RuntimeError(tr("cannot put the case on the server: {strip}", strip=err.strip()[:200]))
     return remote
 
 
@@ -2984,10 +3504,10 @@ def sync_from_ssh(backend: Backend, remote_dir: str, case_dir: str) -> None:
     rc, err = _pipe(ssh_argv(backend.host, listing), stdout_path=tmp)
     try:
         if rc == 3:
-            raise RuntimeError("на сервері немає результатів: прогін не дійшов "
-                               "до запису")
+            raise RuntimeError(tr("no results on the server: the run did "
+                               "not get to a write"))
         if rc != 0:
-            raise RuntimeError(tr("не вдалося забрати результати з сервера: {v}", v=err.strip()[:200] or tr("код {rc}", rc=rc)))
+            raise RuntimeError(tr("cannot get the results from the server: {v}", v=err.strip()[:200] or tr("code {rc}", rc=rc)))
         with tarfile.open(tmp, "r") as tar:
             tar.extractall(dst)
     finally:
@@ -3016,7 +3536,7 @@ def sync_to_wsl(backend: Backend, case_dir: str, name: str) -> str:
         f'echo "$HOME/openfoam-studio/{name}"')
     rc, out = _run(wsl_argv(backend.distro, cmd), timeout=600)
     if rc != 0:
-        raise RuntimeError(tr("не вдалося скопіювати кейс у WSL: {strip}", strip=out.strip()))
+        raise RuntimeError(tr("cannot copy the case to WSL: {strip}", strip=out.strip()))
     return out.strip().splitlines()[-1].strip()
 
 
@@ -3051,7 +3571,7 @@ def sync_from_wsl(backend: Backend, native_dir: str, case_dir: str) -> None:
         # виглядала як успішна: людина дивилася на результати попереднього
         # прогону й не мала жодного способу про це дізнатися.
         raise RuntimeError(
-            tr("не вдалося повернути результати з WSL: {v}", v=out.strip().splitlines()[-1] if out.strip() else tr("код {rc}", rc=rc)))
+            tr("cannot get the results back from WSL: {v}", v=out.strip().splitlines()[-1] if out.strip() else tr("code {rc}", rc=rc)))
 
 
 def find_paraview() -> str:

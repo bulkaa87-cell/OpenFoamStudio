@@ -26,6 +26,11 @@ from __future__ import annotations
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fs_i18n import tr
+import fs_i18n
+
+# The Qt text setters translate and keep the key of each text, also in a
+# widget that is made before the main window (T28).
+fs_i18n.install()
 
 Qt = QtCore.Qt
 _NO_LIMIT = 16777215          # QWIDGETSIZE_MAX
@@ -50,7 +55,10 @@ class StatusText(QtWidgets.QLabel):
 
     # --- текст і підказка ------------------------------------------------
     def setText(self, text: str) -> None:                  # noqa: N802
-        text = "" if text is None else tr(str(text))
+        # tr() keeps a TrStr (a text that knows its key): a live change of
+        # the language makes it again (retranslate_ui).
+        text = "" if text is None else tr(text if isinstance(text, str)
+                                          else str(text))
         if text == self._full and super().text():
             return
         self._full = text
@@ -63,6 +71,14 @@ class StatusText(QtWidgets.QLabel):
     def setToolTip(self, tip: str) -> None:                 # noqa: N802
         self._tip = tr(tip or "")
         self._fit()
+
+    def retranslate_ui(self) -> None:
+        """A live change of the language (fs_i18n): the full text and the
+        tool tip again in the new language."""
+        self._full = tr(self._full)
+        self._tip = tr(self._tip)
+        self._fit()
+        self.updateGeometry()
 
     def is_elided(self) -> bool:
         return super().text() != self._full

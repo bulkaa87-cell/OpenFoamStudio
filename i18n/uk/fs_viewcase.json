@@ -1,0 +1,11 @@
+{
+ " (time directories {join} are from another mesh)": " (зрізи {join} — від іншої сітки)",
+ "Cannot read the mesh volume in case {name}.": "У кейсі {name} не читається обʼєм сітки.",
+ "Case {name} does not give the flow speed (no studio.json, no magUInf in controlDict). Set it: --u-inf.": "Кейс {name} не каже швидкості потоку (немає studio.json, у controlDict нема magUInf). Задайте її: --u-inf.",
+ "Case {name} has no postProcessing with coefficients: it was not run, or they were removed.": "У кейсі {name} немає postProcessing з коефіцієнтами: він не рахувався або їх прибрали.",
+ "Case {name} has no time directories with results.": "У кейсі {name} немає часових каталогів з результатами.",
+ "Time {t:g} is not in case {name}; available: {join}{why}.": "Моменту {t:g} у кейсі {name} нема; є: {join}{why}.",
+ "compressible solver: p∞ = 101325 Pa (assumed)": "стисливий розвʼязувач: p∞ = 101325 Па (припущено)",
+ "no such boundary: {unknown}": "немає такої границі: {unknown}",
+ "time directories {join} are from another mesh — skipped": "зрізи {join} від іншої сітки — пропущено"
+}

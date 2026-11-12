@@ -1,0 +1,14 @@
+{
+ "3D: CPU without GPU — slow": "3D: CPU без GPU — повільно",
+ "3D: software GPU — slower": "3D: програмний GPU — повільніше",
+ "3D: trying VTK…": "3D: пробую VTK…",
+ "3D: trying {adapter} ({backend})…": "3D: пробую {adapter} ({backend})…",
+ "foamview is not built": "foamview не зібрано",
+ "probe crashed (code {returncode}): {tail}": "проба впала (код {returncode}): {tail}",
+ "probe did not start: {exc}": "проба не запустилась: {exc}",
+ "probe hung (> {PROBE_TIMEOUT:.0f} s)": "проба зависла (> {PROBE_TIMEOUT:.0f} с)",
+ "status\u0004OK": "ок",
+ "wrong frame of a layer with a field: center {tolist}": "шар із полем не той: центр {tolist}",
+ "wrong frame: background {tolist}, center {tolist2}": "кадр не той: тло {tolist}, центр {tolist2}",
+ "wrong frame: center {tolist}": "кадр не той: центр {tolist}"
+}

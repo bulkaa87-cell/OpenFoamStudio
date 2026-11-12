@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable
 
 import fs_physics as phys
+import fs_i18n
 from fs_i18n import tr
 
 # Яку частку памʼяті дозволяємо зайняти задачі.
@@ -85,14 +86,12 @@ class MemRow:
     def line(self) -> str:
         h = self.host
         what = ("snappyHexMesh" if self.stage == "snappy"
-                else tr("розвʼязувач × {ranks}", ranks=h.ranks))
-        head = (tr("{what} на {name}: {cells} комірок, "
-                "~{need_gb:.1f} ГБ", what=what, name=h.name, cells=phys.fmt_cells(self.cells), need_gb=self.need_gb))
+                else tr("solver × {ranks}", ranks=h.ranks))
+        head = (tr("{what} on {name}: {cells} cells, ~{need_gb:.1f} GB", what=what, name=h.name, cells=phys.fmt_cells(self.cells), need_gb=self.need_gb))
         if not h.known:
-            return tr("{head} — памʼять машини ще невідома", head=head)
-        verdict = "влізе" if self.fits else "НЕ ВЛІЗЕ"
-        return (tr("{head} з {ram_gb} ГБ (під задачу "
-                "{budget_gb}) — {verdict}", head=head, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb), verdict=verdict))
+            return tr("{head} — machine memory not known yet", head=head)
+        verdict = tr("fits") if self.fits else tr("DOES NOT FIT")
+        return (tr("{head} of {ram_gb} GB ({budget_gb} for the job) — {verdict}", head=head, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb), verdict=verdict))
 
 
 @dataclass
@@ -135,16 +134,15 @@ class MemFit:
             h = w.host
             if w.stage == "snappy":
                 bits.append(
-                    tr("⚠ сітка не влізе на {name}: snappyHexMesh "
-                    "~{need_gb:.1f} ГБ, памʼяті {ram_gb} ГБ "
-                    "(під задачу {budget_gb})", name=h.name, need_gb=w.need_gb, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb)))
+                    tr("⚠ mesh will not fit on {name}: snappyHexMesh "
+                       "~{need_gb:.1f} GB, memory {ram_gb} GB "
+                       "({budget_gb} for the job)", name=h.name, need_gb=w.need_gb, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb)))
             else:
-                src = "збереженої сітки " if self.saved else ""
+                src = tr("of the saved mesh ") if self.saved else ""
                 bits.append(
-                    tr("⚠ розвʼязувач не влізе на {name}: "
-                    "{cells} комірок {src}~{need_gb:.1f} ГБ, "
-                    "памʼяті {ram_gb} ГБ "
-                    "(під задачу {budget_gb})", name=h.name, cells=phys.fmt_cells(w.cells), src=src, need_gb=w.need_gb, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb)))
+                    tr("⚠ solver will not fit on {name}: {cells} cells "
+                       "{src}~{need_gb:.1f} GB, memory {ram_gb} GB "
+                       "({budget_gb} for the job)", name=h.name, cells=phys.fmt_cells(w.cells), src=src, need_gb=w.need_gb, ram_gb=fmt_gb(h.ram_gb), budget_gb=fmt_gb(h.budget_gb)))
         names = []
         for r in self.unknown:
             if r.host.name not in names:
@@ -152,16 +150,16 @@ class MemFit:
         if names:
             dist = len(self.solver_rows()) > 1 and any(
                 r.stage == "solver" for r in self.unknown)
-            bits.append(tr("ℹ памʼять {names} ще невідома — там памʼять "
-                           "не перевіряю{v}", names=", ".join(names), v=" (кнопка «Перевірити машини»)" if dist else ""))
-        return "   ".join(bits)
+            bits.append(tr("ℹ memory of {names} not known yet — memory "
+                           "is not checked there{v}", names=fs_i18n.join(", ", [tr(n) for n in names]), v=" (button “Check machines”)" if dist else ""))
+        return fs_i18n.join("   ", bits)
 
     def details(self) -> str:
         """Усе по машинах — для підказки й діалогу перед запуском."""
-        lines = [tr("Памʼять (оцінка):")]
+        lines = [tr("Memory (estimate):")]
         if self.saved:
-            lines.append(tr("  сітка збережена ({cells} "
-                         "комірок) — snappyHexMesh не запускається", cells=phys.fmt_cells(self.cells)))
+            lines.append(tr("  mesh is saved ({cells} cells) — "
+                            "snappyHexMesh does not run", cells=phys.fmt_cells(self.cells)))
         for r in self.rows:
             lines.append("  " + r.line())
         sol = self.solver_rows()
@@ -170,15 +168,15 @@ class MemFit:
             known = [r.host for r in sol if r.host.known]
             ram = sum(h.ram_gb for h in known)
             if len(known) == len(sol):
-                tail = tr(" з {ram} ГБ", ram=fmt_gb(ram))
+                tail = tr(" of {ram} GB", ram=fmt_gb(ram))
             elif known:
-                tail = (tr(" (памʼять відома лише для {n_known} з них: "
-                        "{ram} ГБ)", n_known=len(known), ram=fmt_gb(ram)))
+                tail = (tr(" (memory known only for {n_known} of them: "
+                           "{ram} GB)", n_known=len(known), ram=fmt_gb(ram)))
             else:
                 tail = ""
-            lines.append(tr("  разом розвʼязувач: ~{need:.1f} ГБ на "
-                         "{n_sol} машинах{tail}", need=need, n_sol=len(sol), tail=tail))
-        return "\n".join(lines)
+            lines.append(tr("  solver total: ~{need:.1f} GB on {n_sol} "
+                            "machines{tail}", need=need, n_sol=len(sol), tail=tail))
+        return fs_i18n.join("\n", lines)    # keeps the keys (T28)
 
 
 def memory_fit(est: "phys.MeshEstimate", mesher: MemHost,

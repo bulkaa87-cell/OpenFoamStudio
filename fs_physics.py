@@ -127,16 +127,16 @@ def yplus_for_wall_distance(dist: float, u: float, length: float, nu: float) -> 
 def yplus_regime(y_plus: float) -> tuple[str, str]:
     """Повертає (мітка, рівень), де рівень один із ok / warn / bad."""
     if y_plus < 1.0:
-        return ("розвʼязаний підшар", "ok")
+        return (tr("resolved sublayer"), "ok")
     if y_plus < 5.0:
-        return ("вʼязкий підшар", "ok")
+        return (tr("viscous sublayer"), "ok")
     if y_plus < 30.0:
-        return ("буферний шар — найгірша зона для пристінних функцій", "bad")
+        return (tr("buffer layer — the worst zone for wall functions"), "bad")
     if y_plus <= 300.0:
-        return ("лог-шар, пристінні функції працюють", "ok")
+        return (tr("log layer, wall functions work"), "ok")
     if y_plus <= 1000.0:
-        return ("зависоко, точність пристінних функцій падає", "warn")
-    return ("далеко за лог-шаром", "bad")
+        return (tr("too high, wall function accuracy drops"), "warn")
+    return (tr("far beyond the log layer"), "bad")
 
 
 # --------------------------------------------------------------------------
@@ -376,11 +376,11 @@ def estimate_mesh(
 def fmt_cells(n: int) -> str:
     """Кількість комірок по-людськи. Мільярди теж: «20628.18M» не читається."""
     if n >= 1_000_000_000:
-        return tr("{v:.1f} млрд", v=n / 1_000_000_000)
+        return tr("{v:.1f} B", v=n / 1_000_000_000)
     if n >= 1_000_000:
-        return tr("{v:.2f} млн", v=n / 1_000_000)
+        return tr("{v:.2f} M", v=n / 1_000_000)
     if n >= 1_000:
-        return tr("{v:.0f} тис.", v=n / 1_000)
+        return tr("{v:.0f} k", v=n / 1_000)
     return str(n)
 
 
@@ -394,10 +394,10 @@ def memory_breakdown(est: "MeshEstimate", cfg_level: int,
     називаємо найбільший доданок і рахуємо рівень, на якому задача влізе.
     """
     parts = [
-        ("фонова сітка", est.background),
-        ("коробки згущення", est.regions),
-        ("рефайнмент поверхні", est.surface),
-        ("призматичні шари", int(est.layers * LAYER_YIELD)),
+        (tr("background mesh"), est.background),
+        (tr("refinement boxes"), est.regions),
+        (tr("surface refinement"), est.surface),
+        (tr("prism layers"), int(est.layers * LAYER_YIELD)),
     ]
     name, value = max(parts, key=lambda kv: kv[1])
     total_raw = sum(v for _, v in parts) or 1
@@ -413,8 +413,8 @@ def memory_breakdown(est: "MeshEstimate", cfg_level: int,
         level -= 1
         gb /= 4.0
 
-    text = (tr("Найбільший внесок — {name}: {value} комірок "
-            "({share:.0%} від усіх).", name=name, value=fmt_cells(value), share=share))
+    text = (tr("Largest contribution — {name}: {value} cells "
+               "({share:.0%} of all).", name=name, value=fmt_cells(value), share=share))
     return text, level
 
 
@@ -424,9 +424,9 @@ def fmt_len(metres: float) -> str:
     if a == 0:
         return "0"
     if a < 1e-6:
-        return tr("{v:.1f} нм", v=metres * 1e9)
+        return tr("{v:.1f} nm", v=metres * 1e9)
     if a < 1e-3:
-        return tr("{v:.1f} мкм", v=metres * 1e6)
+        return tr("{v:.1f} µm", v=metres * 1e6)
     if a < 1.0:
-        return tr("{v:.3g} мм", v=metres * 1e3)
-    return tr("{metres:.4g} м", metres=metres)
+        return tr("{v:.3g} mm", v=metres * 1e3)
+    return tr("{metres:.4g} m", metres=metres)

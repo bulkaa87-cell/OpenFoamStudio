@@ -980,13 +980,13 @@ fn height(a: Vec3, b: Vec3, c: Vec3) -> f64 {
 }
 
 /// Faces of each vertex (compressed rows): faces of v = list[start[v]..start[v+1]].
-struct VertexFaces {
+pub(crate) struct VertexFaces {
     start: Vec<u32>,
     list: Vec<u32>,
 }
 
 impl VertexFaces {
-    fn new(mesh: &Mesh) -> Self {
+    pub(crate) fn new(mesh: &Mesh) -> Self {
         let nv = mesh.vertices.len();
         let mut start = vec![0u32; nv + 1];
         for t in &mesh.triangles {
@@ -1007,15 +1007,15 @@ impl VertexFaces {
         }
         Self { start, list }
     }
-    fn of(&self, v: u32) -> &[u32] {
+    pub(crate) fn of(&self, v: u32) -> &[u32] {
         &self.list[self.start[v as usize] as usize..self.start[v as usize + 1] as usize]
     }
     /// Faces that use edge (a, b).
-    fn edge(&self, mesh: &Mesh, a: u32, b: u32) -> Vec<u32> {
+    pub(crate) fn edge(&self, mesh: &Mesh, a: u32, b: u32) -> Vec<u32> {
         self.of(a).iter().copied().filter(|&f| mesh.triangles[f as usize].contains(&b)).collect()
     }
     /// Sorted neighbour vertices of v.
-    fn ring(&self, mesh: &Mesh, v: u32) -> Vec<u32> {
+    pub(crate) fn ring(&self, mesh: &Mesh, v: u32) -> Vec<u32> {
         let mut r: Vec<u32> = Vec::with_capacity(8);
         for &f in self.of(v) {
             for &w in &mesh.triangles[f as usize] {
@@ -1029,7 +1029,7 @@ impl VertexFaces {
         r
     }
     /// True when an edge at v has other than two faces.
-    fn on_rim(&self, mesh: &Mesh, v: u32) -> bool {
+    pub(crate) fn on_rim(&self, mesh: &Mesh, v: u32) -> bool {
         self.ring(mesh, v).into_iter().any(|w| self.edge(mesh, v, w).len() != 2)
     }
 }
@@ -1306,7 +1306,7 @@ fn undo_crossing_flips(mesh: &mut Mesh, flips: &[(usize, usize, [u32; 3], [u32; 
 /// pass touch separate one-rings, so each one goes back alone. Returns
 /// (collapses undone, flips undone); for moves the first number counts
 /// the moves undone.
-fn undo_crossing_ops(
+pub(crate) fn undo_crossing_ops(
     mesh: &mut Mesh,
     remap: &mut [u32],
     cols: &[(u32, u32, Vec3)],

@@ -54,6 +54,11 @@ SLICE_NAME = "studio_slice"
 # у словнику вище й рахуються раніше.
 WALL_FIELDS = ("p", "wallShearStress", "yPlus")
 SLICE_FIELDS = ("p", "U", "nut")
+# Груба 3D-вибірка швидкості для ліній потоку (функція `sets`, тип array).
+FO_FLOW = "studioLiveFlow"
+FLOW_NAME = "studio_flow"
+FLOW_FILE = f"{FLOW_NAME}_U.xy.gz"
+FLOW_POINTS = 120_000
 # Момент, файли якого змінювалися зовсім недавно, ще може дописуватися.
 FRESH_S = 20
 # Скільки завантажених моментів тримаємо на один прогін.
@@ -93,7 +98,77 @@ def _fo_text(cfg) -> str:
                 triangulate true;
             }}"""
     out.append(_surfaces_fo(FO_SLICE, SLICE_FIELDS, surf))
+    out.append(_flow_fo(cfg))
     return "".join(out)
+
+
+def flow_box(cfg, points: int = FLOW_POINTS):
+    """Коробка грубої вибірки швидкості: (початок, розмір, точок по осях).
+
+    Габарит тіла з запасом 0.3 L з кожного боку і ще 1.0 L за тілом (у бік
+    потоку): там слід, заради якого лінії й дивляться. Крок однаковий по
+    всіх осях, щоб лінії не тягнулися вздовж однієї з них.
+    """
+    lo = np.asarray(cfg.bbox_min, dtype=float)
+    hi = np.asarray(cfg.bbox_max, dtype=float)
+    length = max(float(np.max(hi - lo)), 1e-6)
+    d = np.asarray(getattr(cfg.flow, "direction", (1.0, 0.0, 0.0)), float)
+    d = d / max(float(np.linalg.norm(d)), 1e-12)
+    lo = lo - 0.3 * length - 1.0 * length * np.maximum(-d, 0.0)
+    hi = hi + 0.3 * length + 1.0 * length * np.maximum(d, 0.0)
+    span = hi - lo
+    step = float(np.prod(span) / max(int(points), 1)) ** (1.0 / 3.0)
+    # arraySet ставить n точок у ВНУТРІШНІ вузли: крок = розмір / (n + 1).
+    n = np.maximum(np.round(span / step).astype(int) - 1, 1)
+    return tuple(lo), tuple(span), tuple(int(k) for k in n)
+
+
+def _flow_fo(cfg) -> str:
+    """Функція `sets` (тип array): U у рівній 3D-сітці точок навколо тіла.
+
+    Площина вище дає лише одну площину, а лінії потоку з неї виходять одразу
+    ж. Ця вибірка — грубий 3D-обʼєм для ліній на проміжному результаті:
+    ~120 тис. точок, 2–4 МБ (gzip) на запис. Точки в тілі й поза доменом
+    OpenFOAM не пише.
+    """
+    (ox, oy, oz), (sx, sy, sz), (nx, ny, nz) = flow_box(cfg)
+    return f"""
+    {FO_FLOW}
+    {{
+        type            sets;
+        libs            (sampling);
+        writeControl    writeTime;
+        errors          warn;
+        interpolationScheme cellPoint;
+        setFormat       raw;
+        formatOptions
+        {{
+            raw
+            {{
+                compression true;
+                precision   6;
+            }}
+        }}
+        fields          (U);
+        sets
+        {{
+            {FLOW_NAME}
+            {{
+                type            array;
+                axis            xyz;
+                origin          ({ox:.6g} {oy:.6g} {oz:.6g});
+                rotation
+                {{
+                    type    axes;
+                    e1      (1 0 0);
+                    e2      (0 1 0);
+                }}
+                pointsDensity   ({nx} {ny} {nz});
+                spanBox         ({sx:.6g} {sy:.6g} {sz:.6g});
+            }}
+        }}
+    }}
+"""
 
 
 def _surfaces_fo(name: str, fields, surfaces: str) -> str:
@@ -157,7 +232,8 @@ def probe_script(target: str) -> str:
         'm=0; s=0; for f in "$d"*.vtp; do '
         'fm=$(stat -c %Y "$f"); fs=$(stat -c %s "$f"); '
         '[ "$fm" -gt "$m" ] && m=$fm; s=$((s+fs)); done; '
-        f'for f in postProcessing/{FO_SLICE}/"$n"/*.vtp; do '
+        f'for f in postProcessing/{FO_SLICE}/"$n"/*.vtp '
+        f'postProcessing/{FO_FLOW}/"$n"/*; do '
         's=$((s+$(stat -c %s "$f"))); done; '
         'echo "live $n $m $s"; done; '
         'src=.; [ -d processor0 ] && src=processor0; '
@@ -175,14 +251,16 @@ def fetch_script(target: str, t: str) -> str:
     return (
         f'cd {_q(target)} || exit 1; '
         f'set --; for d in postProcessing/{FO_WALL}/{t} '
-        f'postProcessing/{FO_SLICE}/{t}; do [ -d "$d" ] && set -- "$@" "$d"; '
+        f'postProcessing/{FO_SLICE}/{t} postProcessing/{FO_FLOW}/{t}; '
+        'do [ -d "$d" ] && set -- "$@" "$d"; '
         'done; [ $# -gt 0 ] || exit 3; '
         'nice -n 19 tar czf - "$@"'
     )
 
 
 def extract_script(target: str, bashrc: str, t: str,
-                   patches: "list[str]") -> str:
+                   patches: "list[str]", engine: str = "",
+                   image: str = "") -> str:
     """bash: поверхні тіла з повного зрізу (запасний шлях), tar.gz у stdout.
 
     foamToVTK по кожній processor*/ окремо: кожна читає лише свій шматок
@@ -195,8 +273,7 @@ def extract_script(target: str, bashrc: str, t: str,
     conv = (f'nice -n 19 ionice -c3 foamToVTK -time {t} -no-internal '
             f"-no-point-data -fields '({' '.join(WALL_FIELDS)})'{sel} "
             f'-name {EXTRACT}')
-    return (
-        f'source {_q(bashrc)} >/dev/null 2>&1; cd {_q(target)} || exit 1; '
+    body = (
         '[ -f foamdist.json ] && exit 4; shopt -s nullglob; '
         f'rm -rf processor*/{EXTRACT} {EXTRACT}; n=0; '
         'for p in processor*; do '
@@ -209,6 +286,11 @@ def extract_script(target: str, bashrc: str, t: str,
         f'nice -n 19 tar czf - "$@"; rc=$?; rm -rf processor*/{EXTRACT} '
         f'{EXTRACT}; exit $rc'
     )
+    if engine:
+        # OpenFOAM in a container on the server (fs_backend.container_run).
+        return (f'cd {_q(target)} || exit 1; '
+                + be.container_run(engine, image, body))
+    return f'source {_q(bashrc)} >/dev/null 2>&1; cd {_q(target)} || exit 1; ' + body
 
 
 ENABLE_MARK = "studio/live-added"
@@ -279,7 +361,7 @@ class Probe:
 def parse_probe(text: str) -> Probe:
     lines = [ln.split() for ln in text.splitlines() if ln.strip()]
     if any(ln[0] == "nodir" for ln in lines):
-        return Probe(ok=False, why=tr("теки прогону немає"))
+        return Probe(ok=False, why=tr("the run folder does not exist"))
     now = 0
     pr = Probe()
     by: dict[str, LiveTime] = {}
@@ -379,7 +461,7 @@ class Source:
         out = (p.stdout or b"").decode("utf-8", "replace")
         if p.returncode != 0 and "now " not in out:
             err = (p.stderr or b"").decode("utf-8", "replace").strip()
-            return Probe(ok=False, why=err[-200:] or tr("код {rc}",
+            return Probe(ok=False, why=err[-200:] or tr("code {rc}",
                                                         rc=p.returncode))
         return parse_probe(out)
 
@@ -406,12 +488,14 @@ class Source:
         if lt.surface and _complete(dest):
             return str(dest), {"bytes": 0, "seconds": 0.0, "how": "cache"}
         if not self.has_shell:
-            raise RuntimeError(tr("на цьому бекенді проміжні дані недоступні"))
+            raise RuntimeError(tr("intermediate data is not available on this backend"))
         if lt.surface:
             script, how = fetch_script(self.target, lt.name), "surface"
         else:
             script = extract_script(self.target, self.backend.bashrc,
-                                    lt.name, patches)
+                                    lt.name, patches,
+                                    engine=getattr(self.backend, "engine", ""),
+                                    image=getattr(self.backend, "image", ""))
             how = "extract"
         tmp = Path(tempfile.gettempdir()) / f"ofs-live-{self.key()}.tgz"
         rc, err = be._pipe(self.argv(script), stdout_path=tmp,
@@ -419,13 +503,14 @@ class Source:
         try:
             if rc == 4:
                 raise RuntimeError(tr(
-                    "прогін розподілений між машинами: повних зрізів тут "
-                    "немає, лише поверхні, які пише сам прогін"))
+                    "the run is distributed over machines: the full time "
+                    "steps are not here, only the surfaces that the run "
+                    "writes"))
             if rc == 3:
-                raise RuntimeError(tr("для моменту {t} даних немає",
+                raise RuntimeError(tr("there is no data for time {t}",
                                       t=lt.name))
             if rc != 0:
-                raise RuntimeError(tr("не вдалося забрати дані: {err}",
+                raise RuntimeError(tr("cannot get the data: {err}",
                                       err=err.strip()[-200:] or rc))
             size = tmp.stat().st_size
             part = dest.with_name(dest.name + ".part")
@@ -490,7 +575,7 @@ def _normalise(part: Path, how: str) -> None:
     """
     files = list(part.rglob("*.vtp"))
     if how != "extract":
-        for f in files:
+        for f in files + list(part.rglob(FLOW_FILE)):
             f.replace(part / f.name)
     else:
         import pyvista as pv
@@ -591,6 +676,7 @@ class LiveResults:
         self.cfg = cfg
         self._cache: dict[tuple[float, str], object] = {}
         self._slab: tuple[float, object] | None = None
+        self._flow: tuple[float, tuple] | None = None
 
     @property
     def times(self) -> "list[float]":
@@ -614,6 +700,43 @@ class LiveResults:
             if g.is_file():
                 return g
         return None
+
+    def _flow_file(self, t: float) -> "Path | None":
+        folder = Path(self.folders[t])
+        for f in (folder / FLOW_FILE,
+                  folder.parent.parent / FO_FLOW / folder.name / FLOW_FILE):
+            if f.is_file():
+                return f
+        return None
+
+    def stream_volume(self, time_: float):
+        """Обʼєм для ліній потоку. → (сітка, крок вибірки в м) або (None, 0).
+
+        Є 3D-вибірка (`studioLiveFlow`) — рівна сітка з неї; крок > 0. Нема —
+        лише середня площина: шар із неї, але швидкість у ньому ПЛОСКА (без
+        складової по нормалі), і в field_data[PLANE_MARK] — (вісь, позиція).
+        Інакше лінія за кілька сантиметрів виходить із шару й обривається
+        (2026-11-11, case_jet: 6 ліній зі 1000 насінин).
+        """
+        if not self.folders:
+            return None, 0.0
+        t = self._near(time_)
+        if self._flow is not None and self._flow[0] == t:
+            return self._flow[1]
+        self._flow = None
+        got: tuple = (None, 0.0)
+        f = self._flow_file(t)
+        if f is not None:
+            try:
+                got = read_flow(f)
+            except Exception:                               # noqa: BLE001
+                got = (None, 0.0)
+        if got[0] is None:
+            plane = self._read(t, SLICE_NAME)
+            if plane is not None and "U" in plane.cell_data:
+                got = (in_plane(slab(close_pinholes(plane))), 0.0)
+        self._flow = (t, got)
+        return got
 
     def patch_names(self, time_: float) -> "list[str]":
         t = self._near(time_)
@@ -700,6 +823,136 @@ def slab(plane, normal: int = 1):
     return grid
 
 
+# Мітка в field_data: швидкість є лише в одній площині — (вісь, позиція).
+PLANE_MARK = "fs_stream_plane"
+
+
+def in_plane(grid, normal: int = 1):
+    """Копія шару, де швидкість лежить у площині (складова по нормалі = 0).
+
+    Лінія в такому шарі не виходить із нього, тож доходить до кінця. Це
+    лінії ПЛОСКОЇ проєкції швидкості, а не справжні 3D-лінії: вікно так і
+    каже.
+    """
+    out = grid.copy()
+    for store in (out.point_data, out.cell_data):
+        if "U" in store:
+            u = np.array(store["U"], dtype=float)
+            u[:, normal] = 0.0
+            store["U"] = u
+    b = grid.bounds
+    out.field_data[PLANE_MARK] = np.array(
+        [float(normal), 0.5 * (b[2 * normal] + b[2 * normal + 1])])
+    return out
+
+
+def close_pinholes(plane, max_points: int = 8):
+    """Закрити дрібні дірки в площині — пропущені трикутники розрізу.
+
+    cuttingPlane (interpolate false) губить окремі трикутники: на площині
+    case_jet (22 тис. трикутників) таких дірок 20, по 3–5 вершин. Лінія
+    потоку, що влучає в таку дірку, обривається «поза доменом». Дірки з
+    кількома вершинами закриваємо віялом трикутників зі значеннями —
+    середніми по вершинах. Великі петлі (переріз тіла) не чіпаємо.
+    """
+    import pyvista as pv
+    tri = plane.triangulate().clean()
+    faces = np.asarray(tri.faces).reshape(-1, 4)[:, 1:]
+    if not len(faces):
+        return tri
+    e = np.sort(np.vstack([faces[:, [0, 1]], faces[:, [1, 2]],
+                           faces[:, [2, 0]]]), axis=1)
+    uniq, count = np.unique(e, axis=0, return_counts=True)
+    nb: dict[int, list] = {}
+    for a, b in uniq[count == 1]:
+        nb.setdefault(int(a), []).append(int(b))
+        nb.setdefault(int(b), []).append(int(a))
+    new, seen = [], set()
+    for start in list(nb):
+        if start in seen:
+            continue
+        loop, prev, cur, ok = [start], -1, start, True
+        seen.add(start)
+        while True:
+            nxt = [p for p in nb[cur] if p != prev]
+            if len(nb[cur]) != 2 or not nxt:
+                ok = False
+                break
+            prev, cur = cur, nxt[0]
+            if cur == start:
+                break
+            if cur in seen or len(loop) > max_points:
+                ok = False
+                break
+            seen.add(cur)
+            loop.append(cur)
+        if ok and 3 <= len(loop) <= max_points:
+            new += [(loop[0], loop[i], loop[i + 1])
+                    for i in range(1, len(loop) - 1)]
+    if not new:
+        return tri
+    add = np.asarray(new, dtype=np.int64)
+    allf = np.vstack([faces, add])
+    out = pv.PolyData(np.asarray(tri.points),
+                      np.hstack([np.full((len(allf), 1), 3), allf]).ravel())
+    for k in tri.cell_data.keys():
+        old = np.asarray(tri.cell_data[k])
+        if k in tri.point_data:
+            extra = np.asarray(tri.point_data[k])[add].mean(axis=1)
+        else:
+            extra = np.repeat(old[:1] * 0, len(add), axis=0)
+        out.cell_data[k] = np.concatenate([old, extra.astype(old.dtype)])
+    return out
+
+
+def read_flow(path) -> tuple:
+    """3D-вибірка `studioLiveFlow` (raw: x y z Ux Uy Uz, gzip) → (сітка, крок).
+
+    Точки лежать у вузлах рівної ґратки, але тих, що в тілі чи поза
+    доменом, у файлі немає. Ґратку відновлюємо з координат; лишаємо лише
+    комірки, усі 8 вершин яких є, — тож на місці тіла в сітці дірка, і лінія
+    на ній зупиняється, а не проходить крізь тіло.
+    """
+    import gzip
+    import pyvista as pv
+    with gzip.open(path, "rt", encoding="ascii", errors="replace") as fh:
+        text = "".join(ln for ln in fh if not ln.lstrip().startswith("#"))
+    data = np.array(text.split(), dtype=float)
+    if data.size < 6 * 8:
+        return None, 0.0
+    data = data[: data.size // 6 * 6].reshape(-1, 6)
+    xyz, u = data[:, :3], data[:, 3:]
+    lo = xyz.min(axis=0)
+    step = np.zeros(3)
+    for a in range(3):
+        v = np.unique(np.round(xyz[:, a], 7))
+        d = np.diff(v)
+        d = d[d > 1e-9]
+        step[a] = float(np.median(d)) if d.size else 1.0
+    idx = np.rint((xyz - lo) / step).astype(int)
+    dims = idx.max(axis=0) + 1
+    if np.any(dims < 2):
+        return None, 0.0
+    have = np.zeros(dims[::-1], dtype=bool)          # [k, j, i]: x — найшвидше
+    vel = np.zeros(tuple(dims[::-1]) + (3,))
+    have[idx[:, 2], idx[:, 1], idx[:, 0]] = True
+    vel[idx[:, 2], idx[:, 1], idx[:, 0]] = u
+    img = pv.ImageData(dimensions=tuple(int(n) for n in dims),
+                       spacing=tuple(step), origin=tuple(lo))
+    img.point_data["U"] = vel.reshape(-1, 3)
+    ok = np.ones(tuple(dims[::-1] - 1), dtype=bool)
+    for dk in (0, 1):
+        for dj in (0, 1):
+            for di in (0, 1):
+                ok &= have[dk:dk + dims[2] - 1, dj:dj + dims[1] - 1,
+                           di:di + dims[0] - 1]
+    cells = np.flatnonzero(ok.ravel())
+    if not cells.size:
+        return None, 0.0
+    grid = img.extract_cells(cells)
+    return grid, float(step.max())
+
+
 def run_cfg(case_dir: str, fallback=None, names: "list[str] | None" = None):
     """Налаштування прогону для показу його проміжного результату.
 
@@ -742,12 +995,12 @@ def label(lt: LiveTime, steady: bool) -> str:
     0.0195 — це секунди, а не номер ітерації.
     """
     if steady and _whole(lt.name):
-        head = tr("ітерація {t}", t=lt.name)
+        head = tr("iteration {t}", t=lt.name)
     elif lt.index >= 0:
-        head = tr("t = {t} с (крок {i})", t=lt.name, i=lt.index)
+        head = tr("t = {t} s (step {i})", t=lt.name, i=lt.index)
     else:
-        head = tr("t = {t} с", t=lt.name)
+        head = tr("t = {t} s", t=lt.name)
     if lt.surface:
-        size = tr("{mb:.1f} МБ", mb=lt.size / 1e6)
-        return tr("{head} · поверхні, {size}", head=head, size=size)
-    return tr("{head} · з повного зрізу (повільніше)", head=head)
+        size = tr("{mb:.1f} MB", mb=lt.size / 1e6)
+        return tr("{head} · surfaces, {size}", head=head, size=size)
+    return tr("{head} · from the full time step (slower)", head=head)

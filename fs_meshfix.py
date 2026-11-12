@@ -23,6 +23,12 @@ DIFFERENCES FROM THE SERVICE (measured on tests/meshfix_cases.py):
 - the Wrap step cuts all faces against each other and keeps the faces
   between inside and outside by the winding number of the whole input
   (also of open parts). Steps after it do not make faces cross.
+- the last step StlSafe (rust/meshfix/src/stlsafe.rs) makes the result
+  keep its counts after a write to STL (float32) and a read that joins
+  equal points: the copies of a pinched edge or vertex move apart by some
+  float32 steps (about 1e-3 mm on a model of 3 m), and faces that the
+  rounding makes degenerate get a flip or a small vertex move. Report key
+  "stl_safe".
 - fallbacks, when the 12 steps do not give a closed mesh: first an alpha
   wrap of the input (shrunk onto the input), then a volumetric remesh.
   Each result is used only when it is closed and no count of the
@@ -40,6 +46,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
+import fs_i18n
 from fs_i18n import tr
 
 try:                                       # pragma: no cover - depends on the build
@@ -51,25 +58,27 @@ M_TO_MM = 1000.0
 
 # Step names for the log. The keys are Stage::name in rust/meshfix.
 STEP_NAMES = {
-    "Stitch1": "зшито", "Stitch2": "зшито (2)",
-    "CloseTrivialHoles1": "дірок на 3 ребра", "CloseTrivialHoles2": "дірок на 3 ребра (2)",
-    "RemoveDoubleTriangles": "дублів прибрано",
-    "FixFlipped1": "розвернуто трикутників", "FixFlipped2": "розвернуто (2)",
-    "CloseAllHoles": "дірок закрито",
-    "Wrap": "обгортка: прибрано частин",
-    "RemoveDegeneratedFaces": "вироджених виправлено",
-    "RemoveTinyShells": "крихітних оболонок прибрано",
-    "PrepareForExport": "T-зʼєднань розрізано",
-    "AlphaWrap": "обгортка alpha wrap, трикутників",
-    "VolumeRemesh": "обʼємна перебудова, трикутників",
+    "Stitch1": "stitched", "Stitch2": "stitched (2)",
+    "CloseTrivialHoles1": "3-edge holes", "CloseTrivialHoles2": "3-edge holes (2)",
+    "RemoveDoubleTriangles": "duplicates removed",
+    "FixFlipped1": "triangles flipped", "FixFlipped2": "flipped (2)",
+    "CloseAllHoles": "holes closed",
+    "Wrap": "wrap: parts removed",
+    "RemoveDegeneratedFaces": "degenerate faces fixed",
+    "RemoveTinyShells": "tiny shells removed",
+    "PrepareForExport": "T-junctions cut",
+    "AlphaWrap": "alpha wrap, triangles",
+    "VolumeRemesh": "volume rebuild, triangles",
+    "StlSafe": "points moved for STL",
 }
 
 # Text for the status line when a fallback replaced the result.
 FALLBACK_TEXT = {
-    "AlphaWrap": "12 кроків не дали закритої сітки — результат: обгортка "
-                 "моделі (alpha wrap), стиснута на поверхню",
-    "VolumeRemesh": "12 кроків не дали закритої сітки — результат: обʼємна "
-                    "перебудова (тонші за ~0.7 мм частини можуть зникнути)",
+    "AlphaWrap": "12 steps did not give a closed mesh — result: model "
+                 "wrap (alpha wrap), shrunk onto the surface",
+    "VolumeRemesh": "12 steps did not give a closed mesh — result: "
+                    "volume rebuild (parts thinner than ~0.7 mm can "
+                    "disappear)",
 }
 
 # Methods of this module: key → (name in the status text, report key of
@@ -77,14 +86,14 @@ FALLBACK_TEXT = {
 METHODS = {
     "meshfix": ("meshfix", None),
     "alphawrap": ("alpha wrap", "AlphaWrap"),
-    "volume": ("обʼємна перебудова", "VolumeRemesh"),
+    "volume": ("volume rebuild", "VolumeRemesh"),
 }
 
 # Status text of a forced method.
 FORCED_TEXT = {
-    "AlphaWrap": "обгортка моделі (alpha wrap), стиснута на поверхню",
-    "VolumeRemesh": "обʼємна перебудова (тонші за ~0.7 мм частини могли "
-                    "зникнути)",
+    "AlphaWrap": "model wrap (alpha wrap), shrunk onto the surface",
+    "VolumeRemesh": "volume rebuild (parts thinner than ~0.7 mm may have "
+                    "disappeared)",
 }
 
 # Report of the last repair. The window uses it for the status line.
@@ -98,10 +107,11 @@ def available() -> bool:
 def why_not() -> str:
     if available():
         return ""
-    return (tr("Модуль meshfix (Rust) не зібрано. Зібрати:\n\n    "
-               "powershell -ExecutionPolicy Bypass -File "
-               "tools\\build_rust.ps1\n\nРемонт службою Windows (метод "
-               "«Windows» у меню «Полагодити») працює й без нього."))
+    return (tr("The meshfix module (Rust) is not built. To build it:\n\n   "
+               " powershell -ExecutionPolicy Bypass -File "
+               "tools\\build_rust.ps1\n\nRepair with the Windows service "
+               "(the “Windows” method in the “Repair” menu) also works "
+               "without it."))
 
 
 def _triangles(mesh: pv.PolyData) -> np.ndarray:
@@ -126,6 +136,12 @@ def repair_arrays(points_mm, tris, *, wrap: bool = True,
     return _rs.repair(*args, method=method)
 
 
+# The end of a repair step text that is a verdict (what the repair did):
+# the window keeps such a line in the log. A character, not a word of the
+# text: the text is translated (T24). Invisible (U+2063).
+VERDICT = "\u2063"
+
+
 def summary(report: dict) -> str:
     """One line "what was done" from the steps with a count above zero."""
     parts = []
@@ -134,29 +150,29 @@ def summary(report: dict) -> str:
         if name in FALLBACK_TEXT and name != fallback:
             continue                       # ran, but its result was not used
         if count:
-            parts.append(f"{STEP_NAMES.get(name, name)} {count}")
+            parts.append(tr(STEP_NAMES.get(name, name)) + f" {count}")
     u = report.get("union") or {}
     if u.get("pairs"):
-        parts.append(tr("перетинів тіл розрізано {u}", u=u['pairs']))
+        parts.append(tr("body intersections cut {u}", u=u['pairs']))
     if u.get("skipped_clusters"):
-        parts.append(tr("місць перетину лишено як є {u}", u=u['skipped_clusters']))
+        parts.append(tr("intersection spots left as they are {u}", u=u['skipped_clusters']))
     if u.get("rolled_back") or u.get("panicked"):
-        parts.append("обʼєднання тіл не вдалося — тіла лишилися окремими")
+        parts.append(tr("merging the bodies failed — the bodies stay separate"))
     if report.get("guard"):
         return guard_text(report["guard"])
     if report.get("method", "meshfix") != "meshfix" and fallback in FORCED_TEXT:
-        return FORCED_TEXT[fallback]
+        return tr(FORCED_TEXT[fallback])
     if fallback in FALLBACK_TEXT:
-        return FALLBACK_TEXT[fallback]
+        return tr(FALLBACK_TEXT[fallback])
     after = report.get("after") or {}
     if after.get("boundary_edges") or after.get("non_manifold_edges"):
         # meshfix only cuts and joins closed bodies. An assembly with open
         # and non-manifold parts needs the full wrap of the Windows service.
-        parts.append(tr("лишилося відкритих ребер {get}, "
-                     "non-manifold {get2} — для "
-                     "такої збірки є «Windows» і «обʼємна перебудова» "
-                     "у меню «Полагодити»", get=after.get('boundary_edges', 0), get2=after.get('non_manifold_edges', 0)))
-    return ", ".join(parts) if parts else "кроки нічого не змінили"
+        parts.append(tr("open edges left {get}, non-manifold {get2} — "
+                        "for such an assembly, use “Windows” or “volume "
+                        "rebuild” in the “Repair” menu", get=after.get('boundary_edges', 0), get2=after.get('non_manifold_edges', 0)))
+    return (fs_i18n.join(", ", parts) if parts
+            else tr("the steps changed nothing"))
 
 
 def repair(mesh: pv.PolyData, say=None,
@@ -171,25 +187,24 @@ def repair(mesh: pv.PolyData, say=None,
     global last_report
     say = say or (lambda _text: None)
     if mesh is None or mesh.n_cells == 0:
-        raise ValueError("Нема чого лагодити: у моделі жодного трикутника.")
+        raise ValueError(tr("Nothing to repair: the model has no triangles."))
     if not available():
         raise RuntimeError(why_not())
     tri = _triangles(mesh)
     pts = np.asarray(mesh.points, dtype=np.float64) * M_TO_MM
     label, stage = METHODS[method]
-    say(tr("{label}: {n_tri} трикутників{v}", label=label, n_tri=len(tri), v=", 12 кроків" if stage is None else ""))
+    say(tr("{label}: {n_tri} triangles{v}", label=label, n_tri=len(tri), v=", 12 steps" if stage is None else ""))
     try:
         out_p, out_t, report = repair_arrays(pts, tri, method=method)
     except ValueError as exc:
-        raise RuntimeError(tr("{label} відмовив: {exc}.", label=label, exc=exc)) from exc
+        raise RuntimeError(tr("{label} failed: {exc}.", label=label, exc=exc)) from exc
     last_report = report
     if stage is not None and report.get("fallback") != stage:
         raise RuntimeError(forced_failure(method, report))
-    say(f"{label}: " + summary(report))
+    say(tr(label) + ": " + summary(report) + VERDICT)
     if len(out_t) == 0:
-        raise RuntimeError("Після ремонту не лишилося жодного трикутника: "
-                           "модель була плоскою або з самих крихітних "
-                           "оболонок.")
+        raise RuntimeError(tr("No triangles are left after the repair: the "
+                           "model was flat or made only of tiny shells."))
     out_t = np.asarray(out_t, dtype=np.int64)
     out = pv.PolyData(
         np.asarray(out_p) / M_TO_MM,
@@ -200,7 +215,7 @@ def repair(mesh: pv.PolyData, say=None,
     worse = worse_than(mesh, out)
     report["guard"] = worse
     if worse:
-        say(f"{label}: " + guard_text(worse))
+        say(tr(label) + ": " + guard_text(worse) + VERDICT)
         return mesh.copy()
     return out
 
@@ -210,18 +225,18 @@ def forced_failure(method: str, report: dict) -> str:
     if method == "volume":
         v = report.get("volume") or {}
         if v and 0 < v.get("volume_ratio", 1.0) <= 0.3:
-            return (tr("Обʼємна перебудова втратила тіло: лишилося "
-                    "{v:.0f}% обʼєму. Найчастіше це "
-                    "велика дірка, крізь яку «зовні» затекло всередину. "
-                    "Спробуйте meshfix або alpha wrap.", v=v['volume_ratio'] * 100))
-        return ("Обʼємна перебудова не дала поверхні: модель, мабуть, "
-                "складається з частин, тонших за ~0.7 мм.")
-    return ("Alpha wrap не дав замкненої оболонки. Спробуйте meshfix "
-            "або обʼємну перебудову.")
+            return (tr("The volume rebuild lost the body: {v:.0f}% of "
+                       "the volume is left. Most often this is a large "
+                       "hole through which the “outside” leaked inside. "
+                       "Try meshfix or alpha wrap.", v=v['volume_ratio'] * 100))
+        return (tr("The volume rebuild gave no surface: the model probably "
+                "consists of parts thinner than ~0.7 mm."))
+    return (tr("Alpha wrap did not give a closed shell. Try meshfix or the "
+            "volume rebuild."))
 
 
 # Program counts that the guard compares: (key, label for the status line).
-GUARD_COUNTS = (("open_edges", "дірок"), ("flipped_faces", "вивернутих"),
+GUARD_COUNTS = (("open_edges", "holes"), ("flipped_faces", "flipped"),
                 ("non_manifold_edges", "non-manifold"))
 
 
@@ -235,5 +250,5 @@ def worse_than(before: pv.PolyData, after: pv.PolyData) -> list:
 
 
 def guard_text(worse: list) -> str:
-    return (tr("результат гірший за вхідну модель ({join}) — модель "
-               "лишилася без змін", join=", ".join(f"{label} {a} → {b}" for label, a, b in worse)))
+    return (tr("the result is worse than the input model ({join}) — the "
+               "model stays unchanged", join=", ".join(f"{label} {a} → {b}" for label, a, b in worse)))

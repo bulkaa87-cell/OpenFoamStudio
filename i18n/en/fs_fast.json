@@ -1,4 +1,0 @@
-{
- "foamrs без surface_lines — перезберіть tools\\build_rust.ps1": "foamrs has no surface_lines — rebuild tools\\build_rust.ps1",
- "Модуль foamrs (Rust) не зібрано — поля читаються запасним способом, повільніше. Зібрати: tools\\build_rust.ps1.": "The foamrs module (Rust) is not built — fields are read by the fallback method, which is slower. To build: tools\\build_rust.ps1."
-}

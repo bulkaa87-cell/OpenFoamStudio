@@ -18,22 +18,27 @@ from PySide6 import QtCore, QtWidgets
 import fs_help as fshelp
 import fs_panels as panels
 from fs_i18n import tr
+import fs_i18n
+
+# The Qt text setters translate and keep the key of each text, also in a
+# widget that is made before the main window (T28).
+fs_i18n.install()
 
 # Ті самі ключі й назви, що в fs_views. Тут — копія, а не імпорт: смуга
 # свідомо без VTK (див. вище), а fs_views тягне його за собою. Що вони
 # не розійшлися, перевіряє tests/test_views.py.
 SEED_MODES = (
-    ("auto", "Гвинти й перед носом"),
-    ("nose", "Перед носом"),
-    ("rotors", "Від гвинтів"),
-    ("line", "Відрізок — тягнути у вікні"),
-    ("sphere", "Куля — тягнути у вікні"),
-    ("slice", "На площині зрізу"),
+    ("auto", "Propellers and in front of the nose"),
+    ("nose", "In front of the nose"),
+    ("rotors", "From the propellers"),
+    ("line", "Line segment — drag in the view"),
+    ("sphere", "Sphere — drag in the view"),
+    ("slice", "On the slice plane"),
 )
 SEED_DIRECTIONS = (
-    ("forward", "За потоком"),
-    ("both", "В обидва боки"),
-    ("backward", "Проти потоку"),
+    ("forward", "Downstream"),
+    ("both", "Both ways"),
+    ("backward", "Upstream"),
 )
 SEED_COUNT = 75
 
@@ -76,25 +81,26 @@ class SliceBar(QtWidgets.QWidget):
 
         # --- ряд A: що показувати (завжди видно) і кнопки кадру
         ra = QtWidgets.QHBoxLayout()
-        self.chk_enable = QtWidgets.QCheckBox("Зріз")
+        self.chk_enable = QtWidgets.QCheckBox("Slice")
         self.chk_enable.setToolTip(
-            "Переріз течії площиною. Площину можна тягнути мишею в вікні "
-            "(у косому вигляді) або повзунком.")
-        self.chk_streams = QtWidgets.QCheckBox("Лінії потоку")
+            "Cuts the flow with a plane. You can drag the plane with the "
+            "mouse in the view (in the oblique view) or with the slider.")
+        self.chk_streams = QtWidgets.QCheckBox("Streamlines")
         self.chk_streams.setToolTip(
-            "Лінії потоку, розфарбовані швидкістю. Звідки вони ростуть — "
-            "вибір у рядку нижче. Рахуються кілька секунд.")
-        self.btn_face = QtWidgets.QPushButton("Вид на зріз")
-        self.btn_face.setToolTip("Дивитися рівно на площину, без перспективи")
+            "Streamlines colored by speed. Where they start from — "
+            "choose in the row below. They take a few seconds to compute.")
+        self.btn_face = QtWidgets.QPushButton("Slice View")
+        self.btn_face.setToolTip("Look straight at the plane, without perspective")
         self.btn_iso = QtWidgets.QPushButton("3D")
-        self.btn_model = QtWidgets.QPushButton("До моделі")
+        self.btn_model = QtWidgets.QPushButton("Fit to model")
         self.btn_model.setToolTip(
-            "Камера — до моделі в УСІХ вʼюпортах: і тут, і в 3D. Бік, з якого "
-            "ви дивитесь, лишається. Ctrl+0")
-        self.btn_save = QtWidgets.QPushButton("Зберегти кадр…")
+            "Camera fits the model in ALL viewports: here and in 3D. The "
+            "side you look from stays the same. Ctrl+0")
+        self.btn_save = QtWidgets.QPushButton("Save frame…")
         self.btn_save.setToolTip(
-            "Кадр для звіту: з підписом, шкалою й масштабом. Зрізу — якщо він "
-            "ввімкнений, інакше ліній потоку.")
+            "Frame for a report: with a caption, color scale and scale "
+            "bar. It shows the slice if it is on, otherwise the "
+            "streamlines.")
         ra.addWidget(self.chk_enable)
         ra.addWidget(self.chk_streams)
         ra.addStretch(1)
@@ -117,29 +123,29 @@ class SliceBar(QtWidgets.QWidget):
         self.spin_seeds.setValue(SEED_COUNT)
         self.spin_seeds.setKeyboardTracking(False)
         self.spin_seeds.setToolTip(
-            "Скільки насінин — стільки й ліній. Кільця перед гвинтами мають "
-            "свою густину й цього числа не слухають.")
-        self.lbl_radius = QtWidgets.QLabel("Радіус")
+            "One line per seed. The rings ahead of the propellers have "
+            "their own density and do not follow this number.")
+        self.lbl_radius = QtWidgets.QLabel("Radius")
         self.spin_radius = panels.dspin(0.1, 1e6, 50.0, step=5.0, decimals=1,
-                                        suffix=" мм")
+                                        suffix=" mm")
         self.spin_radius.setKeyboardTracking(False)
         self.spin_radius.setToolTip(
-            "Радіус кулі, в обʼємі якої сидять насінини. У вікні його "
-            "можна змінити й правою кнопкою миші.")
+            "Radius of the sphere that holds the seeds. You can also "
+            "change it in the view with the right mouse button.")
         self.cmb_seed_dir = QtWidgets.QComboBox()
         for key, title in SEED_DIRECTIONS:
             self.cmb_seed_dir.addItem(title, key)
         self.cmb_seed_dir.setToolTip(
-            "За потоком — куди йде повітря від насінин. Проти потоку — звідки "
-            "воно прийшло. В обидва боки — для насіння посеред течії: у "
-            "слід, у вихор, на площину зрізу.")
-        self.btn_seed_reset = QtWidgets.QPushButton("На місце")
+            "Downstream — where the air goes from the seeds. Upstream — "
+            "where it came from. Both ways — for seeds in the middle of "
+            "the flow: in the wake, in a vortex, on the slice plane.")
+        self.btn_seed_reset = QtWidgets.QPushButton(tr("Reset", ctx="seed"))
         self.btn_seed_reset.setToolTip(
-            "Поставити відрізок чи кулю туди, де вони стоять спочатку: "
-            "відрізок — перед носом, куля — за тілом.")
-        rs.addWidget(QtWidgets.QLabel("Звідки"))
+            "Put the line segment or the sphere back where they start: "
+            "the segment ahead of the nose, the sphere behind the body.")
+        rs.addWidget(QtWidgets.QLabel("Source"))
         rs.addWidget(self.cmb_seed)
-        rs.addWidget(QtWidgets.QLabel("Ліній"))
+        rs.addWidget(QtWidgets.QLabel("Lines"))
         rs.addWidget(self.spin_seeds)
         rs.addWidget(self.lbl_radius)
         rs.addWidget(self.spin_radius)
@@ -157,11 +163,11 @@ class SliceBar(QtWidgets.QWidget):
         # --- шари поверх тіла: видно завжди, як і зріз із лініями. Кожен
         # рахується лише ввімкнений — обʼєм і так читається один раз.
         rl = QtWidgets.QHBoxLayout()
-        rl.addWidget(QtWidgets.QLabel("Шари"))
-        self.chk_reverse = QtWidgets.QCheckBox("Зворотна течія")
-        self.chk_loss = QtWidgets.QCheckBox("Слід")
-        self.chk_wall = QtWidgets.QCheckBox("Лінії на тілі")
-        self.chk_wash = QtWidgets.QCheckBox("Обдув гвинтів")
+        rl.addWidget(QtWidgets.QLabel("Layers"))
+        self.chk_reverse = QtWidgets.QCheckBox("Reverse flow")
+        self.chk_loss = QtWidgets.QCheckBox("Wake")
+        self.chk_wall = QtWidgets.QCheckBox("Lines on the body")
+        self.chk_wash = QtWidgets.QCheckBox("Propeller slipstream")
         self._layer_boxes = {"reverse": self.chk_reverse, "loss": self.chk_loss,
                              "wall": self.chk_wall, "wash": self.chk_wash}
         for key, box in self._layer_boxes.items():
@@ -185,16 +191,17 @@ class SliceBar(QtWidgets.QWidget):
         # ряд B: вісь, повзунок, число, кроки, швидкі переходи
         rb = QtWidgets.QHBoxLayout()
         self.cmb_axis = QtWidgets.QComboBox()
-        for label, axis in (("Y — по розмаху", 1), ("X — уздовж потоку", 0),
-                            ("Z — по висоті", 2)):
+        for label, axis in (("Y — spanwise", 1), ("X — along the flow", 0),
+                            ("Z — vertical", 2)):
             self.cmb_axis.addItem(label, axis)
         self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider.setRange(0, SLIDER_STEPS)
         self.slider.setToolTip(
-            "Повзунок ходить по габариту тіла з запасом. Далі площину можна "
-            "поставити числом праворуч — воно приймає весь домен.")
+            "The slider moves over the body size with a margin. Beyond "
+            "that, set the plane with the number on the right — it "
+            "accepts the whole domain.")
         self.spin = panels.dspin(-1e6, 1e6, 0.0, step=5.0, decimals=1,
-                                 suffix=" мм")
+                                 suffix=" mm")
         self.spin.setMinimumWidth(110)
         self.btn_prev = QtWidgets.QToolButton()
         self.btn_prev.setText("◀")
@@ -203,10 +210,10 @@ class SliceBar(QtWidgets.QWidget):
         for b in (self.btn_prev, self.btn_next):
             b.setAutoRepeat(True)
             b.setAutoRepeatInterval(60)
-            b.setToolTip("Крок площини: 5 мм")
+            b.setToolTip("Plane step: 5 mm")
         self.cmb_stops = QtWidgets.QComboBox()
-        self.cmb_stops.setToolTip("Поставити площину в помітне місце")
-        rb.addWidget(QtWidgets.QLabel("Вісь"))
+        self.cmb_stops.setToolTip("Put the plane at an interesting spot")
+        rb.addWidget(QtWidgets.QLabel("Axis"))
         rb.addWidget(self.cmb_axis)
         rb.addWidget(self.slider, 1)
         rb.addWidget(self.spin)
@@ -217,24 +224,26 @@ class SliceBar(QtWidgets.QWidget):
 
         # ряд C: поле й шкала
         r2 = QtWidgets.QHBoxLayout()
-        r2.addWidget(QtWidgets.QLabel("Поле"))
+        r2.addWidget(QtWidgets.QLabel("Field"))
         self.cmb_field = QtWidgets.QComboBox()
         self.cmb_field.setMinimumWidth(260)
         r2.addWidget(self.cmb_field)
-        self.lbl_scale = QtWidgets.QLabel("Шкала")
+        self.lbl_scale = QtWidgets.QLabel("Scale")
         r2.addWidget(self.lbl_scale)
         self.spin_lo = panels.dspin(-1e9, 1e9, 0.0, step=1.0, decimals=3)
         self.spin_hi = panels.dspin(-1e9, 1e9, 1.0, step=1.0, decimals=3)
         r2.addWidget(self.spin_lo)
         r2.addWidget(self.spin_hi)
-        self.btn_auto = QtWidgets.QPushButton("Авто")
+        self.btn_auto = QtWidgets.QPushButton("Auto")
         self.btn_auto.setToolTip(
-            "Шкала сама: за швидкістю й тиском у зрізах навколо тіла, а не "
-            "за пристінковими комірками, які роздувають її.")
-        self.btn_fit = QtWidgets.QPushButton("Під зріз")
+            "Automatic scale: from the speed and pressure in slices "
+            "around the body, not from the near-wall cells that inflate "
+            "it.")
+        self.btn_fit = QtWidgets.QPushButton("Fit to slice")
         self.btn_fit.setToolTip(
-            "Підігнати шкалу під ЦЕЙ зріз. Далі вона стоїть, поки площину "
-            "рухають, — щоб колір міняло поле, а не шкала.")
+            "Fit the scale to THIS slice. After that it stays fixed "
+            "while the plane moves — so that the field changes the "
+            "color, not the scale.")
         r2.addWidget(self.btn_auto)
         r2.addWidget(self.btn_fit)
         r2.addStretch(1)
@@ -242,18 +251,18 @@ class SliceBar(QtWidgets.QWidget):
 
         # ряд D: що на зрізі показувати
         r3 = QtWidgets.QHBoxLayout()
-        self.chk_contour = QtWidgets.QCheckBox("Контур тіла")
+        self.chk_contour = QtWidgets.QCheckBox("Body outline")
         self.chk_contour.setChecked(True)
-        self.chk_edges = QtWidgets.QCheckBox("Сітка")
-        self.chk_edges.setToolTip("Показати ребра комірок на зрізі")
-        self.chk_body = QtWidgets.QCheckBox("Тіло")
+        self.chk_edges = QtWidgets.QCheckBox("Mesh")
+        self.chk_edges.setToolTip("Show cell edges on the slice")
+        self.chk_body = QtWidgets.QCheckBox("Body")
         self.chk_body.setChecked(True)
-        self.chk_widget = QtWidgets.QCheckBox("Площина в вікні")
+        self.chk_widget = QtWidgets.QCheckBox("Plane in view")
         self.chk_widget.setChecked(True)
         self.chk_widget.setToolTip(
-            "Напівпрозора «ручка», за яку площину можна тягнути мишею. "
-            "Вимкніть, щоб вона не потрапляла в знімок.")
-        self.chk_arrows = QtWidgets.QCheckBox("Стрілки")
+            "Semi-transparent “handle” to drag the plane with the mouse. "
+            "Turn it off to keep it out of the screenshot.")
+        self.chk_arrows = QtWidgets.QCheckBox("Arrows")
         for c in (self.chk_contour, self.chk_edges, self.chk_body,
                   self.chk_widget, self.chk_arrows):
             r3.addWidget(c)
@@ -448,7 +457,7 @@ class SliceBar(QtWidgets.QWidget):
                    default=_STEPS_MM[0])
         self.spin.setSingleStep(step)
         for b in (self.btn_prev, self.btn_next):
-            b.setToolTip(tr("Крок площини: {step:g} мм",
+            b.setToolTip(tr("Plane step: {step:g} mm",
                             step=self.spin.singleStep()))
         self._silent = False
 
@@ -479,7 +488,7 @@ class SliceBar(QtWidgets.QWidget):
         """stops — [(підпис, позиція, м)]."""
         self._silent = True
         self.cmb_stops.clear()
-        self.cmb_stops.addItem("Перейти до…", None)
+        self.cmb_stops.addItem("Go to…", None)
         for label, pos in stops:
             self.cmb_stops.addItem(label, float(pos))
         self._silent = False
@@ -489,7 +498,7 @@ class SliceBar(QtWidgets.QWidget):
         self._silent = True
         self._diverging = bool(diverging)
         self.spin_lo.setVisible(not diverging)
-        self.lbl_scale.setText("Шкала ±" if diverging else "Шкала від / до")
+        self.lbl_scale.setText("Scale ±" if diverging else "Scale from / to")
         self.spin_lo.setValue(lo)
         self.spin_hi.setValue(hi)
         self._silent = False

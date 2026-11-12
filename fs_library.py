@@ -58,9 +58,9 @@ ENUMS: dict[str, tuple[str, ...]] = {
     "write_format": ("binary", "ascii"),
 }
 
-STATE_RESULTS = "результати"
-STATE_MESH = "сітка"
-STATE_SETTINGS = "налаштування"
+STATE_RESULTS = "results"
+STATE_MESH = "mesh"
+STATE_SETTINGS = "settings"
 
 
 def _now() -> str:
@@ -501,6 +501,7 @@ def write_manifest(case_dir: str | os.PathLike, cfg: fc.CaseCfg,
 def record_run(case_dir: str | os.PathLike, *, ok: bool, seconds: float = 0.0,
                iterations: int = 0, cells: int = 0, converged: bool = False,
                coeffs: dict | None = None, backend: str = "",
+               backend_id: str = "",
                note: str = "", layers: float = -1.0,
                end_time: float = 0.0) -> str:
     """Дописує результат прогону в історію кейсу.
@@ -518,7 +519,8 @@ def record_run(case_dir: str | os.PathLike, *, ok: bool, seconds: float = 0.0,
         "end_time": round(float(end_time), 6),
         "cells": int(cells),
         "converged": bool(converged),
-        "backend": backend,
+        "backend": backend,          # the label, for the person
+        "backend_id": backend_id,    # fs_backend.Backend.id
         "note": note,
         # Частка граней, які отримали призматичні шари. Зі словників кейсу
         # її не дістати — це результат роботи snappy, а не налаштування.
@@ -735,7 +737,10 @@ def parse_logs(case_dir: str | os.PathLike) -> LogFacts:
     # і стисливі кейси показувалися в бібліотеці без жодної статистики.
     main = sorted(p for p in logs.glob("*Foam.log")
                   if p.stem not in SKIP_LOGS)
-    staged = sorted(logs.glob("*Foam-стійкий.log"))
+    # "-stable" since 2026-11-11 (fs_backend.STABLE_SUFFIX); "-стійкий" in
+    # the logs of older runs.
+    staged = sorted(set(logs.glob("*Foam-stable.log"))
+                    | set(logs.glob("*Foam-стійкий.log")))
 
     # Двоетапний прогін пише два логи, а нумерація ітерацій у другому
     # продовжується з першого — тому по ітераціях беремо максимум, а не суму.
@@ -951,11 +956,11 @@ class CaseInfo:
         пораховано з потрібних.
         """
         if self.steady:
-            return ("ітерацій", str(self.iterations) if self.iterations else "—")
+            return (tr("iterations"), str(self.iterations) if self.iterations else "—")
         if not self.end_time:
-            return ("часу", "—")
-        return ("часу", tr("{end_time:g} с за {iterations} кроків", end_time=self.end_time, iterations=self.iterations)
-                if self.iterations else tr("{end_time:g} с", end_time=self.end_time))
+            return (tr("time"), "—")
+        return (tr("time"), tr("{end_time:g} s in {iterations} steps", end_time=self.end_time, iterations=self.iterations)
+                if self.iterations else tr("{end_time:g} s", end_time=self.end_time))
 
     @property
     def last_run(self) -> dict:
@@ -976,12 +981,12 @@ class CaseInfo:
         run = self.last_run
         if run:
             if not run.get("ok"):
-                return "обірвано"
-            return "збіглося" if run.get("converged") else "пройдено"
+                return tr("aborted")
+            return tr("converged") if run.get("converged") else tr("completed")
         if self.logs.finished:
-            return "пройдено"
+            return tr("completed")
         if self.logs.iterations:
-            return "обірвано"
+            return tr("aborted")
         return ""
 
     def coeff(self, name: str):
@@ -1120,26 +1125,27 @@ def stability(cases: list[CaseInfo]) -> Stability:
     usable = []                     # (info, cfg, (Cd, Cl, Cm), розкиди)
     for info in cases:
         if not info.has_cfg:
-            out.notes.append(tr("«{name}»: маніфесту немає, налаштування "
-                             "невідомі — кейс пропущено", name=info.name))
+            out.notes.append(tr("“{name}”: no manifest, settings unknown "
+                                "— case skipped", name=info.name))
             continue
         cfg = cfg_from_dict(info.cfg)
         got = [info.coeff(n) for n in ("Cd", "Cl", "CmPitch")]
         if any(p is None for p in got):
-            out.notes.append(tr("«{name}»: коефіцієнтів немає — кейс пропущено", name=info.name))
+            out.notes.append(tr("“{name}”: no coefficients — case skipped", name=info.name))
             continue
         means = [p[0] for p in got]
         if not all(math.isfinite(v) and abs(v) < 1e3 for v in means):
-            out.notes.append(tr("«{name}»: розрахунок розійшовся — кейс пропущено", name=info.name))
+            out.notes.append(tr("“{name}”: the run diverged — case skipped", name=info.name))
             continue
         if abs(cfg.flow.aos_deg) > 1e-6:
-            out.notes.append(tr("«{name}»: кут ковзання {aos_deg:g}° — "
-                             "поздовжню стійкість так не знайти, кейс пропущено", name=info.name, aos_deg=cfg.flow.aos_deg))
+            out.notes.append(tr("“{name}”: sideslip angle {aos_deg:g}° — "
+                                "longitudinal stability cannot be found "
+                                "like this, case skipped", name=info.name, aos_deg=cfg.flow.aos_deg))
             continue
         usable.append((info, cfg, means, [p[1] for p in got]))
     if len(usable) < 2:
-        out.problem = ("потрібно щонайменше два кейси ЦЬОГО Ж літака на різних "
-                       "кутах атаки, з коефіцієнтами")
+        out.problem = (tr("you need at least two cases of THE SAME aircraft "
+                       "at different angles of attack, with coefficients"))
         return out
 
     ref = usable[0][1].flow
@@ -1151,17 +1157,18 @@ def stability(cases: list[CaseInfo]) -> Stability:
                         for a, b in zip(f.cofr, ref.cofr)))
         if not same:
             out.problem = (
-                tr("у «{name}» інші Lref, Aref чи центр моментів, ніж у "
-                "«{name2}»: коефіцієнти нормовані по-різному, "
-                "порівнювати їх не можна", name=info.name, name2=usable[0][0].name))
+                tr("“{name}” has a different Lref, Aref or moment center "
+                   "than “{name2}”: the coefficients are normalized "
+                   "differently, you cannot compare them", name=info.name, name2=usable[0][0].name))
             return out
     out.l_ref, out.x_cofr = ref.l_ref, ref.cofr[0]
     out.names = [u[0].name for u in usable]
 
     angles = [u[1].flow.aoa_deg for u in usable]
     if max(angles) - min(angles) < be.MIN_ANGLE_SPAN:
-        out.problem = (tr("кути атаки однакові або різняться менш ніж на "
-                       "{MIN_ANGLE_SPAN:g}°: за одним кутом похідної нема", MIN_ANGLE_SPAN=be.MIN_ANGLE_SPAN))
+        out.problem = (tr("the angles of attack are the same or differ "
+                          "by less than {MIN_ANGLE_SPAN:g}°: one angle "
+                          "gives no derivative", MIN_ANGLE_SPAN=be.MIN_ANGLE_SPAN))
         return out
 
     # Габарит тіла: щоб показати точку «від носа», а не лише в системі кейсу.
@@ -1171,49 +1178,51 @@ def stability(cases: list[CaseInfo]) -> Stability:
         out.nose_x = boxes[0][0]
         out.length = boxes[0][1] - boxes[0][0]
     else:
-        out.notes.append("габарити тіла в кейсах різні — «від носа» не показую")
+        out.notes.append(tr("the body dimensions differ between cases — “from the nose” is not shown"))
 
     out.point = be.neutral_point(
         [(u[1].flow.aoa_deg, *u[2]) for u in usable], out.l_ref, out.x_cofr)
     if out.point is None:
-        out.problem = (tr("нормальна сила майже не росте з кутом (dCn/dα менше "
-                       "{MIN_CN_ALPHA:g} на градус): нейтральна точка тікає "
-                       "в нескінченність", MIN_CN_ALPHA=be.MIN_CN_ALPHA))
+        out.problem = (tr("the normal force almost does not grow with "
+                          "angle (dCn/dα less than {MIN_CN_ALPHA:g} per "
+                          "degree): the neutral point goes to infinity", MIN_CN_ALPHA=be.MIN_CN_ALPHA))
         return out
 
     # На що зважити в числі.
     p = out.point
     if len(p.angles) == 2:
-        out.notes.append("лише два кути: лінійність не перевірена, бажано "
-                         "третій між ними чи поряд")
+        out.notes.append(tr("only two angles: linearity is not checked, a "
+                         "third one between them or near them is better"))
     elif p.pairs and max(p.pairs) - min(p.pairs) > 0.10 * out.l_ref:
         out.notes.append(
-            tr("за різними парами кутів точка ходить від {pairs:.3f} до "
-            "{pairs2:.3f} м: залежність від кута нелінійна (зрив?), "
-            "беріть кути ближче до робочого", pairs=min(p.pairs), pairs2=max(p.pairs)))
+            tr("for different pairs of angles the point moves from "
+               "{pairs:.3f} to {pairs2:.3f} m: the dependence on angle "
+               "is nonlinear (stall?), use angles closer to the "
+               "operating one", pairs=min(p.pairs), pairs2=max(p.pairs)))
     speeds = [u[1].flow.u_inf for u in usable]
     if max(speeds) > 1.01 * min(speeds):
-        out.notes.append("швидкість у кейсів різна — числа Рейнольдса не "
-                         "збігаються")
+        out.notes.append(tr("the speed differs between cases — the Reynolds "
+                         "numbers do not match"))
     if len({u[1].flow.turbulence for u in usable}) > 1:
-        out.notes.append("моделі турбулентності різні")
+        out.notes.append(tr("the turbulence models are different"))
     if len({u[0].steady for u in usable}) > 1:
-        out.notes.append("серед кейсів є і стаціонарні, і нестаціонарні "
-                         "прогони: беріть однакові")
+        out.notes.append(tr("the cases include both steady and transient "
+                         "runs: use the same kind"))
     sources = {os.path.basename(u[0].stl_source) for u in usable if u[0].stl_source}
     if len(sources) > 1:
-        out.notes.append(tr("кейси зроблено з різних файлів геометрії: {join}", join=", ".join(sorted(sources))))
+        out.notes.append(tr("the cases were made from different geometry files: {join}", join=", ".join(sorted(sources))))
     shaky = [u[0].name for u in usable
              if any(sp > 0.05 * max(abs(m), 0.01)
                     for sp, m in zip(u[3][1:], u[2][1:]))]
     if shaky:
-        out.notes.append(tr("коефіцієнти ще коливаються в кейсах: "
-                            "{shaky} — точка наближена", shaky=", ".join(shaky)))
+        out.notes.append(tr("the coefficients still oscillate in cases: "
+                            "{shaky} — the point is approximate", shaky=", ".join(shaky)))
     if out.nose_x is not None and out.length:
         lo, hi = out.nose_x - 0.25 * out.length, out.nose_x + 1.25 * out.length
         if not lo <= p.x <= hi:
-            out.notes.append("нейтральна точка далеко за межами тіла: нормальна "
-                             "сила майже не росте з кутом, число ненадійне")
+            out.notes.append(tr("the neutral point is far outside the body: "
+                             "the normal force almost does not grow with "
+                             "angle, the number is not reliable"))
     return out
 
 
@@ -1242,7 +1251,7 @@ def parse_angles(text: str) -> tuple[list[float], str]:
     """
     raw = (text or "").strip()
     if not raw:
-        return [], "кути не задано"
+        return [], tr("no angles are set")
     if ";" in raw:
         tokens = [t.strip().replace(",", ".") for t in raw.split(";")]
     else:
@@ -1255,22 +1264,23 @@ def parse_angles(text: str) -> tuple[list[float], str]:
         try:
             a = float(t)
         except ValueError:
-            return [], tr("«{t}» — не число", t=t)
+            return [], tr("“{t}” is not a number", t=t)
         if not math.isfinite(a) or abs(a) > 90.0:
-            return [], tr("кут {t}° поза межами −90…90°", t=t)
+            return [], tr("angle {t}° is outside −90…90°", t=t)
         angles.append(a)
     unique = sorted({round(a, 6) for a in angles})
     if len(unique) < 2:
-        return unique, "потрібно щонайменше два різні кути"
+        return unique, tr("you need at least two different angles")
     if unique[-1] - unique[0] < be.MIN_ANGLE_SPAN:
-        return unique, (tr("кути різняться менш ніж на {MIN_ANGLE_SPAN:g}°: "
-                        "похідної з них не взяти", MIN_ANGLE_SPAN=be.MIN_ANGLE_SPAN))
+        return unique, (tr("the angles differ by less than "
+                           "{MIN_ANGLE_SPAN:g}°: you cannot get a "
+                           "derivative from them", MIN_ANGLE_SPAN=be.MIN_ANGLE_SPAN))
     return unique, ""
 
 
 def runs_word(n: int) -> str:
     """«2 прогони», «5 прогонів», «21 прогін» — українська форма числівника."""
-    return fs_i18n.plural(n, "{n} прогін", "{n} прогони", "{n} прогонів").format(n=n)
+    return fs_i18n.plural(n, "{n} run", "{n} runs")
 
 
 def series_case_name(base: str, angle: float) -> str:
@@ -1292,13 +1302,15 @@ def series_problem(cfg) -> str:
     """
     f = cfg.flow
     if abs(f.aos_deg) > 1e-6:
-        return (tr("стоїть кут ковзання {aos_deg:g}°: нейтральна точка по "
-                "тангажу шукається при нульовому ковзанні, і такі кейси в "
-                "розрахунок не підуть. Поставте ковзання 0 на вкладці «Потік».", aos_deg=f.aos_deg))
+        return (tr("a sideslip angle of {aos_deg:g}° is set: the pitch "
+                   "neutral point is found at zero sideslip, and such "
+                   "cases are not used in the calculation. Set sideslip "
+                   "to 0 on the “Flow” tab.", aos_deg=f.aos_deg))
     if f.farfield_mode == "tunnel":
-        return ("зовнішні межі в режимі «аеротруба»: slip-стінки зрізають кут "
-                "атаки, і всі прогони серії порахували б той самий потік. "
-                "Перемкніть «Дальнє поле» на freestream на вкладці «Потік».")
+        return (tr("the outer boundaries are in “wind tunnel” mode: slip "
+                "walls cut off the angle of attack, and all runs of the "
+                "series would compute the same flow. Switch “Far field” "
+                "to freestream on the “Flow” tab."))
     return ""
 
 
@@ -1306,11 +1318,12 @@ def series_notes(angles: list[float]) -> list[str]:
     """На що зважити в самому наборі кутів — до запуску, а не після."""
     notes = []
     if len(angles) == 2:
-        notes.append("лише два кути: лінійність не перевірити, краще три")
+        notes.append(tr("only two angles: linearity cannot be checked, three are better"))
     if max(abs(a) for a in angles) > SERIES_STALL_DEG:
-        notes.append(tr("кути понад {SERIES_STALL_DEG:g}° близькі до зриву: там "
-                     "стаціонарний розвʼязувач не сходиться, а момент "
-                     "нелінійний — точка поїде", SERIES_STALL_DEG=SERIES_STALL_DEG))
+        notes.append(tr("angles above {SERIES_STALL_DEG:g}° are close to "
+                        "stall: there the steady solver does not "
+                        "converge and the moment is nonlinear — the "
+                        "point will shift", SERIES_STALL_DEG=SERIES_STALL_DEG))
     return notes
 
 
@@ -1321,10 +1334,10 @@ def series_notes(angles: list[float]) -> list[str]:
 def fmt_size(n: int) -> str:
     if n <= 0:
         return "—"
-    for unit, div in (("ГБ", 1 << 30), ("МБ", 1 << 20), ("КБ", 1 << 10)):
+    for unit, div in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
         if n >= div:
             return f"{n / div:.1f} {unit}"
-    return tr("{n} Б", n=n)
+    return tr("{n} B", n=n)
 
 
 def fmt_time(stamp: float) -> str:
@@ -1337,10 +1350,10 @@ def fmt_seconds(s: float) -> str:
     if not s:
         return "—"
     if s < 90:
-        return tr("{s:.0f} с", s=s)
+        return tr("{s:.0f} s", s=s)
     if s < 3600:
-        return tr("{v:.1f} хв", v=s / 60)
-    return tr("{v:.1f} год", v=s / 3600)
+        return tr("{v:.1f} min", v=s / 60)
+    return tr("{v:.1f} h", v=s / 3600)
 
 
 # ==========================================================================

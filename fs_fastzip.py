@@ -110,7 +110,7 @@ class Writer:
     def _end(self, offset: int, nb: bytes, flags: int, method: int, z64: bool,
              crc: int, csize: int, size: int) -> None:
         if not z64 and (csize >= _U32 or size >= _U32):
-            raise OSError(tr("запис {name} виріс понад 4 ГБ",
+            raise OSError(tr("entry {name} became larger than 4 GB",
                              name=nb.decode("utf-8", "replace")))
         end = self.fh.tell()
         self.fh.seek(offset + 14)
@@ -132,12 +132,12 @@ class Writer:
             def read(pos, n):
                 got = src.read(n)
                 if len(got) != n:
-                    raise OSError(tr("файл {path} змінився під час запису",
+                    raise OSError(tr("file {path} changed while it was written",
                                      path=path))
                 return got
             self._add(name, size, read, level)
             if src.read(1):
-                raise OSError(tr("файл {path} змінився під час запису",
+                raise OSError(tr("file {path} changed while it was written",
                                  path=path))
 
     def _add(self, name: str, size: int, read, level: int) -> None:
@@ -175,7 +175,7 @@ class Writer:
         while left:
             buf = src.read(min(left, 8 << 20))
             if not buf:
-                raise OSError(tr("архів обрізаний"))
+                raise OSError(tr("the archive is truncated"))
             self.fh.write(buf)
             left -= len(buf)
         self._end(offset, nb, flags, info.compress_type, z64,
@@ -217,7 +217,7 @@ def data_start(src, info: zipfile.ZipInfo) -> int:
     src.seek(info.header_offset)
     head = src.read(30)
     if len(head) != 30 or head[:4] != b"PK\x03\x04":
-        raise OSError(tr("поганий заголовок запису {name}",
+        raise OSError(tr("bad header of entry {name}",
                          name=info.filename))
     nlen, elen = struct.unpack("<HH", head[26:30])
     return info.header_offset + 30 + nlen + elen

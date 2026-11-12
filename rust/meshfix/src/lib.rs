@@ -20,6 +20,7 @@ mod py;
 pub mod rims;
 pub mod seal;
 pub mod stages;
+pub mod stlsafe;
 // Diagnosis on a mesh file: RUSTFLAGS="--cfg meshfix_debug" (file not in git).
 #[cfg(all(test, meshfix_debug))]
 mod debug_tests;
@@ -51,6 +52,9 @@ pub enum Stage {
     AlphaWrap,
     /// Fallback 2, the last one: volumetric remesh (volume.rs).
     VolumeRemesh,
+    /// The last step, after the scale back (stlsafe.rs): the result keeps
+    /// its counts after a write to STL (float32) and a read.
+    StlSafe,
 }
 
 /// The step order of the Windows repair ("repair_extended").
@@ -86,6 +90,7 @@ impl Stage {
             Stage::PrepareForExport => "PrepareForExport",
             Stage::AlphaWrap => "AlphaWrap",
             Stage::VolumeRemesh => "VolumeRemesh",
+            Stage::StlSafe => "StlSafe",
         }
     }
 }
@@ -154,6 +159,8 @@ pub struct RepairOptions {
     /// default of `VolumeOptions` (2048). A small value is for tests: the
     /// default grid on a compact model takes minutes.
     pub volume_cells: Option<usize>,
+    /// The last step StlSafe (stlsafe.rs). MESHFIX_STL_SAFE=off stops it.
+    pub stl_safe: bool,
 }
 
 impl Default for RepairOptions {
@@ -174,6 +181,7 @@ impl Default for RepairOptions {
             stop_after: None,
             method: Method::Pipeline,
             volume_cells: None,
+            stl_safe: true,
         }
     }
 }
@@ -269,6 +277,8 @@ pub struct RepairReport {
     pub alpha_wrap: Option<alphawrap::WrapReport>,
     /// The volumetric remesh, when it ran.
     pub volume: Option<volume::VolumeReport>,
+    /// The StlSafe step, when it ran.
+    pub stl_safe: Option<stlsafe::StlSafeReport>,
 }
 
 pub fn run_stage(stage: Stage, m: &mut Mesh, o: &RepairOptions) -> usize {
@@ -289,7 +299,7 @@ pub fn run_stage(stage: Stage, m: &mut Mesh, o: &RepairOptions) -> usize {
         Stage::RemoveTinyShells => stages::remove_tiny_shells(m, o.tiny_shell_volume),
         Stage::PrepareForExport => stages::prepare_for_export(m, o.export_tolerance),
         // The fallbacks are not single steps: see `repair`.
-        Stage::AlphaWrap | Stage::VolumeRemesh => 0,
+        Stage::AlphaWrap | Stage::VolumeRemesh | Stage::StlSafe => 0,
     }
 }
 
@@ -436,8 +446,19 @@ pub fn repair(
         out.push(StageResult { stage: Stage::VolumeRemesh, count: faces, time: t0.elapsed() });
         progress(Stage::VolumeRemesh, faces);
     }
-    let after = mesh_info(mesh);
     mesh.affine(1.0 / s, lo);
+    // StlSafe works on the final coordinates: the float32 grid of the file
+    // is in these units (or in a scale of them).
+    let mut stl_rep = None;
+    let stl_on = opts.stl_safe && opts.stop_after.is_none() && std::env::var("MESHFIX_STL_SAFE").as_deref() != Ok("off");
+    if stl_on && !mesh.triangles.is_empty() {
+        let t0 = Instant::now();
+        let r = stlsafe::make_stl_safe(mesh, &stlsafe::GRIDS);
+        out.push(StageResult { stage: Stage::StlSafe, count: r.changes(), time: t0.elapsed() });
+        progress(Stage::StlSafe, r.changes());
+        stl_rep = Some(r);
+    }
+    let after = mesh_info(mesh);
     Ok(RepairReport {
         before,
         after,
@@ -448,6 +469,7 @@ pub fn repair(
         fallback,
         alpha_wrap: wrap_rep,
         volume: vol_rep,
+        stl_safe: stl_rep,
     })
 }
 

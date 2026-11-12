@@ -156,7 +156,85 @@ fn repair<'py>(
         vd.set_item("times", t)?;
         d.set_item("volume", vd)?;
     }
+    if let Some(s) = &report.stl_safe {
+        d.set_item("stl_safe", stl_dict(py, s)?)?;
+    }
     Ok((pts, tr, d))
+}
+
+fn stl_dict<'py>(py: Python<'py>, s: &crate::stlsafe::StlSafeReport) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("unit", s.unit)?;
+    d.set_item("pairs", s.pairs)?;
+    d.set_item("faces", s.faces)?;
+    d.set_item("moved", s.moved)?;
+    d.set_item("collapsed", s.collapsed)?;
+    d.set_item("flipped", s.flipped)?;
+    d.set_item("left_pairs", s.left_pairs)?;
+    d.set_item("left_faces", s.left_faces)?;
+    d.set_item("max_move", s.max_move)?;
+    d.set_item("joined_before", s.joined_before)?;
+    d.set_item("joined_after", s.joined_after)?;
+    d.set_item("undone", s.undone)?;
+    d.set_item("rounds", s.rounds)?;
+    d.set_item("t_scan", s.t_scan)?;
+    d.set_item("t_cross", s.t_cross)?;
+    Ok(d)
+}
+
+fn mesh_from<'py>(points: &numpy::PyReadonlyArray2<'py, f64>, tris: &numpy::PyReadonlyArray2<'py, i64>) -> PyResult<Mesh> {
+    let p = points.as_array();
+    let t = tris.as_array();
+    if p.ncols() != 3 || t.ncols() != 3 {
+        return Err(PyValueError::new_err("need (N, 3) points and (M, 3) tris"));
+    }
+    let n = p.nrows() as i64;
+    if t.iter().any(|&i| i < 0 || i >= n) {
+        return Err(PyValueError::new_err("tris: index out of range"));
+    }
+    Ok(Mesh::new(
+        p.rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect(),
+        t.rows().into_iter().map(|r| [r[0] as u32, r[1] as u32, r[2] as u32]).collect(),
+    ))
+}
+
+/// Only the last step StlSafe on a mesh (for checks and diagnosis).
+/// Returns (points, tris, report dict as report["stl_safe"]).
+#[pyfunction]
+fn stl_safe<'py>(
+    py: Python<'py>,
+    points: numpy::PyReadonlyArray2<'py, f64>,
+    tris: numpy::PyReadonlyArray2<'py, i64>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyDict>)> {
+    let mut m = mesh_from(&points, &tris)?;
+    let (m, r) = py.detach(move || {
+        let r = crate::stlsafe::make_stl_safe(&mut m, &crate::stlsafe::GRIDS);
+        (m, r)
+    });
+    let (nv, nf) = (m.vertices.len(), m.triangles.len());
+    let flat_p: Vec<f64> = m.vertices.iter().flat_map(|v| v.iter().copied()).collect();
+    let flat_t: Vec<i64> = m.triangles.iter().flat_map(|t| t.iter().map(|&i| i as i64)).collect();
+    Ok((flat_p.into_pyarray(py).reshape([nv, 3])?.into_any(), flat_t.into_pyarray(py).reshape([nf, 3])?.into_any(), stl_dict(py, &r)?))
+}
+
+/// The counts after a float32 STL round trip at the scale factor k (file =
+/// points · k; equal points joined): the dict of info() and "degenerate"
+/// (faces below the program's zero-area limit).
+#[pyfunction]
+fn round_trip<'py>(
+    py: Python<'py>,
+    points: numpy::PyReadonlyArray2<'py, f64>,
+    tris: numpy::PyReadonlyArray2<'py, i64>,
+    k: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let m = mesh_from(&points, &tris)?;
+    let rt = crate::stlsafe::round_trip(&m, k);
+    let d = info_dict(py, &mesh_info(&rt))?;
+    let lim = crate::stages::zero_area_limit(&rt);
+    let deg = (0..rt.triangles.len()).filter(|&f| { let [a, b, c] = rt.tri_pos(f); crate::math::tri_area(a, b, c) < lim }).count();
+    d.set_item("degenerate", deg)?;
+    d.set_item("clean", crate::is_clean(&rt))?;
+    Ok(d)
 }
 
 /// Counts of a mesh without a repair: the same dict as report["after"].
@@ -245,6 +323,8 @@ fn meshfix(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crossings, m)?)?;
     m.add_function(wrap_pyfunction!(winding, m)?)?;
     m.add_function(wrap_pyfunction!(info, m)?)?;
+    m.add_function(wrap_pyfunction!(stl_safe, m)?)?;
+    m.add_function(wrap_pyfunction!(round_trip, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

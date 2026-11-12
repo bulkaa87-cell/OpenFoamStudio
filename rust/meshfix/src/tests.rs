@@ -438,7 +438,8 @@ fn shared_edge_is_split() {
     assert!(r.after.is_closed() && r.after.is_oriented(), "{:?}", r.after);
     assert_eq!(r.after.non_manifold_edges, 0);
     assert_eq!(r.after.shells, 2);
-    assert!((volume(&m) - 2000.0).abs() < 1e-9);
+    // StlSafe moves the two copies of the edge apart by some float32 steps.
+    assert!((volume(&m) - 2000.0).abs() < 1e-3, "volume {}", volume(&m));
 }
 
 /// Largest number of face fans around one vertex (1 = manifold vertex).
@@ -562,7 +563,8 @@ fn touching_copies_stay_clean() {
     let r = fix(&mut m);
     assert_eq!(m.defect_edges(), 0, "{:?}", r.after);
     assert_eq!(r.after.shells, 2);
-    assert!((volume(&m) - 2000.0).abs() < 1e-9);
+    // StlSafe moves the two copies of the edge apart by some float32 steps.
+    assert!((volume(&m) - 2000.0).abs() < 1e-3, "volume {}", volume(&m));
 }
 
 /// A cube with a flap: one more face on a cube edge (3 faces on the edge).
@@ -785,7 +787,7 @@ fn forced_method_on_a_clean_cube(method: Method) {
         assert!((v - 1000.0).abs() < 60.0, "{method:?} volume {v}");
         // The forced wrap does not run the 12 steps; the forced remesh
         // runs the steps up to CloseAllHoles.
-        let steps: Vec<Stage> = r.stages.iter().map(|s| s.stage).collect();
+        let steps: Vec<Stage> = r.stages.iter().map(|s| s.stage).filter(|&s| s != Stage::StlSafe).collect();
         if method == Method::AlphaWrap {
             assert_eq!(steps, vec![Stage::AlphaWrap]);
         } else {
@@ -1137,4 +1139,82 @@ fn seams_are_cut_out_and_filled() {
     let i = mesh_info(&m);
     assert!(i.is_closed() && i.is_oriented(), "{i:?}");
     assert!((volume(&m) - 1000.0).abs() < 1e-6, "volume {}", volume(&m));
+}
+
+// ---- StlSafe (the last step) -------------------------------------------
+
+/// (clean, degenerate faces) of the mesh after a float32 STL round trip
+/// at the scale factor k.
+fn rt_clean(m: &Mesh, k: f64) -> (bool, usize) {
+    let rt = crate::stlsafe::round_trip(m, k);
+    let lim = zero_area_limit(&rt);
+    let deg = (0..rt.triangles.len())
+        .filter(|&f| {
+            let [a, b, c] = rt.tri_pos(f);
+            tri_area(a, b, c) < lim
+        })
+        .count();
+    (is_clean(&rt), deg)
+}
+
+#[test]
+fn stl_round_trip_of_shared_edge() {
+    // Two cubes on one edge, far from the origin (a coarse float32 step).
+    // The repair gives each cube its own copy of the edge; an STL reader
+    // joins equal points, and the edge then has four faces.
+    let mut m = join(&cube(10.0, [1000.0, 1000.0, 0.0]), &cube(10.0, [1010.0, 1010.0, 0.0]));
+    for t in &mut m.triangles {
+        for x in t.iter_mut() {
+            if *x == 8 {
+                *x = 2;
+            } else if *x == 12 {
+                *x = 6;
+            }
+        }
+    }
+    let mut no = m.clone();
+    let o = RepairOptions { stl_safe: false, ..Default::default() };
+    repair(&mut no, &o, |_, _| {}).unwrap();
+    assert!(is_clean(&no));
+    assert!(!rt_clean(&no, 1.0).0, "without StlSafe the copies join");
+    let r = fix(&mut m);
+    assert!(is_clean(&m));
+    let s = r.stl_safe.expect("StlSafe ran");
+    assert!(!s.undone && s.joined_after == 0 && s.left_pairs == 0, "{s:?}");
+    assert!(s.max_move < 1e-3, "{s:?}");
+    for k in crate::stlsafe::GRIDS {
+        assert_eq!(rt_clean(&m, k), (true, 0), "k {k}");
+    }
+    assert!((volume(&m) - 2000.0).abs() < 0.2, "volume {}", volume(&m));
+}
+
+#[test]
+fn stl_safe_fixes_a_cap() {
+    // A sliver on the top edge 4-5 of a cube: its apex is 1e-7 off the
+    // edge. float32 puts the apex on the edge: a face of zero area.
+    let mut m = cube(10.0, [1000.0, 1000.0, 1000.0]);
+    let (p4, p5) = (m.vertices[4], m.vertices[5]);
+    let c = m.vertices.len() as u32;
+    m.vertices.push(add(scale(add(p4, p5), 0.5), [0.0, 1e-7, 0.0]));
+    m.triangles[2] = [4, c, 6];
+    m.triangles.push([c, 5, 6]);
+    m.triangles.push([4, 5, c]);
+    assert!(is_clean(&m));
+    assert!(rt_clean(&m, 1.0).1 > 0, "the sliver is degenerate after the round trip");
+    let r = crate::stlsafe::make_stl_safe(&mut m, &crate::stlsafe::GRIDS);
+    assert!(!r.undone && r.left_faces == 0 && r.left_pairs == 0, "{r:?}");
+    assert!(is_clean(&m));
+    for k in crate::stlsafe::GRIDS {
+        assert_eq!(rt_clean(&m, k), (true, 0), "k {k}");
+    }
+    assert!((volume(&m) - 1000.0).abs() < 1e-3, "volume {}", volume(&m));
+}
+
+#[test]
+fn stl_safe_keeps_a_clean_cube() {
+    let mut m = cube(10.0, [0.0; 3]);
+    let before = m.clone();
+    let r = crate::stlsafe::make_stl_safe(&mut m, &crate::stlsafe::GRIDS);
+    assert_eq!((r.pairs, r.faces, r.changes()), (0, 0, 0), "{r:?}");
+    assert_eq!(m, before);
 }

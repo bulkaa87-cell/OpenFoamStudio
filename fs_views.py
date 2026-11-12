@@ -196,32 +196,33 @@ class FieldSpec:
 
 
 FIELDS = (
-    FieldSpec("dU", "Приріст швидкості вздовж потоку  U∥ − U∞",
-              "U∥ − U∞,  м/с", "diverging", "fs_diverging", ("U",),
-              "теплий — повітря швидше за набігаюче (обдув гвинтом, обтікання), "
-              "синій — повільніше (слід, гальмування)", pct=99.0),
-    FieldSpec("swirl", "Закрутка  |U⊥|",
-              "поперечна швидкість U⊥,  м/с", "sequential", "magma", ("U",),
-              "швидкість упоперек потоку: закрутка за гвинтом, вихори",
+    FieldSpec("dU", "Speed gain along the flow  U∥ − U∞",
+              "U∥ − U∞,  m/s", "diverging", "fs_diverging", ("U",),
+              "warm — the air is faster than the freestream (propeller "
+              "wash, flow around the body), blue — slower (wake, "
+              "deceleration)", pct=99.0),
+    FieldSpec("swirl", "Swirl  |U⊥|",
+              "cross-flow speed U⊥,  m/s", "sequential", "magma", ("U",),
+              "speed across the flow: swirl behind the propeller, vortices",
               pct=99.9, floor=0.0),
-    FieldSpec("umag", "Швидкість  |U|",
-              "швидкість U,  м/с", "sequential", "turbo", ("U",),
-              "модуль швидкості", pct=99.5, floor=0.0),
-    FieldSpec("dp", "Тиск  p − p∞",
-              "p − p∞,  Па", "diverging", "fs_diverging", ("p",),
-              "теплий — тиск вищий за набігаючий (підпір), "
-              "синій — нижчий (розрідження)", pct=99.9),
-    FieldSpec("cp", "Коефіцієнт тиску  Cp",
+    FieldSpec("umag", "Speed  |U|",
+              "speed U,  m/s", "sequential", "turbo", ("U",),
+              "speed magnitude", pct=99.5, floor=0.0),
+    FieldSpec("dp", "Pressure  p − p∞",
+              "p − p∞,  Pa", "diverging", "fs_diverging", ("p",),
+              "warm — pressure higher than the freestream (stagnation), "
+              "blue — lower (suction)", pct=99.9),
+    FieldSpec("cp", "Pressure coefficient  Cp",
               "Cp", "diverging", "fs_diverging", ("p",),
-              "той самий тиск, віднесений до швидкісного напору потоку",
+              "the same pressure, divided by the dynamic pressure of the flow",
               pct=99.9),
-    FieldSpec("nut", "Вихрова в'язкість  νt/ν",
+    FieldSpec("nut", "Eddy viscosity  νt/ν",
               "νt / ν", "sequential", "magma", ("nut",),
-              "у скільки разів турбулентна в'язкість більша за молекулярну",
+              "how many times the turbulent viscosity is larger than the molecular one",
               pct=99.5, floor=0.0),
-    FieldSpec("cell", "Розмір комірки сітки",
-              "lg розміру комірки,  мм", "sequential", "fs_size", (),
-              "світліше — дрібніша комірка; штрихи — самі комірки",
+    FieldSpec("cell", "Mesh cell size",
+              "lg of cell size,  mm", "sequential", "fs_size", (),
+              "lighter — smaller cell; strokes — the cells themselves",
               pct=99.5, weighted=False),
 )
 
@@ -679,7 +680,7 @@ def _unique_title(plotter, label: str) -> str:
     кінці робить ключ іншим, а на вигляд нічого не міняє."""
     title = label
     while title in plotter.scalar_bars.keys():
-        title += " "
+        title += " "            # TrStr + " " keeps the key (fs_i18n)
     return title
 
 
@@ -852,8 +853,8 @@ class SliceScene:
         lost = [a for a in self.spec.arrays if a not in have]
         if lost:
             raise ValueError(
-                tr("У обʼємі немає {lost} — поле «{key}» "
-                "показати нічим.", lost=', '.join(lost), key=self.spec.key))
+                tr("The volume has no {lost} — nothing to show the "
+                   "“{key}” field with.", lost=', '.join(lost), key=self.spec.key))
 
     def _decorate(self, s):
         """Кладе в переріз скаляр для розфарбування під іменем VALUE."""
@@ -940,7 +941,7 @@ class SliceScene:
         self._arrow_actor.SetVisibility(self.arrows)
 
         if self.show_bar:
-            self._bar_title = _unique_title(p, self.spec.label)
+            self._bar_title = _unique_title(p, tr(self.spec.label))
             bar = p.add_scalar_bar(
                 title=self._bar_title, mapper=self._actor.mapper,
                 n_labels=len(ticks_for(*self.limits,
@@ -957,11 +958,10 @@ class SliceScene:
                 render=False)
 
     def caption(self) -> str:
-        cut_txt = ", ".join(self.cut_names) if self.cut_names else "тіла не зачіпає"
-        text = (tr("зріз {AXES} = {v:.1f} мм"
-                "   ·   контур: {cut_txt}", AXES=AXES[self.axis], v=self.pos * 1000, cut_txt=cut_txt))
+        cut_txt = ", ".join(self.cut_names) if self.cut_names else tr("does not cut the body")
+        text = (tr("slice {AXES} = {v:.1f} mm   ·   contour: {cut_txt}", AXES=AXES[self.axis], v=self.pos * 1000, cut_txt=cut_txt))
         if self.arrows:
-            text += tr("   ·   стрілка в клітинку = {arrow_ref:.3g} м/с", arrow_ref=self.arrow_ref())
+            text += tr("   ·   arrow per grid square = {arrow_ref:.3g} m/s", arrow_ref=self.arrow_ref())
         return text
 
     # --- стрілки --------------------------------------------------------
@@ -1324,7 +1324,7 @@ def _nice_length(x: float) -> float:
 
 
 def _length_text(metres: float) -> str:
-    return tr("{v:g} мм", v=metres * 1000) if metres < 1.0 else tr("{metres:g} м", metres=metres)
+    return tr("{v:g} mm", v=metres * 1000) if metres < 1.0 else tr("{metres:g} m", metres=metres)
 
 
 def compose(grid: list[list[Frame]], *, title: str, subtitle: str = "",
@@ -1407,7 +1407,7 @@ def compose(grid: list[list[Frame]], *, title: str, subtitle: str = "",
                     (fx(ax0), fy(ay0)), (fx(ax1), fy(ay1)),
                     transform=fig.transFigure, arrowstyle="-|>",
                     mutation_scale=14, color=INK_DIM, lw=1.4))
-                fig.text(fx(x + fw - 16), fy(y + fh - 12), "потік",
+                fig.text(fx(x + fw - 16), fy(y + fh - 12), "flow",
                          color=INK_DIM, fontsize=10, va="bottom", ha="right")
 
     if bar is not None:
@@ -1489,23 +1489,23 @@ def slice_report(views: list[CaseView], *, field: str, axis: int = 1,
                            arrows=arrows)
               for v in views]
     fs = views[0].fs
-    head = tr("{v}зріз {AXES} = {v2:.0f} мм,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", AXES=AXES[axis], v2=pos * 1000, u_inf=fs.u_inf)
+    head = tr("{v}slice {AXES} = {v2:.0f} mm,   U∞ = {u_inf:g} m/s", v=f"{name} — " if name else "", AXES=AXES[axis], v2=pos * 1000, u_inf=fs.u_inf)
     if subtitle is None:
         cut = sorted({n for f in frames for n in f.cut})
         missed = sorted({n for f in frames for n in f.missed} - set(cut))
         lines = [spec.about] if spec.about else []
         if cut:
-            note = tr("контур: {cut}", cut=", ".join(cut))
+            note = tr("contour: {cut}", cut=", ".join(cut))
             if missed:
-                note += tr(" — {missed} на цій відстані вже не перетинається", missed=", ".join(missed))
+                note += tr(" — {missed} no longer intersects at this distance", missed=", ".join(missed))
             lines.append(note)
         if arrows:
             # Масштаб стрілок — з першого кейса: свій у кожного означав би, що
             # однакові стрілки в двох кадрах — різні швидкості.
             ref = Sampler(views[0].volume, views[0].bodies, axis).inplane_ref(fs)
-            lines.append(tr("стрілки — швидкість у площині зрізу; стрілка в "
-                         "клітинку = {ref:.3g} м/с; червоні — повітря йде "
-                         "проти потоку (відрив)", ref=ref))
+            lines.append(tr("arrows — velocity in the slice plane; arrow "
+                            "per grid square = {ref:.3g} m/s; red — the "
+                            "air goes against the flow (separation)", ref=ref))
         subtitle = "\n".join(lines)
     return compose([[f] for f in frames], title=head, subtitle=subtitle,
                    bar=(spec, lim[0], lim[1]), path=path)
@@ -1613,12 +1613,17 @@ def trace(volume, seeds: np.ndarray, *, length: float,
     `direction` — "forward" (за потоком), "backward" (звідки прийшло) або
     "both". Кожна точка отримує швидкість SPEED — для розфарбування."""
     if direction not in ("forward", "backward", "both"):
-        raise ValueError(tr("невідомий напрямок ліній: {direction!r}", direction=direction))
+        raise ValueError(tr("unknown line direction: {direction!r}", direction=direction))
     lines = volume.streamlines_from_source(
         pv.PolyData(np.asarray(seeds, dtype=float)), vectors="U",
         integration_direction=direction, max_length=float(length),
         initial_step_length=0.5, step_unit="cl", max_step_length=1.0,
-        terminal_speed=1e-2, max_steps=200000, compute_vorticity=False)
+        terminal_speed=1e-2, max_steps=200000, compute_vorticity=False,
+        # Пошук комірки — локатором, а не «кроком від сусідньої точки»:
+        # на шарі проміжного результату другий губив комірку посеред домену,
+        # і лінії обривалися за 0.2–0.5 м (2026-11-11, case_jet: медіана
+        # довжини 0.46 м → 2.98 м). На повній сітці — так само або краще.
+        interpolator_type="cell")
     if lines.n_points:
         lines.point_data[SPEED] = np.linalg.norm(
             np.asarray(lines.point_data["U"], dtype=float), axis=1)
@@ -1634,17 +1639,17 @@ def trace(volume, seeds: np.ndarray, *, length: float,
 # коли кнопку миші ВІДПУСТИЛИ, а не на кожному кроці перетягування.
 
 SEED_MODES = (
-    ("auto", "Гвинти й перед носом"),
-    ("nose", "Перед носом"),
-    ("rotors", "Від гвинтів"),
-    ("line", "Відрізок — тягнути у вікні"),
-    ("sphere", "Куля — тягнути у вікні"),
-    ("slice", "На площині зрізу"),
+    ("auto", "Propellers and in front of the nose"),
+    ("nose", "In front of the nose"),
+    ("rotors", "From the propellers"),
+    ("line", "Line segment — drag in the view"),
+    ("sphere", "Sphere — drag in the view"),
+    ("slice", "On the slice plane"),
 )
 SEED_DIRECTIONS = (
-    ("forward", "За потоком"),
-    ("both", "В обидва боки"),
-    ("backward", "Проти потоку"),
+    ("forward", "Downstream"),
+    ("both", "Both ways"),
+    ("backward", "Upstream"),
 )
 SEED_COUNT = 75            # 25 × 3 — гребінка, яка була до вибору
 SEED_DRAGGABLE = ("line", "sphere")
@@ -1753,8 +1758,9 @@ def seed_points(seeding: Seeding, bounds: tuple, fs: Freestream,
     rotors = list(rotors or [])
     count = max(int(seeding.count), 1)
     if mode == "rotors" and not rotors:
-        raise ValueError("У кейсі немає гвинтів (обертових зон) — сіяти від "
-                         "них нема звідки. Виберіть інше місце.")
+        raise ValueError(tr("The case has no propellers (rotating zones) — "
+                         "there is nothing to seed from. Select a "
+                         "different place."))
     if mode in ("auto", "nose", "rotors"):
         pts = [rotor_seeds(r, fs) for r in rotors] if mode != "nose" else []
         if mode != "rotors":
@@ -1774,32 +1780,33 @@ def seed_points(seeding: Seeding, bounds: tuple, fs: Freestream,
         return ball_seeds(centre, radius, count)
     if mode == "slice":
         if seeding.plane is None:
-            raise ValueError("Площину зрізу не задано.")
+            raise ValueError(tr("The slice plane is not set."))
         axis, pos = seeding.plane
         return plane_seeds(int(axis), float(pos), bounds, count)
-    raise ValueError(tr("невідоме місце насіння: {mode!r}", mode=mode))
+    raise ValueError(tr("unknown seed place: {mode!r}", mode=mode))
 
 
 def seed_label(seeding: Seeding | None, rotors=()) -> str:
     """Підпис «засів: …» для кадру звіту — словами, як у смузі керування."""
     mode = seeding.mode if seeding is not None else "auto"
     if mode == "auto":
-        text = ("кільця перед дисками гвинтів і гребінка перед носом"
-                if rotors else "гребінка перед носом")
+        text = (tr("rings in front of the propeller disks and a rake in front of the nose")
+                if rotors else tr("rake in front of the nose"))
     elif mode == "nose":
-        text = "гребінка перед носом"
+        text = tr("rake in front of the nose")
     elif mode == "rotors":
-        text = "кільця перед дисками гвинтів"
+        text = tr("rings in front of the propeller disks")
     elif mode == "line":
-        text = "відрізок"
+        text = tr("line segment")
     elif mode == "sphere":
-        text = "куля"
+        text = tr("sphere")
     else:
         axis = int(seeding.plane[0]) if seeding.plane else 0
         pos = float(seeding.plane[1]) if seeding.plane else 0.0
-        text = tr("площина {upper} = {v:g} мм", upper=AXES[axis].upper(), v=pos * 1000)
+        text = tr("plane {upper} = {v:g} mm", upper=AXES[axis].upper(), v=pos * 1000)
     if seeding is not None and seeding.direction != "forward":
-        text += ", " + dict(SEED_DIRECTIONS)[seeding.direction].lower()
+        text += ", " + tr(dict(SEED_DIRECTIONS)[seeding.direction]).map(
+            str.lower)
     return text
 
 
@@ -1816,7 +1823,7 @@ class SeedWidget:
                  line: tuple | None = None, centre=None,
                  radius: float | None = None, on_change=None):
         if kind not in SEED_DRAGGABLE:
-            raise ValueError(tr("тягнути можна лише {SEED_DRAGGABLE}: {kind!r}", SEED_DRAGGABLE=SEED_DRAGGABLE, kind=kind))
+            raise ValueError(tr("only {SEED_DRAGGABLE} can be dragged: {kind!r}", SEED_DRAGGABLE=SEED_DRAGGABLE, kind=kind))
         self.kind = kind
         self.plotter = plotter
         self._on_change = on_change
@@ -1931,7 +1938,7 @@ class StreamScene:
 
     def __init__(self, plotter, lines, *, limits: tuple | None = None,
                  line_width: float = 2.0, bar: bool = True,
-                 vertical: bool = False, label: str = "швидкість U,  м/с"):
+                 vertical: bool = False, label: str = "speed U,  m/s"):
         self.plotter = plotter
         self.lines = lines
         self.limits = limits or stream_limits(lines)
@@ -1944,7 +1951,7 @@ class StreamScene:
                 lighting=False, name="fs_streams", show_scalar_bar=False,
                 reset_camera=False, render=False)
             if bar:
-                self._bar_title = _unique_title(plotter, label)
+                self._bar_title = _unique_title(plotter, tr(label))
                 # Уздовж низу вже стоїть шкала зрізу, якщо він увімкнений, —
                 # тоді шкала ліній іде вертикально ліворуч.
                 place = (dict(vertical=True, position_x=0.03, position_y=0.22,
@@ -2080,7 +2087,7 @@ def case_streamlines(volume, bodies: dict, fs: Freestream, rotors=(), *,
     носом (`across` × `levels`). З `seeding` — там, де вибрала людина.
     """
     if "U" not in volume.point_data:
-        raise ValueError("У обʼємі немає швидкості U — ліній потоку не буде.")
+        raise ValueError(tr("The volume has no velocity U — there will be no streamlines."))
     bounds = bodies_bounds(volume, bodies)
     lo3, hi3 = np.asarray(bounds[0::2]), np.asarray(bounds[1::2])
     direction = "forward"
@@ -2091,11 +2098,79 @@ def case_streamlines(volume, bodies: dict, fs: Freestream, rotors=(), *,
     else:
         seeds = seed_points(seeding, bounds, fs, rotors)
         direction = seeding.direction
+    plane = stream_plane(volume)
+    if plane is not None:
+        seeds = plane_only_seeds(seeds, plane, bounds, fs, seeding,
+                                 across * levels)
     # Довжина ліній — втричі більша за тіло вздовж потоку: цього досить, щоб
     # було видно слід, а далі лінії лише витрачають час і кадр.
     reach = stream_reach(lo3, hi3, fs.direction)
-    return trace(volume, seeds, length=length or 3.0 * reach,
-                 direction=direction)
+    lines = trace(volume, seeds, length=length or 3.0 * reach,
+                  direction=direction)
+    # Скільки насінин дали лінію: решта — у тілі чи поза доменом (чи поза
+    # 3D-вибіркою проміжного результату). Вікно це каже словами.
+    lines.field_data[SEED_COUNT_KEY] = np.array([len(seeds)])
+    return lines
+
+
+# Мітка шару «швидкість лише в одній площині» (fs_live.PLANE_MARK) і
+# кількість насінин у field_data ліній.
+STREAM_PLANE = "fs_stream_plane"
+SEED_COUNT_KEY = "fs_seeds"
+
+
+def stream_plane(volume) -> tuple | None:
+    """(вісь, позиція), якщо швидкість в обʼємі є лише в одній площині."""
+    try:
+        got = np.asarray(volume.field_data[STREAM_PLANE], dtype=float)
+    except (KeyError, AttributeError):
+        return None
+    return (int(got[0]), float(got[1])) if got.size >= 2 else None
+
+
+def started_lines(lines) -> int:
+    """Скільки насінин дали лінію (у «обидва боки» насінина дає дві)."""
+    if not lines.n_cells or "SeedIds" not in lines.cell_data:
+        return int(lines.n_cells)
+    return int(np.unique(np.asarray(lines.cell_data["SeedIds"])).size)
+
+
+def plane_only_seeds(seeds, plane: tuple, bounds: tuple, fs: Freestream,
+                     seeding: Seeding | None, count: int) -> np.ndarray:
+    """Насінини для обʼєму, де швидкість є лише в площині `plane`.
+
+    Насінина поза площиною лінії не дає, тож усе переноситься на площину.
+    Гребінка перед носом і площина зрізу при перенесенні злиплися б у кілька
+    точок, тому їх ставимо наново, у самій площині: рядок упоперек потоку
+    перед носом і рівна сітка на площині.
+    """
+    axis, pos = plane
+    mode = seeding.mode if seeding is not None else "auto"
+    n = max(int(seeding.count if seeding is not None else count), 2)
+    if mode == "slice":
+        return plane_seeds(axis, pos, bounds, n)
+    pts = np.array(seeds, dtype=float)
+    if mode in ("auto", "nose"):
+        d = _unit(fs.direction)
+        normal = np.zeros(3)
+        normal[axis] = 1.0
+        across = np.cross(d, normal)
+        if np.linalg.norm(across) < 1e-9:
+            across = np.roll(normal, 1)
+        across = _unit(across)
+        lo, hi = np.asarray(bounds[0::2], float), np.asarray(bounds[1::2], float)
+        corners = np.array([[x, y, z] for x in (lo[0], hi[0])
+                            for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+        centre = 0.5 * (lo + hi)
+        along = (corners - centre) @ d
+        side = (corners - centre) @ across
+        origin = centre + d * (along.min() - 0.08 * max(np.ptp(along), 1e-9))
+        t = np.linspace(side.min() * 1.3, side.max() * 1.3, n)
+        pts = origin + t[:, None] * across
+    pts[:, axis] = pos
+    # Перенесені точки можуть збігтися (кільця гвинта, куля).
+    _, keep = np.unique(np.round(pts, 9), axis=0, return_index=True)
+    return pts[np.sort(keep)]
 
 
 def streams_report(views: list[CaseView], *, rotors: list[Rotor] | None = None,
@@ -2136,11 +2211,11 @@ def streams_report(views: list[CaseView], *, rotors: list[Rotor] | None = None,
         grid.append(row)
     fs = views[0].fs
     spec = replace(spec_by_key("umag"),
-                   label=tr("швидкість U,  м/с      (набігаючий потік {u_inf:g})", u_inf=fs.u_inf))
+                   label=tr("speed U,  m/s      (freestream {u_inf:g})", u_inf=fs.u_inf))
     seeded = seed_label(seeding, rotors)
-    head = tr("{v}лінії потоку,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", u_inf=fs.u_inf)
-    cols = (tr("гвинт «{name}» зблизька", name=rotors[0].name) if rotors else "3D", "згори")
-    return compose(grid, title=head, subtitle=tr("засів: {seeded}", seeded=seeded),
+    head = tr("{v}streamlines,   U∞ = {u_inf:g} m/s", v=f"{name} — " if name else "", u_inf=fs.u_inf)
+    cols = (tr("propeller “{name}” close up", name=rotors[0].name) if rotors else "3D", "top")
+    return compose(grid, title=head, subtitle=tr("seeding: {seeded}", seeded=seeded),
                    bar=(spec, limits[0], limits[1]), col_labels=cols, path=path)
 
 
@@ -2187,21 +2262,23 @@ UNTOUCHED = "#5b636d"
 
 # Підписи полів тіла у вікні. Масиви звуться латиницею (так їх шукає VTK), а
 # людині показується назва з одиницями.
-SEP_TITLE = tr("Відрив")        # коротко: це й підпис вертикальної шкали,
-DRAG_TITLE = tr("Опір граней, Па")  # а довша назва там обрізається
+# The titles are also the values of the field combo box of the window (its
+# item data), thus they are not translated here: tr() where they are shown.
+SEP_TITLE = "Separation"            # коротко: це й підпис вертикальної шкали,
+DRAG_TITLE = "Face drag, Pa"  # а довша назва там обрізається
 BODY_FIELDS = {SEP_TITLE: SEP, DRAG_TITLE: DRAG}
 
 SEP_SPEC = FieldSpec(
     "sep", SEP_TITLE,
-    "пристінкова течія відносно потоку:   −1 назад  ·  0 упоперек  ·  +1 уздовж",
+    "near-wall flow relative to the stream:   −1 backward  ·  0 across  ·  +1 along",
     "diverging", "fs_sep", (WALL_TAU,),
-    "червоне — повітря біля стінки біжить проти потоку: тут течія відірвалася")
+    "red — the air near the wall moves against the flow: the flow has separated here")
 DRAG_SPEC = FieldSpec(
     "drag", DRAG_TITLE,
-    "внесок у опір: (тиск + тертя) уздовж потоку,  Па",
+    "contribution to drag: (pressure + friction) along the flow,  Pa",
     "diverging", "fs_diverging", ("p",),
-    "теплий — грань тягне тіло назад (опір), синій — штовхає вперед "
-    "(підсмоктування на носі, тяга)")
+    "warm — the face pulls the body back (drag), blue — pushes it "
+    "forward (suction at the nose, thrust)")
 
 
 @lru_cache(maxsize=1)
@@ -2346,7 +2423,7 @@ def part_loads(bodies: dict, fs: Freestream, rotors=()):
         m.cell_data[ROTOR] = np.full(m.n_cells, 1 if rotor else 0, dtype=np.int8)
         meshes.append(m)
     if not meshes:
-        raise ValueError("У кейсі немає поверхні тіла — показувати нічого.")
+        raise ValueError(tr("The case has no body surface — nothing to show."))
     body = meshes[0] if len(meshes) == 1 else meshes[0].merge(
         meshes[1:], merge_points=False)
     return body, sum_loads(frame), sum_loads(spin)
@@ -2401,7 +2478,7 @@ def _cell_volume(volume, ids: np.ndarray) -> float:
 def reverse_flow(volume, fs: Freestream, level: float = REVERSE_LEVEL) -> Blobs:
     """Бульбашки зворотної течії: ізоповерхня U·ê∞ = −level·U∞."""
     if "U" not in volume.point_data:
-        raise ValueError("У обʼємі немає швидкості U — зворотної течії не знайти.")
+        raise ValueError(tr("The volume has no velocity U — reverse flow cannot be found."))
     d = _unit(fs.direction)
     u = max(fs.u_inf, 1e-9)
     volume.point_data[REVERSE] = np.asarray(volume.point_data["U"], dtype=float) @ d / u
@@ -2508,7 +2585,7 @@ def loss_blobs(volume, fs: Freestream, level: float = LOSS_LEVEL,
     обрізається коробкою за тілом (`wake_box`) і біля стінки (`strip_wall`);
     `gap` — типово 2% найбільшого розміру тіла."""
     if not all(a in volume.point_data for a in ("U", "p")):
-        raise ValueError("У обʼємі немає U чи p — повного тиску не порахувати.")
+        raise ValueError(tr("The volume has no U or p — total pressure cannot be computed."))
     total_pressure_loss(volume, fs)
     wake = volume.contour([level], scalars=LOSS, compute_normals=True,
                           compute_scalars=False)
@@ -2550,8 +2627,8 @@ def wall_lines(body, *, count: int = 600, length: float | None = None):
     (приєднання). Тут те саме з поля тертя: лінії біжать за −τ.
     """
     if NEAR not in body.point_data:
-        raise ValueError("На тілі немає wallShearStress — напрямок пристінкової "
-                         "течії взяти нізвідки.")
+        raise ValueError(tr("The body has no wallShearStress — there is no "
+                         "source for the near-wall flow direction."))
     import fs_fast
     if fs_fast.has("surface_lines"):
         return wall_lines_rs(body, count=count, length=length)
@@ -2669,7 +2746,7 @@ def wall_lines_rs(body, *, count: int = 600, length: float | None = None):
 WASH = "fs_wash"
 WASH_RINGS = (0.3, 0.5, 0.7, 0.9)        # частки радіуса — усі ВСЕРЕДИНІ диска
 WASH_PER_RING = (6, 10, 14, 18)
-THIRDS = ("передня третина", "середня третина", "задня третина (хвіст)")
+THIRDS = ("front third", "middle third", "rear third (tail)")
 
 
 @dataclass
@@ -2733,10 +2810,10 @@ def prop_wash(volume, bodies: dict, fs: Freestream, rotors, *,
               near: float | None = None, length: float | None = None) -> WashReach:
     """Лінії від дисків гвинтів і те, яких частин тіла вони торкаються."""
     if "U" not in volume.point_data:
-        raise ValueError("У обʼємі немає швидкості U — ліній обдуву не буде.")
+        raise ValueError(tr("The volume has no velocity U — there will be no wash lines."))
     rotors = list(rotors or [])
     if not rotors:
-        raise ValueError("У кейсі немає гвинтів — обдуву нема звідки пускати.")
+        raise ValueError(tr("The case has no propellers — there is nothing to start the wash from."))
     zones, split = wash_zones(bodies, rotors, fs)
     seeds = np.vstack([rotor_seeds(r, fs, rings=WASH_RINGS,
                                    per_ring=WASH_PER_RING, standoff=0.15)
@@ -2829,14 +2906,14 @@ def wash_text(w: WashReach) -> list[tuple[str, str]]:
     for colour, name in zip(wash_colors(len(w.zones)), w.zones):
         share = w.shares[name]
         top, bottom, side = w.sides.get(name, (0, 0, 0))
-        text = tr("{name}: {v:.0f}% ліній", name=name, v=share * 100)
+        text = tr("{name}: {v:.0f}% of lines", name=name, v=share * 100)
         if share > 0:
             bits = [f"{lbl} {v * 100:.0f}%" for lbl, v in
-                    (("згори", top), ("знизу", bottom), ("збоку", side)) if v > 0]
+                    (("top", top), ("bottom", bottom), ("side", side)) if v > 0]
             text += "  (" + ", ".join(bits) + ")"
         out.append((colour, text))
-    out.append((UNTOUCHED, tr("ще не торкнулася жодної частини  ·  «торкнулася» — "
-                           "ближче за {v:.0f} мм", v=w.near * 1000)))
+    out.append((UNTOUCHED, tr("has not touched any part yet  ·  "
+                              "“touched” — closer than {v:.0f} mm", v=w.near * 1000)))
     return out
 
 
@@ -2950,34 +3027,35 @@ class Overlay:
 
 def reverse_note(b: Blobs) -> str:
     if not b.cells:
-        return "зворотної течії в обʼємі немає (швидше за 2% U∞ назад — ніде)"
-    return (tr("зворотна течія: ≈ {v:.3g} см³ повітря йде назад "
-            "({cells} комірок)", v=b.volume * 1e6, cells=b.cells))
+        return tr("no reverse flow in the volume (faster than 2% U∞ backward — nowhere)")
+    return (tr("reverse flow: ≈ {v:.3g} cm³ of air goes backward "
+               "({cells} cells)", v=b.volume * 1e6, cells=b.cells))
 
 
 def loads_note(loads: SurfaceLoads, fs: Freestream, a_ref: float = 0.0,
                rotors: SurfaceLoads | None = None) -> str:
     """Рядок про суму по поверхні — тим самим числом, що й Cd у forceCoeffs."""
-    who = "планер" if rotors is not None else "сума по поверхні"
-    text = (tr("{who}: опір {drag:.4g} Н = тиск "
-            "{pressure:.4g} + тертя {friction:.4g}", who=who, drag=loads.drag, pressure=loads.pressure, friction=loads.friction))
+    who = tr("airframe") if rotors is not None else tr("sum over the surface")
+    text = (tr("{who}: drag {drag:.4g} N = pressure {pressure:.4g} + "
+               "friction {friction:.4g}", who=who, drag=loads.drag, pressure=loads.pressure, friction=loads.friction))
     if a_ref > 0:
         text += f",  Cd = {loads.cd(fs.dynamic_pressure, a_ref):.5f}"
     if not loads.has_friction:
-        text += "  (тертя в кейсі не записане — лише тиск)"
+        text += tr("  (friction is not written in the case — pressure only)")
     if rotors is not None:
-        text += (tr(";   гвинти вздовж потоку: {drag:+.4g} Н"
-                 " (мінус — тяга)", drag=rotors.drag))
+        text += (tr(";   propellers along the flow: {drag:+.4g} N (minus "
+                    "= thrust)", drag=rotors.drag))
     return text
 
 
 def separation_note(loads: SurfaceLoads) -> str:
     if not loads.has_friction:
-        return ("відриву на поверхні не показати: у моменті немає "
-                "wallShearStress (функція не була ввімкнена в прогоні)")
+        return (tr("cannot show separation on the surface: the moment has "
+                "no wallShearStress (the function was not enabled in the "
+                "run)"))
     share = loads.separated / loads.area if loads.area > 0 else 0.0
-    return (tr("пристінкова течія йде назад на {v:.1f}% поверхні "
-            "({v2:.3g} см²)", v=share * 100, v2=loads.separated * 1e4))
+    return (tr("near-wall flow goes backward on {v:.1f}% of the surface "
+               "({v2:.3g} cm²)", v=share * 100, v2=loads.separated * 1e4))
 
 
 # --- кадри тіла --------------------------------------------------------------
@@ -3080,7 +3158,7 @@ def render_body_frame(body, fs: Freestream, *, view: str, field: str | None = No
 def _merged(bodies: dict):
     parts = [m for m in (bodies or {}).values() if m is not None and m.n_points]
     if not parts:
-        raise ValueError("У кейсі немає поверхні тіла — показувати нічого.")
+        raise ValueError(tr("The case has no body surface — nothing to show."))
     return parts[0].copy() if len(parts) == 1 else parts[0].merge(
         parts[1:], merge_points=False)
 
@@ -3109,14 +3187,15 @@ def stall_report(view: CaseView, *, name: str = "", path: str | None = None,
     field = SEP if has_tau else None
     frames = [[render_body_frame(body, fs, view=v, field=field, blobs=tuple(blobs),
                                  lines=tuple(lines), size=size, label=lbl)
-               for v, lbl in (("top", "згори"), ("iso", "3D"))]]
-    head = tr("{v}де течія відривається,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", u_inf=fs.u_inf)
-    legend = [(REVERSE_COLOR, tr("червоні бульбашки — зворотна течія в обʼємі "
-                              "(U∥ < −{v:g}% U∞)", v=REVERSE_LEVEL * 100))]
+               for v, lbl in (("top", "top"), ("iso", "3D"))]]
+    head = tr("{v}where the flow separates,   U∞ = {u_inf:g} m/s", v=f"{name} — " if name else "", u_inf=fs.u_inf)
+    legend = [(REVERSE_COLOR, tr("red bubbles — reverse flow in the "
+                                 "volume (U∥ < −{v:g}% U∞)", v=REVERSE_LEVEL * 100))]
     if lines:
         legend.append((INK_DIM,
-                       "темні лінії на тілі — куди біжить повітря біля стінки "
-                       "(як олія в аеротрубі): сходяться — лінія відриву"))
+                       tr("dark lines on the body — where the air near the "
+                       "wall moves (like oil in a wind tunnel): where "
+                       "they converge — separation line")))
     return compose(frames, title=head, subtitle="\n".join(notes),
                    bar=(SEP_SPEC, -1.0, 1.0) if field else None,
                    legend=tuple(legend), path=path)
@@ -3130,7 +3209,7 @@ def drag_report(view: CaseView, *, name: str = "", a_ref: float = 0.0,
     fs = view.fs
     body, loads, spin = part_loads(view.bodies, fs, rotors)
     if loads is None:
-        raise ValueError("На тілі немає тиску на гранях — опору не скласти.")
+        raise ValueError(tr("The body has no face pressure — drag cannot be summed."))
     lim = drag_limits(body)
     blobs = []
     notes = [loads_note(loads, fs, a_ref, spin)]
@@ -3142,18 +3221,19 @@ def drag_report(view: CaseView, *, name: str = "", a_ref: float = 0.0,
     # Слід — окремим кадром у 3D, де видно, куди він тягнеться.
     row = [render_body_frame(body, fs, view=v, field=DRAG, limits=lim,
                              size=size, label=lbl)
-           for v, lbl in (("top", "згори"), ("bottom", "знизу"))]
+           for v, lbl in (("top", "top"), ("bottom", "bottom"))]
     if blobs:
         row.append(render_body_frame(body, fs, view="iso", field=DRAG,
                                      limits=lim, blobs=tuple(blobs), size=size,
-                                     label="3D, зі слідом"))
+                                     label="3D, with wake"))
     frames = [row]
-    head = tr("{v}звідки береться опір,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", u_inf=fs.u_inf)
+    head = tr("{v}where the drag comes from,   U∞ = {u_inf:g} m/s", v=f"{name} — " if name else "", u_inf=fs.u_inf)
     legend = []
     if blobs:
-        legend.append((LOSS_COLOR, tr("блакитна оболонка — слід: повітря "
-                                   "загубило понад {v:g}% "
-                                   "напору (сюди йде робота опору)", v=LOSS_LEVEL * 100)))
+        legend.append((LOSS_COLOR, tr("light-blue shell — wake: the air "
+                                      "has lost more than {v:g}% of its "
+                                      "total pressure (this is where the "
+                                      "drag work goes)", v=LOSS_LEVEL * 100)))
     return compose(frames, title=head, subtitle="\n".join(notes),
                    bar=(DRAG_SPEC, lim[0], lim[1]),
                    legend=tuple(legend), path=path)
@@ -3172,13 +3252,13 @@ def wash_report(view: CaseView, rotors, *, name: str = "",
     frames = [render_body_frame(body, view.fs, view=v, wash=w,
                                 zones={**zones, **rot}, size=size, label=lbl,
                                 behind=0.3)
-              for v, lbl in (("iso", "3D"), ("top", "згори"))]
-    head = tr("{v}куди йде обдув гвинтів,   U∞ = {u_inf:g} м/с", v=f"{name} — " if name else "", u_inf=view.fs.u_inf)
-    sub = (tr("{seeds} ліній від дисків {n_rotors} гвинт(ів), кільця "
-           "{join} радіуса; колір лінії — "
-           "частина, якої вона вже торкнулася", seeds=w.seeds, n_rotors=len(rotors), join=', '.join('%g' % r for r in WASH_RINGS)))
+              for v, lbl in (("iso", "3D"), ("top", "top"))]
+    head = tr("{v}where the propeller wash goes,   U∞ = {u_inf:g} m/s", v=f"{name} — " if name else "", u_inf=view.fs.u_inf)
+    sub = (tr("{seeds} lines from the disks of {n_rotors} propeller(s), "
+              "rings at {join} of the radius; line color — the part it "
+              "has already touched", seeds=w.seeds, n_rotors=len(rotors), join=', '.join('%g' % r for r in WASH_RINGS)))
     if w.split:
-        sub += "\nтіло — один патч, тож поділене на третини вздовж потоку"
+        sub += tr("\nthe body is one patch, so it is divided into thirds along the flow")
     return compose([frames], title=head, subtitle=sub,
                    legend=tuple(wash_text(w)), path=path)
 
@@ -3202,8 +3282,8 @@ def wash_report(view: CaseView, rotors, *, name: str = "",
 
 CASE_COLORS = ("#3987e5", "#d95926", "#199e70", "#c98500")
 PART_STYLES = ("-", (0, (5, 2)), (0, (1.5, 2)), (0, (5, 2, 1.5, 2)))
-VERDICT_TEXT = {"ok": "усталилося", "osc": "коливання", "drift": "не добіг",
-                "few": "мало точок"}
+VERDICT_TEXT = {"ok": "settled", "osc": "oscillation", "drift": "did not finish",
+                "few": "few points"}
 GRID = "#2c2c2a"           # сітка й осі: суцільні волоски, майже тло
 AXIS = "#383835"
 
@@ -3227,14 +3307,14 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
 
     import fs_post as post
 
-    names = {"Cd": "Cd — опір", "Cl": "Cl — підйомна сила",
-             "CmPitch": "Cm — момент тангажа"}
+    names = {"Cd": "Cd — drag", "Cl": "Cl — lift",
+             "CmPitch": "Cm — pitching moment"}
     panels = []          # (заголовок, [(номер кейса, підпис, штрих, точки)])
     for q in quantities:
         rows = [(i, "", PART_STYLES[0], c.series[q])
                 for i, c in enumerate(cases) if len(c.series.get(q, ())) > 1]
         if rows:
-            panels.append((tr("{q}, сумарно", q=names.get(q, q)), rows))
+            panels.append((tr("{q}, total", q=names.get(q, q)), rows))
     for q in quantities:
         rows = []
         for i, c in enumerate(cases):
@@ -3243,16 +3323,18 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
                 if len(pts) > 1:
                     rows.append((i, part, PART_STYLES[k % len(PART_STYLES)], pts))
         if rows and len({r[1] for r in rows}) > 1:
-            panels.append((tr("{q}, по частинах", q=names.get(q, q)), rows))
+            panels.append((tr("{q}, by part", q=names.get(q, q)), rows))
     if not panels:
-        raise ValueError("Немає рядів коефіцієнтів: у postProcessing/forceCoeffs "
-                         "порожньо або кейс ще не рахувався.")
+        raise ValueError(tr("No coefficient series: "
+                         "postProcessing/forceCoeffs is empty or the "
+                         "case has not run yet."))
     if len({c.steady for c in cases}) > 1:
         # Стаціонарний рахується ітераціями (сотні), нестаціонарний — секундами
         # (соті): на одній осі другий стискається в цятку біля нуля, і графік
         # виходить «правдоподібним», але нічого не показує.
-        raise ValueError("Стаціонарні й нестаціонарні кейси не можна класти на "
-                         "одну вісь: у них різні одиниці (ітерації й секунди).")
+        raise ValueError(tr("Steady and transient cases cannot go on one "
+                         "axis: they have different units (iterations "
+                         "and seconds)."))
 
     w, h = size
     fig = Figure(figsize=(w / dpi, h / dpi), dpi=dpi, facecolor="#000000")
@@ -3260,11 +3342,11 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
     top = 0.13
     gap, bottom = 0.045, 0.085
     ph = (1.0 - top - bottom - gap * (len(panels) - 1)) / len(panels)
-    fig.text(40 / w, 1 - 40 / h, tr("{v}сили за ітераціями", v=f"{name} — " if name else ""), color=INK, fontsize=15.5,
+    fig.text(40 / w, 1 - 40 / h, tr("{v}forces by iteration", v=f"{name} — " if name else ""), color=INK, fontsize=15.5,
              fontweight="bold", va="top", ha="left")
     fig.text(40 / w, 1 - 74 / h,
-             "світла смуга праворуч — вікно, за яким береться середнє; "
-             "суцільна — сумарно, штрих — окрема частина",
+             "light band on the right — the window used for the mean; "
+             "solid — total, dashed — a single part",
              color=INK_DIM, fontsize=10.5, va="top", ha="left")
 
     for i, (title, rows) in enumerate(panels):
@@ -3296,7 +3378,7 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
             mean = float(arr[cut_at:, 1].mean())
             mark, _ = post.coeff_verdict(list(map(tuple, arr)), steady=c.steady)
             label = c.label + (f" · {part}" if part else "")
-            verdict = ("розійшовся (є nan/inf)" if diverged
+            verdict = (tr("diverged (nan/inf present)") if diverged
                        else VERDICT_TEXT.get(mark, mark))
             label += f":  {mean:+.4f},  {verdict}"
             ax.plot(arr[:, 0], arr[:, 1], color=colour, lw=1.7, ls=style,
@@ -3305,7 +3387,7 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
                        lw=0)
             tails.append(arr[len(arr) // 4:, 1])
         if not tails:
-            ax.text(0.5, 0.5, "немає скінченних значень", color=INK_DIM,
+            ax.text(0.5, 0.5, "no finite values", color=INK_DIM,
                     ha="center", va="center", transform=ax.transAxes)
             continue
         both = np.concatenate(tails)
@@ -3317,7 +3399,7 @@ def history_report(cases: list[HistoryCase], *, name: str = "",
         ax.legend(loc="center left", bbox_to_anchor=(1.015, 0.5), frameon=False,
                   fontsize=9.5, labelcolor=INK_DIM, handlelength=2.6)
         if i == len(panels) - 1:
-            ax.set_xlabel("ітерація" if cases[0].steady else "час, с",
+            ax.set_xlabel(tr("iteration") if cases[0].steady else tr("time, s"),
                           color=INK_DIM, fontsize=10.5)
         else:
             ax.tick_params(labelbottom=False)

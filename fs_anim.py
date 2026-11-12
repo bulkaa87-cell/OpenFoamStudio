@@ -38,15 +38,15 @@ from fs_i18n import tr
 # Поля на тілі: ключ → (підпис шкали, симетрична шкала, звідки береться).
 BODY_FIELDS = {
     "cp": ("Cp", True),
-    "dp": ("p − p∞,  Па", True),
+    "dp": ("p − p∞,  Pa", True),
     "yplus": ("y+", False),
-    "tau": ("|τ стінки|,  Па", False),
+    "tau": ("|τ wall|,  Pa", False),
 }
 BODY_TITLES = {
-    "cp": "Коефіцієнт тиску  Cp",
-    "dp": "Тиск  p − p∞",
-    "yplus": "y+ на стінці",
-    "tau": "Тертя на стінці  |τ|",
+    "cp": "Pressure coefficient  Cp",
+    "dp": "Pressure  p − p∞",
+    "yplus": "y+ at the wall",
+    "tau": "Wall friction  |τ|",
 }
 # Поля зрізу — ті самі, що й у статичному зрізі, крім розміру комірки
 # (він від часу не залежить).
@@ -231,26 +231,27 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
     case = plan.case_dir
     times = list(plan.times)
     if not times:
-        raise ValueError("Не вибрано жодного моменту часу.")
+        raise ValueError(tr("No time moment is selected."))
     tvals = [float(t) for t in times]
     frames = Frames(times=tvals, axis=plan.axis)
 
-    _say(say, "читаю сітку першого кадру", 0.0)
+    _say(say, tr("reading the mesh of the first frame"), 0.0)
     volume = results.internal(tvals[0])
     if volume is None:
-        raise ValueError(tr("У моменті {times} немає сітки з полями.", times=times[0]))
+        raise ValueError(tr("The moment {times} has no mesh with fields.", times=times[0]))
     n_cells = fs_fast.n_cells(case, times[0])
     moving = fs_fast.mesh_moves(case, times)
     fast = (not force_vtk and not moving and n_cells == volume.n_cells
             and all((Path(case) / t).is_dir() for t in times))
     frames.fast = fast
     if moving:
-        frames.notes.append("Сітка змінюється від кадру до кадру (рух чи "
-                            "адаптація) — кожен кадр читається повністю, "
-                            "повільніше.")
+        frames.notes.append(tr("The mesh changes from frame to frame "
+                            "(motion or adaptation) — each frame is read "
+                            "in full, slower."))
     elif not fast and not force_vtk:
-        frames.notes.append("Кількість комірок у полях і в сітці VTK "
-                            "різна — читаю через VTK, повільніше.")
+        frames.notes.append(tr("The cell count in the fields and in the VTK "
+                            "mesh is different — reading through VTK, "
+                            "slower."))
 
     # --- геометрія тіла ---------------------------------------------------
     walls = [w for w in plan.walls]
@@ -273,12 +274,13 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
             owners = fs_fast.patch_owner_cells(case, walls, times[0])
             if any(owners.get(w) is None or owners[w].size != body_n[w]
                    for w in walls):
-                frames.notes.append("Грані тіла у VTK і в сітці не "
-                                    "збіглися — тіло читаю через VTK.")
+                frames.notes.append(tr("The body faces in VTK and in the "
+                                    "mesh did not match — reading the "
+                                    "body through VTK."))
                 owners = None
         except (OSError, ValueError) as exc:
-            frames.notes.append(tr("Власники граней не прочиталися ({exc}) — "
-                                "тіло через VTK.", exc=exc))
+            frames.notes.append(tr("Face owners could not be read "
+                                   "({exc}) — body through VTK.", exc=exc))
             owners = None
 
     # --- геометрія зрізу --------------------------------------------------
@@ -359,7 +361,7 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
                 try:
                     lines = fv.case_streamlines(pt, bodies, fs, rotors)
                 except Exception as exc:                  # noqa: BLE001
-                    frames.notes.append(tr("Лінії кадру {times}: {exc}", times=times[i], exc=exc))
+                    frames.notes.append(tr("Lines of frame {times}: {exc}", times=times[i], exc=exc))
                     lines = pv.PolyData()
                 if lines.n_points and "U" in lines.point_data:
                     lines.point_data[ANIM] = np.linalg.norm(
@@ -373,7 +375,7 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
         patch_req = [(w, body_n[w]) for w in walls]
         for a in range(0, total, CHUNK):
             chunk = times[a:a + CHUNK]
-            _say(say, tr("кадри {v}–{v2} з {total}", v=a + 1, v2=a + len(chunk), total=total),
+            _say(say, tr("frames {v}–{v2} of {total}", v=a + 1, v2=a + len(chunk), total=total),
                  a / max(total, 1))
             paths, index = [], []
             for t in chunk:
@@ -394,10 +396,10 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
                 frame_from(internal, patch_vals, a + j)
     else:
         for i, t in enumerate(tvals):
-            _say(say, tr("кадр {v} з {total} (через VTK)", v=i + 1, total=total), i / max(total, 1))
+            _say(say, tr("frame {v} of {total} (through VTK)", v=i + 1, total=total), i / max(total, 1))
             vol = results.internal(t)
             if vol is None:
-                raise ValueError(tr("У моменті {times} немає полів.", times=times[i]))
+                raise ValueError(tr("The moment {times} has no fields.", times=times[i]))
             internal = {n: np.asarray(vol.cell_data[n]) for n in names
                         if n in vol.cell_data}
             patch_vals = {}
@@ -410,7 +412,7 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
                         patch_vals[(n, w)] = np.asarray(pm.cell_data[n])
             frame_from(internal, patch_vals, i, vol if moving else None)
 
-    _say(say, "шкали", 0.98)
+    _say(say, tr("scales"), 0.98)
     for k, arrs in frames.body_vals.items():
         sym = BODY_FIELDS[k][1]
         frames.limits["body:" + k] = common_limits(
@@ -423,14 +425,14 @@ def prepare(plan: Plan, results, fs, *, rotors=(), say=None,
         frames.limits["streams"] = common_limits(
             [s.point_data[ANIM] for s in frames.streams
              if s.n_points and ANIM in s.point_data], False, floor=0.0)
-    _say(say, "готово", 1.0)
+    _say(say, "done", 1.0)
     return frames
 
 
 def reslice(frames: Frames, pos: float, fs) -> None:
     """Рухомий зріз: нова площина без нового читання (сирі поля в памʼяті)."""
     if frames.volume is None or not frames.raw:
-        raise ValueError("Кадри підготовлено без «рухомого зрізу».")
+        raise ValueError(tr("Frames were prepared without “moving slice”."))
     sl = _slice_geometry(frames.volume, frames.axis, pos)
     frames.slices = [sl]
     frames.pos = float(pos)

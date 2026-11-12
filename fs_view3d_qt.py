@@ -17,6 +17,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 import fs_view3d as v3
 from fs_i18n import tr
+import fs_i18n
+
+# The Qt text setters translate and keep the key of each text, also in a
+# widget that is made before the main window (T28).
+fs_i18n.install()
 
 Qt = QtCore.Qt
 
@@ -96,8 +101,9 @@ class GpuWidget(QtWidgets.QWidget):
             try:
                 r = v3.make_renderer(v3.Level(lv.level, note=lv.note), hwnd, w, h, font,
                                      kind=self._kind or "win32")
-                self.setToolTip(tr("3D: {backend} не дав поверхню вікна "
-                                   "({error}); малює {adapter}", backend=lv.backend,
+                self.setToolTip(tr("3D: {backend} did not give a window "
+                                   "surface ({error}); drawing with "
+                                   "{adapter}", backend=lv.backend,
                                    error=self.error, adapter=r.adapter))
                 return r
             except BaseException as exc:                  # noqa: BLE001
@@ -114,7 +120,7 @@ class GpuWidget(QtWidgets.QWidget):
                     raise
                 self.error = f"{self.error}; {exc}"
         if lv.level != "cpu":
-            self._to_cpu(tr("{text} не створився: {error}", text=lv.text(), error=self.error))
+            self._to_cpu(tr("{text} was not created: {error}", text=lv.text(), error=self.error))
             return v3.make_renderer(self.pl.level, None, w, h, font)
         return None
 
@@ -153,7 +159,7 @@ class GpuWidget(QtWidgets.QWidget):
                 p.fillRect(self.rect(), QtGui.QColor("#22262b"))
                 p.setPen(QtGui.QColor("#e8e8e8"))
                 p.drawText(self.rect(), Qt.AlignCenter,
-                           tr("3D недоступне: {v}", v=self.error or tr("немає foamview")))
+                           tr("3D is not available: {v}", v=self.error or tr("no foamview")))
             return
         if self._native:
             self._draw()
@@ -189,7 +195,7 @@ class GpuWidget(QtWidgets.QWidget):
         self.setToolTip("3D: " + self.error)
         self.gpu = None
         if self._retried and self.pl.level.level != "cpu":
-            self._to_cpu(tr("GPU відмовив двічі: {error}", error=self.error))
+            self._to_cpu(tr("GPU failed twice: {error}", error=self.error))
         self._retried = True
         self.update()
 

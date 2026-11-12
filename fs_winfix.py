@@ -93,16 +93,18 @@ def available() -> bool:
 def why_not() -> str:
     """Чому кнопка неактивна — людськими словами."""
     if sys.platform != "win32":
-        return ("Ремонт службою Netfabb є лише у Windows: це частина самої "
-                "системи, а не бібліотека програми. З тієї самої причини "
-                "кнопки «Fix model» немає в Bambu Studio й PrusaSlicer на "
-                "Linux і macOS. Тут лишаються інші методи в меню "
-                "«Полагодити»: meshfix, alpha wrap, обʼємна перебудова.")
-    return (tr("Не встановлено пакунки WinRT. У теці програми:\n\n    pip "
-               "install winrt-Windows.Graphics.Printing3D "
-               "winrt-Windows.Storage.Streams\n\nСама служба ремонту вже є "
-               "у Windows — ці пакунки лише дають до неї доступ із "
-               "Python."))
+        return (tr("Repair with the Netfabb service exists only in Windows: "
+                "it is a part of the system itself, not a program "
+                "library. For the same reason, Bambu Studio and "
+                "PrusaSlicer have no “Fix model” button on Linux and "
+                "macOS. Here the other methods in the “Repair” menu stay "
+                "available: meshfix, alpha wrap, volume rebuild."))
+    return (tr("The WinRT packages are not installed. In the program "
+               "folder:\n\n    pip install "
+               "winrt-Windows.Graphics.Printing3D "
+               "winrt-Windows.Storage.Streams\n\nThe repair service itself "
+               "is already in Windows — these packages only give access "
+               "to it from Python."))
 
 
 # --------------------------------------------------------------------------
@@ -193,7 +195,7 @@ def _from_3mf(data: bytes) -> pv.PolyData:
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         names = [n for n in z.namelist() if n.lower().endswith(".model")]
         if not names:
-            raise RuntimeError("служба повернула пакунок без моделі")
+            raise RuntimeError(tr("the service returned a package without a model"))
         root = ET.fromstring(z.read(names[0]))
 
     meshes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -213,7 +215,7 @@ def _from_3mf(data: bytes) -> pv.PolyData:
 
     def collect(oid: str, matrix: np.ndarray, depth: int = 0) -> None:
         if depth > 16:
-            raise RuntimeError("у моделі кільце посилань між обʼєктами")
+            raise RuntimeError(tr("the model has a reference loop between objects"))
         if oid in meshes:
             pts, tri = meshes[oid]
             placed.append((_apply(pts, matrix), tri))
@@ -231,7 +233,7 @@ def _from_3mf(data: bytes) -> pv.PolyData:
             collect(oid, np.eye(4))
     placed = [(p, t) for p, t in placed if len(p) and len(t)]
     if not placed:
-        raise RuntimeError("служба повернула порожню модель")
+        raise RuntimeError(tr("the service returned an empty model"))
 
     offset, all_pts, all_tri = 0, [], []
     for pts, tri in placed:
@@ -275,9 +277,9 @@ async def _run(payload: bytes, say) -> bytes:
     package = Printing3D3MFPackage()
     model = await package.load_model_from_package_async(
         await as_stream(payload))
-    say("ремонт службою Windows — на 250 тис. трикутників близько пів хвилини")
+    say(tr("repair with the Windows service — about half a minute for 250 k triangles"))
     await model.repair_async()
-    say("читаю полагоджену модель")
+    say(tr("reading the repaired model"))
     await package.save_model_to_package_async(model)
     return await to_bytes(await package.save_async())
 
@@ -290,11 +292,11 @@ def repair(mesh: pv.PolyData, say=None) -> pv.PolyData:
     """
     say = say or (lambda _text: None)
     if mesh is None or mesh.n_cells == 0:
-        raise ValueError("Нема чого лагодити: у моделі жодного трикутника.")
+        raise ValueError(tr("Nothing to repair: the model has no triangles."))
     if not available():
         raise RuntimeError(why_not())
 
-    say("готую пакунок для служби ремонту")
+    say(tr("preparing the package for the repair service"))
     payload = _to_3mf(mesh)
     try:
         out = _from_3mf(asyncio.run(_run(payload, say)))
@@ -302,10 +304,10 @@ def repair(mesh: pv.PolyData, say=None) -> pv.PolyData:
         # Служба говорить кодами COM. Текст у них буває англійський і
         # невиразний, тому лишаємо його поруч, а не замість пояснення.
         raise RuntimeError(
-            tr("Служба ремонту Windows відмовила: {v}.\n\nНайчастіше це "
-               "завелика модель або вимкнена служба. Спробуйте спершу "
-               "«Проріднити…», або виберіть інший метод у меню "
-               "«Полагодити»: meshfix чи alpha wrap.", v=getattr(exc, 'strerror', None) or exc)) from exc
+            tr("The Windows repair service refused: {v}.\n\nMost often the "
+               "model is too large or the service is disabled. Try "
+               "“Decimate…” first, or select another method in the "
+               "“Repair” menu: meshfix or alpha wrap.", v=getattr(exc, 'strerror', None) or exc)) from exc
     if out.n_cells == 0:
-        raise RuntimeError("Після ремонту не лишилося жодного трикутника.")
+        raise RuntimeError(tr("No triangles are left after the repair."))
     return out

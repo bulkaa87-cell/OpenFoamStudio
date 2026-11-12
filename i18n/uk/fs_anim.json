@@ -1,0 +1,21 @@
+{
+ "Face owners could not be read ({exc}) — body through VTK.": "Власники граней не прочиталися ({exc}) — тіло через VTK.",
+ "Frames were prepared without “moving slice”.": "Кадри підготовлено без «рухомого зрізу».",
+ "Lines of frame {times}: {exc}": "Лінії кадру {times}: {exc}",
+ "No time moment is selected.": "Не вибрано жодного моменту часу.",
+ "Pressure  p − p∞": "Тиск  p − p∞",
+ "Pressure coefficient  Cp": "Коефіцієнт тиску  Cp",
+ "The body faces in VTK and in the mesh did not match — reading the body through VTK.": "Грані тіла у VTK і в сітці не збіглися — тіло читаю через VTK.",
+ "The cell count in the fields and in the VTK mesh is different — reading through VTK, slower.": "Кількість комірок у полях і в сітці VTK різна — читаю через VTK, повільніше.",
+ "The mesh changes from frame to frame (motion or adaptation) — each frame is read in full, slower.": "Сітка змінюється від кадру до кадру (рух чи адаптація) — кожен кадр читається повністю, повільніше.",
+ "The moment {times} has no fields.": "У моменті {times} немає полів.",
+ "The moment {times} has no mesh with fields.": "У моменті {times} немає сітки з полями.",
+ "Wall friction  |τ|": "Тертя на стінці  |τ|",
+ "frame {v} of {total} (through VTK)": "кадр {v} з {total} (через VTK)",
+ "frames {v}–{v2} of {total}": "кадри {v}–{v2} з {total}",
+ "p − p∞,  Pa": "p − p∞,  Па",
+ "reading the mesh of the first frame": "читаю сітку першого кадру",
+ "scales": "шкали",
+ "y+ at the wall": "y+ на стінці",
+ "|τ wall|,  Pa": "|τ стінки|,  Па"
+}

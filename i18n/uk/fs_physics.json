@@ -1,0 +1,20 @@
+{
+ "Largest contribution — {name}: {value} cells ({share:.0%} of all).": "Найбільший внесок — {name}: {value} комірок ({share:.0%} від усіх).",
+ "background mesh": "фонова сітка",
+ "buffer layer — the worst zone for wall functions": "буферний шар — найгірша зона для пристінних функцій",
+ "far beyond the log layer": "далеко за лог-шаром",
+ "log layer, wall functions work": "лог-шар, пристінні функції працюють",
+ "prism layers": "призматичні шари",
+ "refinement boxes": "коробки згущення",
+ "resolved sublayer": "розвʼязаний підшар",
+ "surface refinement": "рефайнмент поверхні",
+ "too high, wall function accuracy drops": "зависоко, точність пристінних функцій падає",
+ "viscous sublayer": "вʼязкий підшар",
+ "{metres:.4g} m": "{metres:.4g} м",
+ "{v:.0f} k": "{v:.0f} тис.",
+ "{v:.1f} B": "{v:.1f} млрд",
+ "{v:.1f} nm": "{v:.1f} нм",
+ "{v:.1f} µm": "{v:.1f} мкм",
+ "{v:.2f} M": "{v:.2f} млн",
+ "{v:.3g} mm": "{v:.3g} мм"
+}

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>MeshFix Studio</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#16233F" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="4"/>
+  <path d="M82 125 L174 125 L128 206 Z" fill="#4ADE80"/>
+  <g fill="none" stroke="#F4F7FB" stroke-width="14" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M128 44 L220 206 L36 206 Z"/>
+    <path d="M82 125 L174 125 L128 206 Z"/>
+  </g>
+</svg>

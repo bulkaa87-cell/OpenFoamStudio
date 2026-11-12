@@ -118,7 +118,7 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
     import copy
 
     if mem is None:
-        host = memfit.MemHost("цей компʼютер", ram_gb, RAM_HEADROOM)
+        host = memfit.MemHost("this computer", ram_gb, RAM_HEADROOM)
         mem = lambda c: memfit.memory_fit(c.estimate(), host)   # noqa: E731
 
     new = copy.deepcopy(cfg)
@@ -134,13 +134,13 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
     # встигнути «випустити» з домену, інакше вихід ріже його впоперек.
     slender = span / max(L, 1e-9)
     downstream = 15.0 if slender > 1.5 else 12.0
-    _add(tips, "Домен", "Позаду", cfg.domain.downstream, downstream,
-         ("слід за тілом із великим розмахом довший — беремо 15 довжин"
-          if slender > 1.5 else "12 довжин вистачає, щоб слід вирівнявся"))
+    _add(tips, "Domain", tr("Downstream", ctx="domain"), cfg.domain.downstream, downstream,
+         ("the wake behind a body with a large span is longer — we use 15 lengths"
+          if slender > 1.5 else "12 lengths are enough for the wake to settle"))
     new.domain.downstream = downstream
 
-    _add(tips, "Домен", "Попереду", cfg.domain.upstream, 5.0,
-         "5 довжин попереду: ближче вхід уже впливає на тиск біля носа")
+    _add(tips, "Domain", tr("Upstream", ctx="domain"), cfg.domain.upstream, 5.0,
+         "5 lengths upstream: a closer inlet already affects the pressure near the nose")
     new.domain.upstream = 5.0
 
     # ------------------------------------------------- комірка на поверхні
@@ -176,26 +176,27 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
                 # Тесселяція настільки груба, що обмежує не точність, а сенс:
                 # на 24 комірки вздовж тіла форми крила вже не видно.
                 notes.append(("bad", (
-                    tr("STL надто грубий: його тесселяція дозволяє лише "
-                    "~{cells_per_L:.0f} комірок на довжину тіла, а для "
-                    "аеродинаміки треба від 100. Натисніть «Згустити» на "
-                    "вкладці «Геометрія» або перезбережіть STL з меншим "
-                    "відхиленням.", cells_per_L=cells_per_L))))
+                    tr("The STL is too coarse: its tessellation allows "
+                       "only ~{cells_per_L:.0f} cells per body length, "
+                       "and aerodynamics needs 100 or more. Click "
+                       "“Refine” on the “Geometry” tab or save the STL "
+                       "again with a smaller deviation.", cells_per_L=cells_per_L))))
             else:
                 notes.append(("info", (
-                    tr("Комірку обмежено знизу тесселяцією STL "
-                    "({stl_edge} коротке ребро трикутника): "
-                    "дрібніша сітка вже не додасть форми, лише часу.", stl_edge=phys.fmt_len(stl_edge)))))
+                    tr("The cell size is limited from below by the STL "
+                       "tessellation ({stl_edge} short triangle edge): a "
+                       "finer mesh will not add shape any more, only "
+                       "time.", stl_edge=phys.fmt_len(stl_edge)))))
 
     # Дірки: комірка має бути БІЛЬШОЮ за найбільшу дірку, інакше протече.
     if diag is not None and diag.hole_sizes:
         biggest = diag.largest_hole
         if biggest > target_surface:
             notes.append(("bad", (
-                tr("Найбільша дірка {biggest} більша за потрібну "
-                "комірку {target_surface}. Сітка протече. "
-                "Або залатайте STL, або свідомо загрубіть поверхню до "
-                "{fmt_len} — але тоді форма розмиється.", biggest=phys.fmt_len(biggest), target_surface=phys.fmt_len(target_surface), fmt_len=phys.fmt_len(biggest * 1.5)))))
+                tr("The largest hole {biggest} is larger than the "
+                   "required cell {target_surface}. The mesh will leak. "
+                   "Either patch the STL, or make the surface coarser on "
+                   "purpose to {fmt_len} — but then the shape will blur.", biggest=phys.fmt_len(biggest), target_surface=phys.fmt_len(target_surface), fmt_len=phys.fmt_len(biggest * 1.5)))))
 
     # -------------------------------------------- рівень і фонова комірка
     level = 5
@@ -220,28 +221,26 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
         new.mesh.surface_level_max -= 1
         new.mesh.surface_level_min = max(1, new.mesh.surface_level_max - 1)
         new.mesh.feature_level = new.mesh.surface_level_max
-        what = "snappyHexMesh" if w.stage == "snappy" else "розвʼязувач"
+        what = "snappyHexMesh" if w.stage == "snappy" else tr("solver")
         notes.append(("warn", (
-            tr("Рівень рефайнменту знижено до {surface_level_max}: "
-            "на попередньому {what} не влазив на {name} "
-            "(~{need_gb:.1f} ГБ, під задачу "
-            "{budget_gb} з "
-            "{ram_gb} ГБ).", surface_level_max=new.mesh.surface_level_max, what=what, name=w.host.name, need_gb=w.need_gb, budget_gb=memfit.fmt_gb(w.host.budget_gb), ram_gb=memfit.fmt_gb(w.host.ram_gb)))))
+            tr("Refinement level lowered to {surface_level_max}: at the "
+               "previous level, {what} did not fit on {name} "
+               "(~{need_gb:.1f} GB, with {budget_gb} of {ram_gb} GB "
+               "available for the job).", surface_level_max=new.mesh.surface_level_max, what=what, name=w.host.name, need_gb=w.need_gb, budget_gb=memfit.fmt_gb(w.host.budget_gb), ram_gb=memfit.fmt_gb(w.host.ram_gb)))))
 
-    _add(tips, "Сітка", "Рівень поверхні", cfg.mesh.surface_level_max,
+    _add(tips, "Mesh", "Surface level", cfg.mesh.surface_level_max,
          new.mesh.surface_level_max,
-         tr("комірка на поверхні {surface_cell} ≈ "
-         "L/{v:.0f}", surface_cell=phys.fmt_len(new.surface_cell), v=L / max(new.surface_cell, 1e-12)))
-    _add(tips, "Домен", "Комірок уздовж X", cfg.domain.base_cells_along_x, n_x,
-         tr("фонова комірка {base_cell}; "
-         "рівень {surface_level_max} доводить її до потрібної", base_cell=phys.fmt_len(new.base_cell), surface_level_max=new.mesh.surface_level_max))
+         tr("surface cell {surface_cell} ≈ L/{v:.0f}", surface_cell=phys.fmt_len(new.surface_cell), v=L / max(new.surface_cell, 1e-12)))
+    _add(tips, "Domain", "Cells along X", cfg.domain.base_cells_along_x, n_x,
+         tr("background cell {base_cell}; level {surface_level_max} "
+            "brings it to the required size", base_cell=phys.fmt_len(new.base_cell), surface_level_max=new.mesh.surface_level_max))
 
     # ----------------------------------------------------- кромки й шари
     dirty = _is_assembly(diag)
     included = 170 if dirty else 150
-    _add(tips, "Сітка", "includedAngle", cfg.mesh.included_angle, included,
-         ("на збірці з перетинних деталей менший кут дає сміттєві кромки"
-          if dirty else "150° — стандарт для чистої геометрії"))
+    _add(tips, "Mesh", "includedAngle", cfg.mesh.included_angle, included,
+         ("on an assembly of intersecting parts, a smaller angle gives junk edges"
+          if dirty else "150° — the standard for clean geometry"))
     new.mesh.included_angle = included
 
     auto = target_yplus is None
@@ -257,8 +256,8 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
     if diag is not None and not diag.closed and diag.largest_hole > new.surface_cell:
         # Нема сенсу нарощувати шари на поверхні, крізь яку тече.
         new.mesh.add_layers = False
-        _add(tips, "Сітка", "Шари", cfg.mesh.n_layers, 0,
-             "поки STL протікає, шари не наростуть — спершу геометрія",
+        _add(tips, "Mesh", "Layers", cfg.mesh.n_layers, 0,
+             "while the STL leaks, layers will not grow — fix the geometry first",
              level="warn")
     else:
         new.mesh.add_layers = True
@@ -285,11 +284,12 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
         layer_cap = 5 if messy else 25
         if messy:
             notes.append(("info", (
-                tr("Шарів не більше {layer_cap}: у геометрії {parts} частин "
-                "і {non_manifold_edges} non-manifold ребер. На такій "
-                "поверхні snappy нарощує шари плямами, і чим більше їх "
-                "просити, тим менше граней їх отримає (виміряно: 3 шари дають "
-                "79% покриття, 10 шарів — 37%).", layer_cap=layer_cap, parts=diag.parts, non_manifold_edges=diag.non_manifold_edges))))
+                tr("No more than {layer_cap} layers: the geometry has "
+                   "{parts} parts and {non_manifold_edges} non-manifold "
+                   "edges. On such a surface snappy grows layers in "
+                   "patches, and the more layers you ask for, the fewer "
+                   "faces get them (measured: 3 layers give 79% "
+                   "coverage, 10 layers — 37%).", layer_cap=layer_cap, parts=diag.parts, non_manifold_edges=diag.non_manifold_edges))))
 
         best = None
         for final_rel in (0.5, 0.4, 0.3, 0.25, 0.2, 0.15):
@@ -325,29 +325,29 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
                 notes.append(("bad" if pick.level == "error" else "warn",
                               pick.problem))
             if abs(new.mesh.expansion - cfg.mesh.expansion) > 1e-9:
-                _add(tips, "Сітка", "expansionRatio", cfg.mesh.expansion,
+                _add(tips, "Mesh", "expansionRatio", cfg.mesh.expansion,
                      new.mesh.expansion,
-                     "інакше перший шар не дотягнеться до потрібного y+ "
-                     "у межах кількості шарів")
+                     "otherwise the first layer will not reach the "
+                     "required y+ within the number of layers")
 
         got_yplus = _predicted_yplus(new, target_yplus)
         if got_yplus > target_yplus * 4:
             notes.append(("warn", (
-                tr("Цільового y+ {target_yplus:.0f} досягти не вдається: виходить "
-                "{got_yplus:.0f}. Перший шар упирається у розмір поверхневої "
-                "комірки ({surface_cell}). Підніміть рівень "
-                "рефайнменту або зменшіть finalLayerThickness з "
-                "{final_layer_rel:.2f} до 0.2.", target_yplus=target_yplus, got_yplus=got_yplus, surface_cell=phys.fmt_len(new.surface_cell), final_layer_rel=new.mesh.final_layer_rel))))
+                tr("The target y+ {target_yplus:.0f} cannot be reached: "
+                   "the result is {got_yplus:.0f}. The first layer is "
+                   "limited by the surface cell size ({surface_cell}). "
+                   "Raise the refinement level or decrease "
+                   "finalLayerThickness from {final_layer_rel:.2f} to "
+                   "0.2.", target_yplus=target_yplus, got_yplus=got_yplus, surface_cell=phys.fmt_len(new.surface_cell), final_layer_rel=new.mesh.final_layer_rel))))
 
-        _add(tips, "Сітка", "finalLayerThickness", cfg.mesh.final_layer_rel,
+        _add(tips, "Mesh", "finalLayerThickness", cfg.mesh.final_layer_rel,
              new.mesh.final_layer_rel,
-             "тонший останній шар робить увесь стек тоншим, не жертвуючи "
-             "тонкістю першого — так y+ і товщина стеку миряться")
-        _add(tips, "Сітка", "Шарів", cfg.mesh.n_layers, new.mesh.n_layers,
-             tr("дає y+ ≈ {new:.0f} "
-             "при цільовому {target_yplus:.0f}; стек "
-             "{u_inf:.0%} "
-             "пограншару", new=_predicted_yplus(new, target_yplus), target_yplus=target_yplus, u_inf=new.layer_stack.covers_bl(cfg.flow.u_inf, cfg.flow.l_ref or L, cfg.flow.nu)))
+             "a thinner last layer makes the whole stack thinner without "
+             "giving up a thin first layer — this way y+ and the stack "
+             "thickness agree")
+        _add(tips, "Mesh", tr("Layers", ctx="count"), cfg.mesh.n_layers, new.mesh.n_layers,
+             tr("gives y+ ≈ {new:.0f} at the target {target_yplus:.0f}; "
+                "the stack is {u_inf:.0%} of the boundary layer", new=_predicted_yplus(new, target_yplus), target_yplus=target_yplus, u_inf=new.layer_stack.covers_bl(cfg.flow.u_inf, cfg.flow.l_ref or L, cfg.flow.nu)))
 
     # ------------------------------------------------------- розвʼязувач
     est = new.estimate()
@@ -355,14 +355,14 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
     # і прогін від цього не пришвидшується.
     usable = cores - 2 if cores > 4 else cores
     n_procs = max(1, min(usable, max(1, est.total // 40_000)))
-    _add(tips, "Розвʼязувач", "Процесів", cfg.solver.n_procs, n_procs,
-         tr("{replace} комірок на процес; з {cores} ядер два лишаємо системі", replace=f"~{est.total // max(n_procs, 1):,}".replace(",", " "), cores=cores))
+    _add(tips, "Solver", tr("Processes", ctx="count"), cfg.solver.n_procs, n_procs,
+         tr("{replace} cells per process; of {cores} cores, two are left to the system", replace=f"~{est.total // max(n_procs, 1):,}".replace(",", " "), cores=cores))
     new.solver.n_procs = n_procs
 
     iters = 1000 if est.total < 1_000_000 else 2000
-    _add(tips, "Розвʼязувач", "Ітерацій", cfg.solver.n_iterations, iters,
-         "стаціонарний SIMPLE на такій сітці зазвичай сходиться раніше — "
-         "зупинить residualControl")
+    _add(tips, "Solver", "Iterations", cfg.solver.n_iterations, iters,
+         "steady SIMPLE on such a mesh usually converges sooner — "
+         "residualControl will stop it")
     new.solver.n_iterations = iters
     new.solver.write_interval = iters
 
@@ -372,15 +372,16 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
         # домену, а не пропонуємо число з голови.
         flight = new.flow_through_time
         end = _round_nice(flight * 4)
-        _add(tips, "Розвʼязувач", "Кінцевий час", cfg.solver.end_time, end,
-             tr("чотири прольоти домену ({flight:.3g} с кожен): перший іде на "
-             "те, щоб потік дійшов до тіла, решта — на формування сліду", flight=flight))
+        _add(tips, "Solver", "End time", cfg.solver.end_time, end,
+             tr("four domain flow-throughs ({flight:.3g} s each): the "
+                "first one is for the flow to reach the body, the rest "
+                "are for the wake to form", flight=flight))
         new.solver.end_time = end
 
         every = _round_nice(end / 40.0)
-        _add(tips, "Розвʼязувач", "Запис кожні", cfg.solver.write_every, every,
-             "сорок часових зрізів — досить, щоб побачити рух, і не стільки, "
-             "щоб забити диск")
+        _add(tips, "Solver", "Write every", cfg.solver.write_every, every,
+             "forty time steps — enough to see the motion, and not so "
+             "many that they fill the disk")
         new.solver.write_every = every
 
         # Початковий крок беремо від комірки на поверхні: Куранта на ній і
@@ -388,18 +389,19 @@ def advise(cfg: fc.CaseCfg, diag, ram_gb: float = 8.0,
         # встиг нічого підібрати.
         dt = _round_nice(new.surface_cell / max(new.flow.u_inf, 1e-9) * 0.5)
         dt = min(dt, every / 10.0)
-        _add(tips, "Розвʼязувач", "Початковий крок", cfg.solver.time_step, dt,
-             "половина Куранта на поверхневій комірці — далі крок веде "
-             "adjustTimeStep сам")
+        _add(tips, "Solver", "Initial time step", cfg.solver.time_step, dt,
+             "half a Courant number on the surface cell — after that "
+             "adjustTimeStep controls the step itself")
         new.solver.time_step = dt
 
     # Двоетапність: що швидший потік, то довший стійкий розгін.
     u = cfg.flow.u_inf
     robust = 150 if u <= 40 else (300 if u <= 90 else 500)
-    _add(tips, "Розвʼязувач", "Стійких ітерацій", cfg.solver.robust_iterations,
+    _add(tips, "Solver", "Robust iterations", cfg.solver.robust_iterations,
          robust,
-         tr("при {u:.0f} м/с типові схеми другого порядку зриваються в перші "
-         "десятки ітерацій; стільки перших рахуємо upwind-ом", u=u))
+         tr("at {u:.0f} m/s, typical second-order schemes diverge in the "
+            "first few dozen iterations; we run this many first "
+            "iterations with upwind", u=u))
     new.solver.robust_iterations = robust
 
     # ------------------------------------------------------------ нотатки
@@ -446,29 +448,31 @@ def _flow_notes(cfg: fc.CaseCfg, diag, notes: list, target_yplus: float,
     est = cfg.estimate()
 
     notes.append(("info", (
-        tr("Re = {re:.3g}, M = {ma:.2f}, оцінка сітки {total} комірок. "
-           "Памʼять: {join}.", re=re, ma=ma, total=phys.fmt_cells(est.total), join="; ".join(ln.strip() for ln
+        tr("Re = {re:.3g}, M = {ma:.2f}, mesh estimate {total} cells. "
+           "Memory: {join}.", re=re, ma=ma, total=phys.fmt_cells(est.total), join="; ".join(ln.strip() for ln
                                    in fit.details().splitlines()[1:])))))
     if fit.verdict == "unknown":
         notes.append(("warn", fit.warning().lstrip("ℹ ")))
 
     if ma > 0.3 and not f.compressible:
         notes.append(("warn", (
-            tr("M = {ma:.2f}: стисливість уже помітна, а simpleFoam її не "
-            "бачить і занижує опір. Перемкніть режим течії на стисливий — "
-            "кейс піде через rhoSimpleFoam.", ma=ma))))
+            tr("M = {ma:.2f}: compressibility is already noticeable, but "
+               "simpleFoam does not see it and underestimates drag. "
+               "Switch the flow mode to compressible — the case will go "
+               "through rhoSimpleFoam.", ma=ma))))
     elif f.compressible and ma < 0.3:
         # Не помилка, але й не безкоштовно: стисливий SIMPLE релаксує густину
         # на 0.01, і на ту саму збіжність йому треба в рази більше ітерацій.
         notes.append(("info", (
-            tr("M = {ma:.2f}: стисливість тут нічого не змінює, а стисливий "
-            "розвʼязувач збігається помітно повільніше. Якщо швидкість не "
-            "зростатиме, нестислива дасть той самий результат швидше.", ma=ma))))
+            tr("M = {ma:.2f}: compressibility changes nothing here, and "
+               "a compressible solver converges noticeably slower. If "
+               "the speed does not increase, the incompressible mode "
+               "will give the same result faster.", ma=ma))))
     elif f.compressible and ma > 0.8:
         notes.append(("warn", (
-            tr("M = {ma:.2f}: це вже трансзвук. rhoSimpleFoam стаціонарний і "
-            "на ударних хвилях ненадійний — для такого потрібен "
-            "rhoCentralFoam, якого в цій версії немає.", ma=ma))))
+            tr("M = {ma:.2f}: this is already transonic. rhoSimpleFoam "
+               "is steady and not reliable on shock waves — this needs "
+               "rhoCentralFoam, which is not in this version.", ma=ma))))
 
     # Модель переходу має сенс лише на розвʼязаному пограншарі: вона рахує,
     # ДЕ ламінарне тече в турбулентне, а пристінна функція саме цю ділянку й
@@ -483,23 +487,24 @@ def _flow_notes(cfg: fc.CaseCfg, diag, notes: list, target_yplus: float,
     if not chk.ok:
         fix = "; ".join(label for _, _, label in chk.fixes)
         notes.append(("bad" if chk.level == "error" else "warn",
-                      chk.text + (tr(" Що зробити: {fix}.", fix=fix) if fix else "")))
+                      chk.text + (tr(" What to do: {fix}.", fix=fix) if fix else "")))
     if (phys.is_transitional(re)
             and fy.model_family(f.turbulence) != "transition"):
-        common = (tr("Re = {re:.2g} нижче 5·10⁵: пограншар частково ламінарний, "
-                  "а RAS вважає його турбулентним усюди й завищує опір тертя.", re=re))
+        common = (tr("Re = {re:.2g} is below 5·10⁵: the boundary layer "
+                     "is partly laminar, but RAS treats it as turbulent "
+                     "everywhere and overestimates skin friction drag.", re=re))
         if resolved:
-            notes.append(("warn", tr("{common} Сітка вже розвʼязує "
-                                     "стінку (y+ ≈ {yp_now:.1f}), тож "
-                                     "тут варто взяти kOmegaSSTLM — вона "
-                                     "рахує перехід замість того, щоб "
-                                     "його ігнорувати.", common=common, yp_now=yp_now)))
+            notes.append(("warn", tr("{common} The mesh already resolves "
+                                     "the wall (y+ ≈ {yp_now:.1f}), so "
+                                     "here it is better to use "
+                                     "kOmegaSSTLM — it calculates the "
+                                     "transition instead of ignoring it.", common=common, yp_now=yp_now)))
         else:
-            notes.append(("warn", tr("{common} Полагодити це може "
-                                     "kOmegaSSTLM, але вона вимагає y+ ≈ "
-                                     "1, а зараз виходить {yp_now:.0f}: "
-                                     "спершу дрібніший перший шар, і аж "
-                                     "потім модель переходу.", common=common, yp_now=yp_now)))
+            notes.append(("warn", tr("{common} kOmegaSSTLM can fix this, "
+                                     "but it needs y+ ≈ 1, and now the "
+                                     "result is {yp_now:.0f}: first make "
+                                     "the first layer finer, and only "
+                                     "then use the transition model.", common=common, yp_now=yp_now)))
 
     if cfg.mesh.add_layers:
         yp = _predicted_yplus(cfg, target_yplus)
@@ -511,10 +516,10 @@ def _flow_notes(cfg: fc.CaseCfg, diag, notes: list, target_yplus: float,
         rest = max(delta - st.total, 0.0)
         cells_above = rest / cfg.surface_cell if cfg.surface_cell > 0 else 0
 
-        msg = (tr("Очікуваний y+ ≈ {yp:.0f} — {label}. Стек шарів "
-               "{total} накриває {cover:.0%} пограншару "
-               "({delta}), решту тримають ~{cells_above:.1f} "
-               "звичайних комірок.", yp=yp, label=label, total=phys.fmt_len(st.total), cover=cover, delta=phys.fmt_len(delta), cells_above=cells_above))
+        msg = (tr("Expected y+ ≈ {yp:.0f} — {label}. The layer stack "
+                  "{total} covers {cover:.0%} of the boundary layer "
+                  "({delta}), the rest is held by ~{cells_above:.1f} "
+                  "regular cells.", yp=yp, label=label, total=phys.fmt_len(st.total), cover=cover, delta=phys.fmt_len(delta), cells_above=cells_above))
         # Тонкий стек — це не помилка, а ціна за потрібний y+: щоб перша
         # комірка була тонкою, увесь стек виходить низьким. Тривожно стає
         # тоді, коли над ним на весь зовнішній пограншар лишається менше
@@ -523,25 +528,27 @@ def _flow_notes(cfg: fc.CaseCfg, diag, notes: list, target_yplus: float,
         level = lvl if lvl != "ok" else "info"
         if cells_above < 2.0 and cover < 0.5:
             level = "warn"
-            msg += (" Це замало: підніміть рівень рефайнменту поверхні "
-                    "на одиницю або дозвольте більше шарів.")
+            msg += (tr(" This is too little: raise the surface refinement "
+                    "level by one or allow more layers."))
         notes.append((level, msg))
     else:
         notes.append(("warn", (
-            "Без шарів перша комірка дорівнює поверхневій, y+ буде в сотнях. "
-            "Тиск і форма сліду ще осмислені, опір тертя — ні.")))
+            tr("Without layers, the first cell is equal to the surface "
+            "cell, and y+ will be in the hundreds. Pressure and the wake "
+            "shape still make sense, skin friction drag does not."))))
 
     if diag is not None and diag.bad_winding:
         notes.append(("bad", (
-            tr("{bad_winding} ребер із неузгодженою намоткою. Спершу "
-            "«Полагодити» (метод meshfix): на такій поверхні snappy не може надійно "
-            "сказати, де «всередині», і шари лягають плямами.", bad_winding=diag.bad_winding))))
+            tr("{bad_winding} edges with inconsistent winding. First use "
+               "“Repair” (meshfix method): on such a surface snappy "
+               "cannot reliably tell where “inside” is, and the layers "
+               "grow in patches.", bad_winding=diag.bad_winding))))
     elif diag is not None and diag.inverted_parts:
         notes.append(("warn", (
-            tr("{inverted_parts} частин вивернуті навиворіт "
-            "({flipped_faces} граней). Для шарів це менш болісно, ніж "
-            "для refinementRegions з mode inside, але лагодиться одним "
-            "натиском «Полагодити» (метод meshfix).", inverted_parts=diag.inverted_parts, flipped_faces=diag.flipped_faces))))
+            tr("{inverted_parts} parts are turned inside out "
+               "({flipped_faces} faces). For layers this is less harmful "
+               "than for refinementRegions with mode inside, but one "
+               "click on “Repair” (meshfix method) fixes it.", inverted_parts=diag.inverted_parts, flipped_faces=diag.flipped_faces))))
 
 
 # --------------------------------------------------------------------------
@@ -586,7 +593,7 @@ class LayerDiagnosis:
         if self.effect:
             lines.append(self.effect)
         if self.tips:
-            lines.append(tr("Що підкрутити: {join}.", join="; ".join(
+            lines.append(tr("What to adjust: {join}.", join="; ".join(
                 f"{t.what} {t.current} → {t.suggested}" for t in self.tips)))
         lines.extend(self.notes)
         return "\n".join(lines)
@@ -615,13 +622,13 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
     pct = coverage * 100
 
     if not m.add_layers or m.n_layers <= 0:
-        out.headline = "Шарів не просили — пограншар на «голій» сітці."
+        out.headline = tr("No layers were requested — the boundary layer is on a “bare” mesh.")
         return out
 
     if coverage >= LAYER_FINE:
-        out.headline = tr("Шари наросли на {pct:.0f}% граней — норма.", pct=pct)
+        out.headline = tr("Layers grew on {pct:.0f}% of faces — normal.", pct=pct)
         out.notes.append(
-            "Решта — гострі кромки й стики, де призму нікуди вставити.")
+            tr("The rest are sharp edges and joints where there is no space for a prism."))
         return out
 
     # ---- наслідок, у числах ----
@@ -630,23 +637,24 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
     yp_bare = phys.yplus_for_wall_distance(cfg.surface_cell / 2.0,
                                            f.u_inf, L, f.nu)
     out.effect = (
-        tr("Там, де шарів немає (це {v:.0f}% поверхні), перша комірка "
-        "дорівнює поверхневій — {surface_cell} замість "
-        "{first_abs}, тобто локальний y+ підскакує з "
-        "{yp_layers:.0f} до {yp_bare:.0f}. Опір тертя на цих ділянках "
-        "занижений, і y+ із вкладки «Сітка» для них не має сили.", v=100 - pct, surface_cell=phys.fmt_len(cfg.surface_cell), first_abs=phys.fmt_len(stack.first_abs), yp_layers=yp_layers, yp_bare=yp_bare))
+        tr("Where there are no layers (that is {v:.0f}% of the surface), "
+           "the first cell is equal to the surface cell — {surface_cell} "
+           "instead of {first_abs}, so the local y+ jumps from "
+           "{yp_layers:.0f} to {yp_bare:.0f}. Skin friction drag on "
+           "these areas is too low, and the y+ from the “Mesh” tab is "
+           "not valid for them.", v=100 - pct, surface_cell=phys.fmt_len(cfg.surface_cell), first_abs=phys.fmt_len(stack.first_abs), yp_layers=yp_layers, yp_bare=yp_bare))
 
     if coverage >= LAYER_WORKABLE:
         out.level = "warn"
-        out.headline = (tr("Шари наросли на {pct:.0f}% граней — робоче, але не "
-                        "рівномірно.", pct=pct))
+        out.headline = (tr("Layers grew on {pct:.0f}% of faces — usable, "
+                           "but not uniform.", pct=pct))
     elif coverage >= LAYER_POOR:
         out.level = "warn"
-        out.headline = tr("Шари наросли лише на {pct:.0f}% граней — замало.", pct=pct)
+        out.headline = tr("Layers grew on only {pct:.0f}% of faces — too little.", pct=pct)
     else:
         out.level = "bad"
-        out.headline = (tr("Шари наросли лише на {pct:.0f}% граней — пограншар "
-                        "фактично не розвʼязано.", pct=pct))
+        out.headline = (tr("Layers grew on only {pct:.0f}% of faces — "
+                           "the boundary layer is in fact not resolved.", pct=pct))
 
     # ---- правки ----
     #
@@ -663,16 +671,17 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
     if m.n_layers > 3:
         want = max(3, m.n_layers - 2 if m.n_layers <= 8 else m.n_layers // 2)
         new.mesh.n_layers = want
-        _add(tips, "Сітка", "Шарів", m.n_layers, want,
-             "найдужчий важіль: коротший стек влазить у вужчі місця. "
-             "Виміряно на plane5 — 10 шарів дали 37% покриття, 5 шарів 65%, "
-             "3 шари 79%")
+        _add(tips, "Mesh", tr("Layers", ctx="count"), m.n_layers, want,
+             "the strongest lever: a shorter stack fits into narrower "
+             "places. Measured on plane5 — 10 layers gave 37% coverage, "
+             "5 layers 65%, 3 layers 79%")
 
     if m.expansion > 1.3:
         new.mesh.expansion = 1.3
-        _add(tips, "Сітка", "expansionRatio", m.expansion, 1.3,
-             "зростання швидше за 1.3 робить стек довгим на кількох шарах і "
-             "дає різкий стрибок розміру на виході з нього")
+        _add(tips, "Mesh", "expansionRatio", m.expansion, 1.3,
+             "growth faster than 1.3 makes the stack long with only a "
+             "few layers and gives a sharp jump in size where the stack "
+             "ends")
 
     if tips and cfg.surface_cell > 0:
         # Тримаємо перший шар незмінним: final_rel * cell / exp^(n-1) = const.
@@ -681,17 +690,19 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
         want_final = round(min(max(want_final, 0.05), 1.0), 2)
         if abs(want_final - m.final_layer_rel) >= 0.01:
             new.mesh.final_layer_rel = want_final
-            _add(tips, "Сітка", "finalLayerThickness", m.final_layer_rel,
+            _add(tips, "Mesh", "finalLayerThickness", m.final_layer_rel,
                  want_final,
-                 "перерахунок під нову кількість шарів: перший шар лишається "
-                 "такий самий, тобто y+ не псується, а стек коротшає")
+                 "recalculated for the new number of layers: the first "
+                 "layer stays the same, so y+ does not get worse, but "
+                 "the stack gets shorter")
 
     if m.min_thickness_rel > 0.02:
         new.mesh.min_thickness_rel = 0.02
-        _add(tips, "Сітка", "minThickness", m.min_thickness_rel, 0.02,
-             "грань, де шар виходить тонший за цей поріг, snappy лишає зовсім "
-             "без шару. Нижчий поріг дає тонкий шар замість жодного — ціною "
-             "витягнутіших комірок, тож checkMesh може почати бурчати")
+        _add(tips, "Mesh", "minThickness", m.min_thickness_rel, 0.02,
+             "a face where the layer comes out thinner than this "
+             "threshold, snappy leaves with no layer at all. A lower "
+             "threshold gives a thin layer instead of none — at the cost "
+             "of more stretched cells, so checkMesh can start to complain")
 
     out.tips = tips
     out.cfg = new if tips else None
@@ -700,53 +711,55 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
         after = new.layer_stack
         if after.total < stack.total * 0.95:
             out.notes.append(
-                tr("Після правок: перший шар {first_abs} "
-                "(було {first_before}), тобто y+ ≈ "
-                "{u_inf:.0f} замість "
-                "{yp_layers:.0f} — майже те саме, а от стек коротшає з "
-                "{total} до "
-                "{total2}. Саме це й дає покриття.", first_abs=phys.fmt_len(after.first_abs), first_before=phys.fmt_len(first_before), u_inf=after.yplus(f.u_inf, L, f.nu), yp_layers=yp_layers, total=phys.fmt_len(stack.total), total2=phys.fmt_len(after.total)))
+                tr("After the changes: first layer {first_abs} (was "
+                   "{first_before}), so y+ ≈ {u_inf:.0f} instead of "
+                   "{yp_layers:.0f} — almost the same, but the stack "
+                   "gets shorter from {total} to {total2}. This is "
+                   "exactly what gives the coverage.", first_abs=phys.fmt_len(after.first_abs), first_before=phys.fmt_len(first_before), u_inf=after.yplus(f.u_inf, L, f.nu), yp_layers=yp_layers, total=phys.fmt_len(stack.total), total2=phys.fmt_len(after.total)))
         else:
             out.notes.append(
-                tr("Стек при цьому не коротшає — працює лише нижчий поріг: "
-                "грані, на яких шар виходив тонший за "
-                "{min_thickness_rel:g} комірки й тому не зʼявлявся "
-                "зовсім, тепер отримають тонкий шар.", min_thickness_rel=m.min_thickness_rel))
+                tr("The stack does not get shorter with this — only the "
+                   "lower threshold works: faces where the layer came "
+                   "out thinner than {min_thickness_rel:g} of a cell and "
+                   "so did not appear at all will now get a thin layer.", min_thickness_rel=m.min_thickness_rel))
 
     # ---- причини, яких ручками не полагодити ----
     if _is_assembly(diag):
         out.notes.append(
-            tr("Головна причина тут не в налаштуваннях: у геометрії "
-            "{parts} частин і {non_manifold_edges} non-manifold "
-            "ребер. Уздовж ліній взаємного врізання оболонок шар нарощувати "
-            "нікуди. Перевірено A/B: featureAngle 60→130 і medialRatio "
-            "0.3→0.6 дали 36.7% проти 36.4% — ці ручки не лікують. Лікує "
-            "зшивання деталей в одне тіло (булеве обʼєднання в CAD або "
-            "shrink wrap).", parts=diag.parts, non_manifold_edges=diag.non_manifold_edges))
+            tr("The main cause here is not the settings: the geometry "
+               "has {parts} parts and {non_manifold_edges} non-manifold "
+               "edges. Along the lines where the shells cut into each "
+               "other, there is no place to grow a layer. A/B tested: "
+               "featureAngle 60→130 and medialRatio 0.3→0.6 gave 36.7% "
+               "vs 36.4% — these knobs do not fix it. What fixes it is "
+               "joining the parts into one body (Boolean union in CAD or "
+               "shrink wrap).", parts=diag.parts, non_manifold_edges=diag.non_manifold_edges))
     if diag is not None and not diag.closed and diag.largest_hole > cfg.surface_cell:
         out.notes.append(
-            "Поверхня протікає дірками більшими за комірку — поки це так, "
-            "шари не наростуть узагалі. Спершу вкладка «Геометрія».")
+            tr("The surface leaks through holes larger than a cell — while "
+            "this is so, layers will not grow at all. Start with the "
+            "“Geometry” tab."))
     if not tips:
         out.notes.append(
-            tr("Крутити вже нічого: шарів {n_layers}, minThickness "
-            "{min_thickness_rel:g}, finalLayerThickness "
-            "{final_layer_rel:g} — усе на мінімумі. Лишається підняти "
-            "рівень рефайнменту поверхні (комірка стане меншою, а з нею й "
-            "стек — але комірок буде вчетверо більше) або лагодити "
-            "геометрію.", n_layers=m.n_layers, min_thickness_rel=m.min_thickness_rel, final_layer_rel=m.final_layer_rel))
+            tr("Nothing is left to adjust: {n_layers} layers, "
+               "minThickness {min_thickness_rel:g}, finalLayerThickness "
+               "{final_layer_rel:g} — all at the minimum. What remains "
+               "is to raise the surface refinement level (the cell will "
+               "become smaller, and the stack with it — but there will "
+               "be four times as many cells) or to repair the geometry.", n_layers=m.n_layers, min_thickness_rel=m.min_thickness_rel, final_layer_rel=m.final_layer_rel))
     if out.level == "bad":
         out.notes.append(
-            tr("Якщо не допоможе — лишається рівень рефайнменту поверхні "
-            "{surface_level_max} → {v}: комірка "
-            "стане {fmt_len} замість "
-            "{surface_cell}, а з нею вдвічі тоншим і "
-            "стек. Ціна — комірок приблизно вчетверо більше.", surface_level_max=m.surface_level_max, v=m.surface_level_max + 1, fmt_len=phys.fmt_len(cfg.surface_cell / 2), surface_cell=phys.fmt_len(cfg.surface_cell)))
+            tr("If this does not help, what remains is the surface "
+               "refinement level {surface_level_max} → {v}: the cell "
+               "will become {fmt_len} instead of {surface_cell}, and the "
+               "stack will become half as thick with it. The cost is "
+               "about four times as many cells.", surface_level_max=m.surface_level_max, v=m.surface_level_max + 1, fmt_len=phys.fmt_len(cfg.surface_cell / 2), surface_cell=phys.fmt_len(cfg.surface_cell)))
         out.notes.append(
-            "Варіант «здатися» теж робочий: вимкнути шари зовсім. Рівний "
-            "високий y+ по всій поверхні пристінна функція обробляє "
-            "передбачувано, а плямистий — ні. Опір тертя буде занижений, "
-            "зате однаково по всій моделі.")
+            tr("The “give up” option also works: turn off layers fully. The "
+            "wall function handles a uniform high y+ over the whole "
+            "surface predictably, but a patchy one it does not. Skin "
+            "friction drag will be too low, but equally over the whole "
+            "model."))
     return out
 
 

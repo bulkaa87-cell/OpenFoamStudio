@@ -12,12 +12,15 @@ import fs_backend as be
 import fs_case as fc
 import fs_help as fshelp
 import fs_library as lib
-import fs_meshfix as meshfix
+import fs_repair
 import fs_physics as phys
-import fs_winfix as winfix
 import fs_yplus as fy
 import fs_i18n
 from fs_i18n import tr
+
+# The Qt text setters translate and keep the key of each text, also in a
+# widget that is made before the main window (T28).
+fs_i18n.install()
 
 # Усі блоки пояснень, створені панелями. Режим новачка просто показує або
 # ховає їх усі — так не треба протягувати прапорець крізь кожну панель.
@@ -199,9 +202,9 @@ def _field_name(widget) -> str:
 
 # Заголовки пояснень, у яких немає поля з підписом поруч.
 _FOLD_TITLES = {
-    "rotate": "Поворот збірки: що це?",
-    "layers": "Шари",
-    "streams_seed": "Звідки пускати лінії",
+    "rotate": "Assembly rotation: what is this?",
+    "layers": "Layers",
+    "streams_seed": "Where to start the lines",
 }
 
 
@@ -222,6 +225,7 @@ class Fold(QtWidgets.QWidget):
                  key: str = "", widget=None, parent=None):
         super().__init__(parent)
         self._title = title
+        self._given = bool(title)   # else: from the label of the field
         self._widget = widget       # поле, з чийого підпису взяти заголовок
         self._key = key or title
         lay = QtWidgets.QVBoxLayout(self)
@@ -280,8 +284,14 @@ class Fold(QtWidgets.QWidget):
                 # латинські імена OpenFOAM (includedAngle) лишаємо як є.
                 if "а" <= name[:1] <= "я" or name[:1] in "іїєґ":
                     name = name[:1].upper() + name[1:]
-                self._title = tr("{name}: що це?", name=name)
-        return tr(self._title or "Опис")
+                self._title = tr("{name}: what is this?", name=name)
+        return tr(self._title or "Description")
+
+    def retranslate_ui(self) -> None:
+        """A live change of the language (fs_i18n): the title again."""
+        if not self._given:
+            self._title = ""
+        self._show_title()
 
     def _show_title(self):
         full = self.title()
@@ -376,11 +386,11 @@ LEVEL_COLOR = {
 }
 
 MEDIA = {
-    "Повітря, 15 °C": (1.470e-5, 1.225),
-    "Повітря, 0 °C": (1.338e-5, 1.292),
-    "Повітря, 25 °C": (1.562e-5, 1.184),
-    "Вода, 20 °C": (1.004e-6, 998.2),
-    "Своє значення": (None, None),
+    "Air, 15 °C": (1.470e-5, 1.225),
+    "Air, 0 °C": (1.338e-5, 1.292),
+    "Air, 25 °C": (1.562e-5, 1.184),
+    "Water, 20 °C": (1.004e-6, 998.2),
+    "Custom value": (None, None),
 }
 
 
@@ -392,7 +402,7 @@ def media_name(nu: float, rho: float) -> str:
             continue
         if abs(nu - mnu) <= 1e-6 * mnu and abs(rho - mrho) <= 1e-6 * mrho:
             return name
-    return "Своє значення"
+    return "Custom value"
 
 
 # --------------------------------------------------------------------------
@@ -667,7 +677,7 @@ class HintLabel(WrapLabel):
     PAD_H = 3
 
 
-def hint(text: str, replaced_by: str = "", title: str = "Опис",
+def hint(text: str, replaced_by: str = "", title: str = "Description",
          fold: bool = True):
     """Сірий опис під полем, згорнутий у рядок «▸ title» (див. Fold).
 
@@ -781,6 +791,9 @@ class Panel(QtWidgets.QWidget):
 # --------------------------------------------------------------------------
 
 # Одиниці STL і множник у метри. Порядок — той, що в полі «Одиниці STL».
+# The values are Ukrainian words: a project file and a session keep them, and
+# the stable copy reads the same files (i18n/skip.json). The person sees
+# their translation (ValueCombo, tr() and the reverse map).
 UNITS = ("авто", "метри", "міліметри", "сантиметри", "дюйми")
 DEFAULT_UNITS = "міліметри"
 _UNIT_FACTOR = {"метри": 1.0, "міліметри": 0.001, "сантиметри": 0.01,
@@ -788,11 +801,14 @@ _UNIT_FACTOR = {"метри": 1.0, "міліметри": 0.001, "сантиме�
 
 
 class ValueCombo(QtWidgets.QComboBox):
-    """A combo box whose item texts are also values (units, media).
+    """A combo box whose item texts are also values (units, media, fields).
 
-    The code reads and sets the Ukrainian source text (currentText,
-    setCurrentText, findText), and a project file keeps it. The person sees
-    the translation: each item keeps its value as item data.
+    The code reads and sets the value (currentText, setCurrentText,
+    findText), and a project file can keep it (units: the Ukrainian words of
+    older versions, so that the stable copy reads the same files). The
+    person sees the translation of the value: each item keeps its value as
+    item data, and tr() finds a Ukrainian value through the reverse map of
+    the catalogue.
     """
 
     def add_values(self, values) -> None:
@@ -821,28 +837,9 @@ def units_factor(units: str, auto_factor: float) -> float:
 
 
 # Methods of the «Полагодити» menu: (key for repair_requested, name, tooltip).
-# meshfix first: it is the default.
-REPAIR_METHODS = (
-    ("meshfix", "meshfix",
-     "Наш ремонт на Rust (rust/meshfix), без служби Windows: зшити щілини "
-     "до 0.01 мм, прибрати дублі, узгодити нормалі, закрити всі дірки, "
-     "обʼєднати тіла, що врізаються одне в одне, прибрати вкладені й "
-     "крихітні оболонки. Поверхня лишається на місці. Якщо сітка все одно "
-     "не замкнулася, сам бере alpha wrap, а тоді обʼємну перебудову."),
-    ("alphawrap", "alpha wrap",
-     "Обгорнути всю збірку однією оболонкою (alpha wrap на Rust, у самій "
-     "програмі) і стиснути її на поверхню. Оболонка замкнена, кромки "
-     "лишаються кромками. Ціна: вузькі порожнини (щілина між гондолою й "
-     "обшивкою) заповнюються, усі моделі стають одним тілом"),
-    ("winfix", "Windows",
-     "Служба ремонту, вбудована у Windows (Netfabb) — те саме, що «Fix "
-     "model» у Bambu Studio, Orca й PrusaSlicer. Згущує сітку й трохи "
-     "зсуває вершини. Іде довго: близько хвилини на 250 тис. трикутників"),
-    ("volume", "обʼємна перебудова",
-     "Для дуже брудних моделей: модель перебудовується наново по сітці "
-     "комірок, напрямок граней не має значення. Результат завжди замкнений, "
-     "але деталі, тонші за ~0.7 мм, зникають. Усі моделі стають одним тілом"),
-)
+# meshfix first: it is the default. The list is shared with MeshFix Studio
+# (fs_repair.py): change it there.
+REPAIR_METHODS = fs_repair.METHODS
 
 
 class GeometryPanel(Panel):
@@ -872,15 +869,17 @@ class GeometryPanel(Panel):
         super().__init__(cfg, parent)
 
         row = QtWidgets.QHBoxLayout()
-        self.btn_open = QtWidgets.QPushButton("Відкрити STL…")
+        self.btn_open = QtWidgets.QPushButton("Open STL…")
         self.btn_open.setToolTip(
-            "Замінити сцену цією моделлю.\n"
-            "Можна вибрати кілька файлів за раз: Ctrl або Shift у діалозі.")
+            "Replace the scene with this model.\nYou can select several "
+            "files at once: Ctrl or Shift in the dialog.")
         self.btn_open.clicked.connect(self.load_requested)
         row.addWidget(self.btn_open, 2)
-        self.btn_add = QtWidgets.QPushButton("Додати…")
-        self.btn_add.setToolTip("Додати моделі до сцени (можна кілька за раз), не прибираючи "
-                                "наявні: крило + хвіст + антена рахуються разом")
+        self.btn_add = QtWidgets.QPushButton("Add…")
+        self.btn_add.setToolTip("Add models to the scene (several at "
+                                "once are possible) without removing the "
+                                "existing ones: wing + tail + antenna "
+                                "are computed together")
         self.btn_add.clicked.connect(self.add_requested)
         row.addWidget(self.btn_add, 1)
         self.v.insertLayout(0, row)
@@ -890,49 +889,50 @@ class GeometryPanel(Panel):
         # Зліпити гвинт руками легко неправильно, і помилка при цьому
         # мовчазна: зона MRF накриє криву фігуру цілком законно, тяги не
         # дасть, а помилки не буде. Тому — з чисел.
-        self.box_prop = QtWidgets.QGroupBox("Зробити гвинт із чисел")
+        self.box_prop = QtWidgets.QGroupBox("Make a propeller from numbers")
         self.box_prop.setCheckable(True)
         self.box_prop.setChecked(False)
         pv_ = QtWidgets.QFormLayout(self.box_prop)
-        self.prop_d = dspin(0.01, 20.0, 0.30, 0.01, 4, " м")
+        self.prop_d = dspin(0.01, 20.0, 0.30, 0.01, 4, " m")
         # Мінімум ДВІ, і це не примха. В однолопатевого гвинта немає
         # обертової симетрії, тож центр мас не лежить на осі — і
         # радіус зони виходив 97 мм замість 165. Такий гвинт існує
         # (з противагою), але робити його з чисел ми не вміємо.
         self.prop_n = ispin(2, 12, 2)
-        self.prop_pitch = dspin(0.005, 20.0, 0.15, 0.01, 4, " м")
-        self.prop_hub = dspin(0.0, 5.0, 0.03, 0.005, 4, " м")
-        self.prop_chord = dspin(0.0, 5.0, 0.0, 0.005, 4, " м")
-        self.prop_rpm = dspin(-100000.0, 100000.0, 6000.0, 100.0, 1, " об/хв")
-        pv_.addRow("Діаметр", self.prop_d)
-        pv_.addRow("Лопатей", self.prop_n)
-        pv_.addRow("Крок", self.prop_pitch)
-        pv_.addRow("Діаметр втулки", self.prop_hub)
-        pv_.addRow("Хорда (0 — авто)", self.prop_chord)
-        pv_.addRow("Оберти", self.prop_rpm)
+        self.prop_pitch = dspin(0.005, 20.0, 0.15, 0.01, 4, " m")
+        self.prop_hub = dspin(0.0, 5.0, 0.03, 0.005, 4, " m")
+        self.prop_chord = dspin(0.0, 5.0, 0.0, 0.005, 4, " m")
+        self.prop_rpm = dspin(-100000.0, 100000.0, 6000.0, 100.0, 1, " rpm")
+        pv_.addRow("Diameter", self.prop_d)
+        pv_.addRow("Blades", self.prop_n)
+        pv_.addRow("Pitch", self.prop_pitch)
+        pv_.addRow("Hub diameter", self.prop_hub)
+        pv_.addRow("Chord (0 — auto)", self.prop_chord)
+        pv_.addRow("RPM", self.prop_rpm)
         self.prop_note = WrapLabel("")
         self.prop_note.setWordWrap(True)
         self.prop_note.setStyleSheet("color:#7c8894; font-size:11px;")
         pv_.addRow(self.prop_note)
-        self.btn_prop = QtWidgets.QPushButton("Додати гвинт у сцену")
+        self.btn_prop = QtWidgets.QPushButton("Add propeller to scene")
         self.btn_prop.clicked.connect(self.propeller_requested)
         pv_.addRow(self.btn_prop)
         # Той самий гвинт, але БЕЗ ЛОПАТЕЙ: плаский диск того ж діаметра з
         # отвором під втулку. Сітці не треба розвʼязувати лопаті, тягу й
         # закрутку задають числа на ньому.
-        self.btn_disk = QtWidgets.QPushButton("Додати гвинт-диск (без лопатей)")
+        self.btn_disk = QtWidgets.QPushButton("Add actuator disk (no blades)")
         self.btn_disk.setToolTip(
-            "Плаский диск із тим самим діаметром і втулкою. У сітку він не "
-            "йде: це місце, де діє сила гвинта. Тягу й момент задайте на "
-            "ньому в блоці ролі.")
+            "A flat disk with the same diameter and hub. It does not go "
+            "into the mesh: it is the place where the propeller force "
+            "acts. Set the thrust and torque on it in the role block.")
         self.btn_disk.clicked.connect(self.disk_requested)
         pv_.addRow(self.btn_disk)
         pv_.addRow(hint(
-            "Крок — це відстань, на яку гвинт угвинтився б за один оберт у "
-            "твердому тілі. З нього рахується закрутка лопаті. "
-            "ЧЕСНО ПРО МЕЖУ: переріз тут еліпс, а не профіль, тож числа з "
-            "такого гвинта беріть як ПОРЯДОК. Для справжніх потрібна модель "
-            "лопаті з CAD.", title="Крок і межі такого гвинта"))
+            tr("Pitch is the distance the propeller would screw forward in "
+            "one revolution in a solid body. The blade twist is "
+            "calculated from it. HONEST ABOUT THE LIMIT: the section "
+            "here is an ellipse, not an airfoil, so take the numbers "
+            "from such a propeller as an ORDER OF MAGNITUDE. For real "
+            "numbers you need a blade model from CAD."), title="Pitch and limits of this propeller"))
         for w in (self.prop_d, self.prop_n, self.prop_pitch, self.prop_hub,
                   self.prop_chord):
             w.valueChanged.connect(lambda _: self.refresh_propeller())
@@ -946,9 +946,10 @@ class GeometryPanel(Panel):
         self.parts = QtWidgets.QListWidget()
         self.parts.setMaximumHeight(120)
         self.parts.setToolTip(
-            "Галочка — модель у сцені й у кейсі. Знята — файл лишається "
-            "в списку, але в розрахунок не йде. Подвійний клік лишає в "
-            "сцені саму цю модель.")
+            "Check box set — the model is in the scene and in the case. "
+            "Cleared — the file stays in the list but does not go into "
+            "the computation. A double-click leaves only this model in "
+            "the scene.")
         self.parts.itemChanged.connect(self._part_changed)
         self.parts.itemDoubleClicked.connect(
             lambda it: self.part_solo.emit(self.parts.row(it)))
@@ -966,9 +967,9 @@ class GeometryPanel(Panel):
         self.lbl_scene.setStyleSheet("color:#7c8894; font-size:11px;")
         self.v.insertWidget(3, self.lbl_scene)
 
-        self.btn_drop = QtWidgets.QPushButton("Прибрати зі списку")
-        self.btn_drop.setToolTip("Забути вибрану модель. Сам файл лишається "
-                                 "на диску.")
+        self.btn_drop = QtWidgets.QPushButton("Remove from list")
+        self.btn_drop.setToolTip("Forget the selected model. The file "
+                                 "itself stays on disk.")
         self.btn_drop.clicked.connect(self._drop_current)
         self.v.insertWidget(4, self.btn_drop)
 
@@ -990,24 +991,24 @@ class GeometryPanel(Panel):
         for key, label, why in fc.PART_ROLES:
             self.cmb_role.addItem(tr("{label} — {why}", label=label, why=why), key)
         self.cmb_role.currentIndexChanged.connect(self._role_changed)
-        rf.addRow("Це", self.cmb_role)
-        self.role_rpm = dspin(-100000.0, 100000.0, 3000.0, 100.0, 1, " об/хв")
+        rf.addRow("This is", self.cmb_role)
+        self.role_rpm = dspin(-100000.0, 100000.0, 3000.0, 100.0, 1, " rpm")
         self.role_rpm.valueChanged.connect(lambda _: self._role_changed())
         self.row_rpm = rf.rowCount()
-        rf.addRow("Оберти", self.role_rpm)
+        rf.addRow("RPM", self.role_rpm)
         # ВІСЬ ЗАДАЄ ЛЮДИНА, і це не лінощі, а межа способу: плаский
         # двулопатевий гвинт габаритом НЕ ВІДРІЗНИТИ від пластини — він і
         # справді міг би крутитися навколо обох осей. Автовизначення давало
         # для нього Y замість X, мовчки й упевнено.
         self.role_axis = QtWidgets.QComboBox()
-        for key, label in (("x", "X — уздовж потоку (звично для гвинта)"),
-                           ("y", "Y — уздовж розмаху"),
-                           ("z", "Z — угору (ротор гелікоптера)")):
+        for key, label in (("x", "X — along the flow (usual for a propeller)"),
+                           ("y", "Y — along the span"),
+                           ("z", "Z — up (helicopter rotor)")):
             self.role_axis.addItem(label, key)
         self.role_axis.currentIndexChanged.connect(
             lambda _: self._role_changed())
         self.row_axis = rf.rowCount()
-        rf.addRow("Вісь обертання", self.role_axis)
+        rf.addRow("Rotation axis", self.role_axis)
 
         # ВЛАСНЕ ЗГУЩЕННЯ ЦІЄЇ ДЕТАЛІ.
         #
@@ -1021,32 +1022,33 @@ class GeometryPanel(Panel):
         # Нуль означає «як усі», і саме він стоїть типово: поки його ніхто
         # не чіпає, сітка виходить точно та сама, що й була.
         self.role_level = ispin(0, 9, 0, 1)
-        self.role_level.setSpecialValueText("як усі")
+        self.role_level.setSpecialValueText("same as all")
         self.role_level.setToolTip(
-            "Скільки разів ділити комірку НА ЦІЙ поверхні. Кожен рівень "
-            "ділить її вдвічі по кожному напрямку, тобто множить кількість "
-            "комірок на поверхні вчетверо. «Як усі» — спільний рівень із "
-            "вкладки «Сітка».")
+            "How many times to split a cell ON THIS surface. Each level "
+            "halves it in each direction, so it multiplies the number of "
+            "cells on the surface by four. “Same as all” — the common "
+            "level from the “Mesh” tab.")
         self.role_level.valueChanged.connect(lambda _: self._role_changed())
         self.row_level = rf.rowCount()
-        rf.addRow("Згущення поверхні", self.role_level)
+        rf.addRow("Surface refinement", self.role_level)
         # ДВИГУН — лише для кришок. Імʼя звʼязує повітрозабірник із соплом:
         # кришки з однаковим імʼям — один двигун.
         self.eng_name = QtWidgets.QLineEdit("engine1")
         self.eng_name.setToolTip(
-            "Кришки з однаковим імʼям двигуна — один двигун. Два "
-            "повітрозабірники й одне сопло з імʼям engine1 — це один "
-            "двигун із двома бічними входами.")
+            "Caps with the same engine name are one engine. Two intakes "
+            "and one nozzle with the name engine1 are one engine with "
+            "two side inlets.")
         self.eng_name.editingFinished.connect(self._engine_changed)
         self.row_engine = rf.rowCount()
-        rf.addRow("Двигун", self.eng_name)
+        rf.addRow("Engine", self.eng_name)
         explain_tip(self.eng_name, "engine_name")
         # Активний бік — куди дивляться нормалі STL. Стрілка у вʼюпорті
         # показує його; ця кнопка міняє бік, не вертаючись у CAD.
-        self.btn_flip = QtWidgets.QPushButton("Перевернути активний бік")
+        self.btn_flip = QtWidgets.QPushButton("Flip active side")
         self.btn_flip.setToolTip(
-            "Сопло дме, а вхід смокче з того боку, куди показує стрілка у "
-            "вʼюпорті. Кнопка перевертає нормалі цієї поверхні.")
+            "The nozzle blows, and the intake sucks, on the side that "
+            "the arrow in the viewport points to. The button flips the "
+            "normals of this surface.")
         self.btn_flip.clicked.connect(self._flip_current)
         self.row_flip = rf.rowCount()
         rf.addRow("", self.btn_flip)
@@ -1064,63 +1066,63 @@ class GeometryPanel(Panel):
         for key, label, why in fc.ENGINE_KINDS:
             self.jet_kind.addItem(tr("{label} — {why}", label=label, why=why), key)
         self.jet_kind.currentIndexChanged.connect(self._engine_changed)
-        jf.addRow("Вид", self.jet_kind)
+        jf.addRow("Type", self.jet_kind)
         _b = explain(self.jet_kind, "engine_kind")
         if _b: jf.addRow(_b)
         self.jet_mode = QtWidgets.QComboBox()
         for key, label, why in fc.THRUST_MODES:
             self.jet_mode.addItem(tr("{label} — {why}", label=label, why=why), key)
         self.jet_mode.currentIndexChanged.connect(self._engine_changed)
-        jf.addRow("Тяга задана як", self.jet_mode)
+        jf.addRow("Thrust given as", self.jet_mode)
         _b = explain(self.jet_mode, "engine_thrust_mode")
         if _b: jf.addRow(_b)
-        self.jet_thrust = dspin(0.0, 100000.0, 20.0, 1.0, 2, " Н")
+        self.jet_thrust = dspin(0.0, 100000.0, 20.0, 1.0, 2, " N")
         self.jet_thrust.valueChanged.connect(lambda _: self._engine_changed())
-        jf.addRow("Тяга", self.jet_thrust)
+        jf.addRow("Thrust", self.jet_thrust)
         _b = explain(self.jet_thrust, "engine_thrust")
         if _b: jf.addRow(_b)
-        self.jet_vjet = dspin(0.0, 3000.0, 0.0, 10.0, 0, " м/с")
-        self.jet_vjet.setSpecialValueText("з площі сопла")
+        self.jet_vjet = dspin(0.0, 3000.0, 0.0, 10.0, 0, " m/s")
+        self.jet_vjet.setSpecialValueText("from nozzle area")
         self.jet_vjet.valueChanged.connect(lambda _: self._engine_changed())
-        jf.addRow("Швидкість вихлопу", self.jet_vjet)
+        jf.addRow("Exhaust velocity", self.jet_vjet)
         _b = explain(self.jet_vjet, "engine_vjet")
         if _b: jf.addRow(_b)
         self.jet_temp = dspin(-50.0, 2000.0, 627.0, 10.0, 0, " °C")
         self.jet_temp.valueChanged.connect(lambda _: self._engine_changed())
         self.row_jet_temp = jf.rowCount()
-        jf.addRow("Температура струменя", self.jet_temp)
+        jf.addRow("Jet temperature", self.jet_temp)
         explain_tip(self.jet_temp, "engine_tjet")
         self.jet_fuel = dspin(0.0, 10.0, 0.0, 0.5, 1, " %")
         self.jet_fuel.valueChanged.connect(lambda _: self._engine_changed())
-        jf.addRow("Частка палива", self.jet_fuel)
+        jf.addRow("Fuel fraction", self.jet_fuel)
         _b = explain(self.jet_fuel, "engine_fuel")
         if _b: jf.addRow(_b)
-        self.jet_throttle = QtWidgets.QCheckBox("від газу на пульті (тяга ∝ газ²)")
+        self.jet_throttle = QtWidgets.QCheckBox("from the throttle on the control panel (thrust ∝ throttle²)")
         self.jet_throttle.setChecked(True)
         self.jet_throttle.toggled.connect(lambda _: self._engine_changed())
         jf.addRow(self.jet_throttle)
         _b = explain(self.jet_throttle, "engine_throttle")
         if _b: jf.addRow(_b)
-        self.jet_refine = QtWidgets.QCheckBox("згущувати сітку на кришках")
+        self.jet_refine = QtWidgets.QCheckBox("refine the mesh on the caps")
         self.jet_refine.setChecked(True)
         self.jet_refine.toggled.connect(lambda _: self._engine_changed())
         jf.addRow(self.jet_refine)
         _b = explain(self.jet_refine, "engine_refine")
         if _b: jf.addRow(_b)
         self.jet_direct = QtWidgets.QCheckBox(
-            "задати витрату й швидкість напряму")
+            "set the mass flow and velocity directly")
         self.jet_direct.toggled.connect(lambda _: self._engine_changed())
         jf.addRow(self.jet_direct)
         _b = explain(self.jet_direct, "engine_direct")
         if _b: jf.addRow(_b)
-        self.jet_mdot = dspin(0.0, 1000.0, 0.5, 0.01, 4, " кг/с")
+        self.jet_mdot = dspin(0.0, 1000.0, 0.5, 0.01, 4, " kg/s")
         self.jet_mdot.valueChanged.connect(lambda _: self._engine_changed())
         self.row_jet_mdot = jf.rowCount()
-        jf.addRow("Витрата крізь сопло", self.jet_mdot)
-        self.jet_vexit = dspin(0.0, 3000.0, 50.0, 1.0, 1, " м/с")
+        jf.addRow("Mass flow through the nozzle", self.jet_mdot)
+        self.jet_vexit = dspin(0.0, 3000.0, 50.0, 1.0, 1, " m/s")
         self.jet_vexit.valueChanged.connect(lambda _: self._engine_changed())
         self.row_jet_vexit = jf.rowCount()
-        jf.addRow("Швидкість на зрізі", self.jet_vexit)
+        jf.addRow("Exit velocity", self.jet_vexit)
         self.form_jet = jf
         self.box_jet.setVisible(False)
 
@@ -1130,33 +1132,33 @@ class GeometryPanel(Panel):
         df = QtWidgets.QFormLayout(self.box_disk)
         df.setContentsMargins(0, 0, 0, 0)
         df.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
-        self.disk_thrust = dspin(0.0, 100000.0, 5.0, 0.5, 2, " Н")
+        self.disk_thrust = dspin(0.0, 100000.0, 5.0, 0.5, 2, " N")
         self.disk_thrust.valueChanged.connect(lambda _: self._disk_changed())
-        df.addRow("Тяга", self.disk_thrust)
+        df.addRow("Thrust", self.disk_thrust)
         _b = explain(self.disk_thrust, "disk_thrust")
         if _b: df.addRow(_b)
-        self.disk_torque = dspin(0.0, 10000.0, 0.0, 0.01, 3, " Н·м")
+        self.disk_torque = dspin(0.0, 10000.0, 0.0, 0.01, 3, " N·m")
         self.disk_torque.valueChanged.connect(lambda _: self._disk_changed())
-        df.addRow("Крутний момент", self.disk_torque)
+        df.addRow("Torque", self.disk_torque)
         _b = explain(self.disk_torque, "disk_torque")
         if _b: df.addRow(_b)
         self.disk_profile = QtWidgets.QComboBox()
         for key, label, why in fc.DISK_PROFILES:
             self.disk_profile.addItem(tr("{label} — {why}", label=label, why=why), key)
         self.disk_profile.currentIndexChanged.connect(self._disk_changed)
-        df.addRow("Розподіл", self.disk_profile)
+        df.addRow("Distribution", self.disk_profile)
         _b = explain(self.disk_profile, "disk_profile")
         if _b: df.addRow(_b)
-        self.disk_hub = dspin(0.0, 5000.0, 0.0, 1.0, 1, " мм")
-        self.disk_hub.setSpecialValueText("15 % радіуса")
+        self.disk_hub = dspin(0.0, 5000.0, 0.0, 1.0, 1, " mm")
+        self.disk_hub.setSpecialValueText("15 % of radius")
         self.disk_hub.valueChanged.connect(lambda _: self._disk_changed())
-        df.addRow("Радіус кока", self.disk_hub)
+        df.addRow("Spinner radius", self.disk_hub)
         explain_tip(self.disk_hub, "disk_hub")
-        self.disk_throttle = QtWidgets.QCheckBox("від газу на пульті (тяга ∝ газ²)")
+        self.disk_throttle = QtWidgets.QCheckBox("from the throttle on the control panel (thrust ∝ throttle²)")
         self.disk_throttle.setChecked(True)
         self.disk_throttle.toggled.connect(lambda _: self._disk_changed())
         df.addRow(self.disk_throttle)
-        self.disk_refine = QtWidgets.QCheckBox("згущувати сітку в диску")
+        self.disk_refine = QtWidgets.QCheckBox("refine the mesh in the disk")
         self.disk_refine.setChecked(True)
         self.disk_refine.toggled.connect(lambda _: self._disk_changed())
         df.addRow(self.disk_refine)
@@ -1183,7 +1185,7 @@ class GeometryPanel(Panel):
         # передньої кромки. Якщо задати поворот навколо центра деталі,
         # вона сповзе з гнізда — передня кромка підніметься над крилом,
         # задня втопиться в обшивці, і в сітці зʼявиться дірка.
-        self.box_ctl = QtWidgets.QGroupBox("Керування (пульт)")
+        self.box_ctl = QtWidgets.QGroupBox("Control (control panel)")
         self.box_ctl.setCheckable(True)
         self.box_ctl.setChecked(False)
         cf = QtWidgets.QFormLayout(self.box_ctl)
@@ -1195,67 +1197,68 @@ class GeometryPanel(Panel):
         cf.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
 
         self.ctl_channel = QtWidgets.QComboBox()
-        self.ctl_channel.addItem("— не керована —", "")
+        self.ctl_channel.addItem("— not controlled —", "")
         # Змінну НЕ звати `hint`: так зветься модульний помічник, яким
         # цей самий __init__ користується вище, і локальне ім'я зробило б
         # його «використаним до присвоєння» по всій функції.
         for key, label, _, _, _, what in fc.RC_CHANNELS:
-            self.ctl_channel.addItem(tr("{label} — {what}", label=label, what=what) if what else label,
+            self.ctl_channel.addItem(tr("{label} — {what}", label=label, what=what) if what else tr(label),
                                      key)
-        cf.addRow("Канал", self.ctl_channel)
+        cf.addRow("Channel", self.ctl_channel)
 
         self.btn_hinge_guess = QtWidgets.QPushButton(
-            "Підібрати завісу з геометрії")
+            "Get hinge from geometry")
         self.btn_hinge_guess.setToolTip(
-            "Поставити вісь уздовж найдовшого напрямку деталі, а точку — "
-            "на середину її передньої кромки. Для елерона й керма це "
-            "майже завжди те, що треба; перевірте у вювпорті.")
+            "Put the axis along the longest direction of the part, and "
+            "the point at the middle of its leading edge. For an aileron "
+            "and a rudder this is almost always what you need; check it "
+            "in the viewport.")
         cf.addRow(self.btn_hinge_guess)
 
         self.ctl_pivot = []
         prow = QtWidgets.QHBoxLayout()
         for ax in "xyz":
-            sp = dspin(-1000.0, 1000.0, 0.0, 0.005, 4, " м")
-            sp.setToolTip(tr("{upper} точки, через яку проходить завіса", upper=ax.upper()))
+            sp = dspin(-1000.0, 1000.0, 0.0, 0.005, 4, " m")
+            sp.setToolTip(tr("{upper} of the point the hinge passes through", upper=ax.upper()))
             self.ctl_pivot.append(sp)
             prow.addWidget(QtWidgets.QLabel(ax.upper()))
             prow.addWidget(sp, 1)
-        cf.addRow("Точка завіси", _wrap(prow))
+        cf.addRow("Hinge point", _wrap(prow))
 
         self.ctl_axis = []
         arow = QtWidgets.QHBoxLayout()
         for i, ax in enumerate("xyz"):
             sp = dspin(-1.0, 1.0, 1.0 if i == 1 else 0.0, 0.1, 3, "")
-            sp.setToolTip(tr("{upper} напрямку завіси (довжина не важить)", upper=ax.upper()))
+            sp.setToolTip(tr("{upper} of the hinge direction (length does not matter)", upper=ax.upper()))
             self.ctl_axis.append(sp)
             arow.addWidget(QtWidgets.QLabel(ax.upper()))
             arow.addWidget(sp, 1)
-        cf.addRow("Напрямок завіси", _wrap(arow))
+        cf.addRow("Hinge direction", _wrap(arow))
 
         self.ctl_offset = []
         orow = QtWidgets.QHBoxLayout()
         for ax in "xyz":
-            sp = dspin(-10.0, 10.0, 0.0, 0.001, 4, " м")
+            sp = dspin(-10.0, 10.0, 0.0, 0.001, 4, " m")
             sp.setToolTip(
-                "Поправка ПІСЛЯ повороту — дослати деталь на місце, якщо "
-                "в моделі вона знята з вузла")
+                "Offset AFTER rotation — moves the part back into place "
+                "if in the model it is removed from the assembly")
             self.ctl_offset.append(sp)
             orow.addWidget(QtWidgets.QLabel(ax.upper()))
             orow.addWidget(sp, 1)
-        cf.addRow("Поправка", _wrap(orow))
+        cf.addRow("Offset", _wrap(orow))
 
         grow = QtWidgets.QHBoxLayout()
         self.ctl_gain = dspin(-90.0, 90.0, 20.0, 1.0, 1, "°")
-        self.ctl_gain.setToolTip("Скільки градусів дає повний хід стіка")
+        self.ctl_gain.setToolTip("How many degrees a full stick throw gives")
         self.ctl_trim = dspin(-90.0, 90.0, 0.0, 0.5, 1, "°")
-        self.ctl_trim.setToolTip("Відхилення на нейтралі")
+        self.ctl_trim.setToolTip("Deflection at neutral")
         self.ctl_limit = dspin(0.0, 90.0, 30.0, 1.0, 1, "°")
-        self.ctl_limit.setToolTip("Обмежувач: далі поверхня не піде")
-        for lab, w in (("хід", self.ctl_gain), ("трим", self.ctl_trim),
-                       ("межа", self.ctl_limit)):
+        self.ctl_limit.setToolTip("Limiter: the surface does not go further")
+        for lab, w in (("travel", self.ctl_gain), ("trim", self.ctl_trim),
+                       ("limit", self.ctl_limit)):
             grow.addWidget(QtWidgets.QLabel(lab))
             grow.addWidget(w, 1)
-        cf.addRow("Кути", _wrap(grow))
+        cf.addRow("Angles", _wrap(grow))
         # По три поля в рядку: з типовими 96 px на поле рядок хотів 391 px,
         # і група розпирала панель. 72 px досить для «-0,0000 м».
         for sp in (self.ctl_pivot + self.ctl_axis + self.ctl_offset
@@ -1263,7 +1266,7 @@ class GeometryPanel(Panel):
             sp.setMinimumWidth(72)
 
         self.ctl_reverse = QtWidgets.QCheckBox(
-            "Реверс (для другого елерона — щоб ходили назустріч)")
+            "Reverse (for the second aileron — so that they move in opposite directions)")
         cf.addRow(self.ctl_reverse)
 
         self.lbl_ctl = WrapLabel("")
@@ -1298,22 +1301,22 @@ class GeometryPanel(Panel):
         # лишається як була. Тому цей блок тепер згорнутий і названий
         # тим, що він робить.
         self.box_one = QtWidgets.QGroupBox(
-            "Посунути ОКРЕМУ деталь (ламає складання з CAD)")
+            "Move a SEPARATE part (breaks the CAD assembly)")
         self.box_one.setCheckable(True)
         self.box_one.setChecked(False)
         self.box_one.setToolTip(
-            "Потрібне лише тоді, коли деталь приїхала окремо й не на "
-            "місці — наприклад, гвинт, який треба поставити на вал.\n"
-            "Щоб розвернути ВЕСЬ літак, користуйтеся блоком «Орієнтація "
-            "всієї збірки» нижче.")
+            "Needed only when a part arrived separately and is not in "
+            "its place — for example, a propeller that must go onto the "
+            "shaft.\nTo turn the WHOLE aircraft, use the “Whole assembly "
+            "orientation” block below.")
         ov = QtWidgets.QVBoxLayout(self.box_one)
         ov.setContentsMargins(8, 4, 8, 6)
         grow = QtWidgets.QHBoxLayout()
         for axis in ("x", "y", "z"):
-            b = QtWidgets.QPushButton(tr("↻ {upper} 90° (лише ця)", upper=axis.upper()))
-            b.setToolTip(tr("Повернути ЛИШЕ вибрану деталь на 90° навколо "
-                         "{upper}, навколо її власного центра. "
-                         "Решта збірки лишиться як була.", upper=axis.upper()))
+            b = QtWidgets.QPushButton(tr("↻ {upper} 90° (this one only)", upper=axis.upper()))
+            b.setToolTip(tr("Rotate ONLY the selected part by 90° about "
+                            "{upper}, about its own center. The rest of "
+                            "the assembly stays as it was.", upper=axis.upper()))
             b.clicked.connect(
                 lambda _=False, a=axis: self._move_current(a, 90.0))
             grow.addWidget(b)
@@ -1321,15 +1324,15 @@ class GeometryPanel(Panel):
         rv = ov
 
         mrow = QtWidgets.QHBoxLayout()
-        self.move_step = dspin(0.0001, 100.0, 0.01, 0.005, 4, " м")
-        self.move_step.setToolTip("На скільки зсувати за одне натискання")
-        mrow.addWidget(QtWidgets.QLabel("Крок"))
+        self.move_step = dspin(0.0001, 100.0, 0.01, 0.005, 4, " m")
+        self.move_step.setToolTip("How far to move per click")
+        mrow.addWidget(QtWidgets.QLabel("Pitch"))
         mrow.addWidget(self.move_step, 1)
         for label, key in (("−X", "-x"), ("+X", "+x"), ("−Y", "-y"),
                            ("+Y", "+y"), ("−Z", "-z"), ("+Z", "+z")):
             b = QtWidgets.QPushButton(label)
             b.setFixedWidth(34)
-            b.setToolTip(tr("Зсунути ЦЮ модель по {upper}", upper=key[1].upper()))
+            b.setToolTip(tr("Move THIS model along {upper}", upper=key[1].upper()))
             b.clicked.connect(
                 lambda _=False, k=key: self._move_current(
                     k, self.move_step.value()))
@@ -1339,18 +1342,19 @@ class GeometryPanel(Panel):
         self.v.insertWidget(5, self.box_role)
         self.box_role.setVisible(False)
 
-        self.lbl_file = WrapLabel("файл не завантажено")
+        self.lbl_file = WrapLabel("file not loaded")
         self.lbl_file.setWordWrap(True)
         self.lbl_file.setStyleSheet("color:#555; font-size:11px;")
         # Індекси тут зсунулися на одиницю, коли під списком зʼявився блок
         # ролі: box_role стоїть на 4, тож усе, що було нижче, посунулося.
         self.v.insertWidget(6, self.lbl_file)
 
-        self.chk_split = QtWidgets.QCheckBox("Кожна модель — окремий патч")
+        self.chk_split = QtWidgets.QCheckBox("Each model is a separate patch")
         self.chk_split.setToolTip(
-            "Крило, фюзеляж і мотогондола стануть окремими границями, і "
-            "сили порахуються ДЛЯ КОЖНОЇ ОКРЕМО, а не лише сумарно. "
-            "Працює, коли в сцені більше однієї моделі.")
+            "The wing, fuselage and motor nacelle become separate "
+            "boundaries, and the forces are computed FOR EACH ONE "
+            "SEPARATELY, not only as a total. Works when the scene has "
+            "more than one model.")
         self.chk_split.setChecked(cfg.split_patches)
         self.chk_split.toggled.connect(self._split_changed)
         self.v.insertWidget(7, self.chk_split)
@@ -1376,44 +1380,44 @@ class GeometryPanel(Panel):
         # каже; «авто» лишається в списку для тих, хто не знає.
         self.cmb_units.setCurrentText(DEFAULT_UNITS)
         self.cmb_units.currentTextChanged.connect(lambda _: self.emit_changed())
-        self.form.addRow("Одиниці STL", self.cmb_units)
+        self.form.addRow("STL units", self.cmb_units)
         _b = explain(self.cmb_units, "units")
         if _b: self.form.addRow(_b)
         self.v.addWidget(hint(
-            "STL не зберігає одиниць, а OpenFOAM працює в метрах. "
-            "«Авто» вгадує за габаритом.", "units",
-            title="Одиниці STL і метри"))
+            tr("STL does not store units, and OpenFOAM works in meters. "
+            "“Auto” guesses from the overall size."), "units",
+            title="STL units and meters"))
 
-        self.v.addWidget(section("Орієнтація всієї збірки"))
+        self.v.addWidget(section(tr("Orientation of the whole assembly")))
         rot = QtWidgets.QHBoxLayout()
         for axis in ("x", "y", "z"):
             # Коротко: «усе разом» вже сказано заголовком секції, а з ним
             # три кнопки в рядку хотіли 389 px — «Геометрія» на 2 px не
             # влазила в стовпчик і прокручувалась убік.
             b = QtWidgets.QPushButton(f"↻ {axis.upper()} 90°")
-            b.setToolTip(tr("Повернути на 90° навколо {upper} УСІ "
-                         "деталі одразу, навколо спільного центра. "
-                         "Складання з CAD при цьому не ламається.", upper=axis.upper()))
+            b.setToolTip(tr("Rotate ALL parts at once by 90° about "
+                            "{upper}, about the common center. The CAD "
+                            "assembly does not break.", upper=axis.upper()))
             b.clicked.connect(lambda _=False, a=axis: self.transform_requested.emit(a, 90.0))
             rot.addWidget(b)
         self.v.addLayout(rot)
         _b = explain(None, "rotate")
         if _b: self.v.addWidget(_b)
         self.v.addWidget(hint(
-            "Потік іде вздовж +X, розмах — по Y, вгору — Z. "
-            "Розверніть модель, якщо вона експортована інакше.\n"
-            "Крутить УСІ деталі разом навколо спільного центра — і ті, що "
-            "зараз без галочки, теж, щоб складання не розʼїхалося.",
-            "rotate", title="Осі моделі й поворот збірки"))
+            tr("The flow goes along +X, the span is along Y, up is Z. "
+            "Rotate the model if it was exported differently.\nRotates "
+            "ALL parts together around a common center — also the ones "
+            "that are unchecked now, so the assembly does not come apart."),
+            "rotate", title="Model axes and assembly rotation"))
 
         pos = QtWidgets.QHBoxLayout()
-        for label, key in (("Центрувати", "centre"), ("Посадити на z=0", "ground")):
+        for label, key in (("Center", "centre"), ("Put on z=0", "ground")):
             b = QtWidgets.QPushButton(label)
             b.clicked.connect(lambda _=False, k=key: self.transform_requested.emit(k, 0.0))
             pos.addWidget(b)
         self.v.addLayout(pos)
 
-        self.v.addWidget(section("Діагностика"))
+        self.v.addWidget(section(tr("Diagnostics")))
         self.table = QtWidgets.QTableWidget(0, 2)
         self.table.horizontalHeader().setVisible(False)
         self.table.verticalHeader().setVisible(False)
@@ -1432,26 +1436,26 @@ class GeometryPanel(Panel):
         self.notes.setOpenExternalLinks(False)
         self.v.addWidget(self.notes)
 
-        self.v.addWidget(section("Ремонт"))
+        self.v.addWidget(section(tr("Repair", ctx="section")))
         # One button «Полагодити» and a menu of methods (REPAIR_METHODS).
         # The menu is a QComboBox and not a split button: the method you
         # will get is always in view, before you push the button.
         fix = QtWidgets.QHBoxLayout()
-        self.btn_repair = QtWidgets.QPushButton("Полагодити")
+        self.btn_repair = QtWidgets.QPushButton("Repair")
         self.cmb_repair = QtWidgets.QComboBox()
         self.cmb_repair.setSizeAdjustPolicy(
             QtWidgets.QComboBox.AdjustToContents)
         model = QtGui.QStandardItemModel(self.cmb_repair)
-        for key, label, tip in REPAIR_METHODS:
-            item = QtGui.QStandardItem(label)
+        for key, _label, _tip in REPAIR_METHODS:
+            item = QtGui.QStandardItem(fs_repair.label(key))
             item.setData(key, QtCore.Qt.UserRole)
+            tip = fs_repair.tooltip(key)
             # A tool that is not on this computer (no Windows, no WinRT
             # packages, meshfix not built) gives a gray item. Its tooltip
-            # tells why. All three modules have available()/why_not().
-            gate = winfix if key == "winfix" else meshfix
-            if not gate.available():
+            # tells why.
+            if not fs_repair.available(key):
                 item.setEnabled(False)
-                tip = gate.why_not()
+                tip = fs_repair.why_not(key)
             item.setToolTip(tip)
             model.appendRow(item)
         self.cmb_repair.setModel(model)
@@ -1467,11 +1471,11 @@ class GeometryPanel(Panel):
         # the way back to the file.
         tools = QtWidgets.QHBoxLayout()
         for label, key, tip in (
-                ("Проріднити…", "decimate",
-                 "Менше трикутників — швидший пошук у snappy"),
-                ("Згустити", "subdivide",
-                 "Розбити кожен трикутник — якщо STL надто грубий"),
-                ("Скинути", "reset", "Повернутися до вихідного файлу")):
+                ("Decimate…", "decimate",
+                 "Fewer triangles — faster search in snappy"),
+                ("Subdivide", "subdivide",
+                 "Split each triangle — if the STL is too coarse"),
+                ("Reset", "reset", "Go back to the original file")):
             b = QtWidgets.QPushButton(label)
             b.setToolTip(tip)
             b.clicked.connect(lambda _=False, k=key: self.repair_requested.emit(k))
@@ -1540,11 +1544,11 @@ class GeometryPanel(Panel):
             self.lbl_split.setVisible(False)
             return
         if len(bodies) < 2:
-            text = ("Поки в сцені одна модель, патч лишається один — "
-                    "розділяти нема чого.")
+            text = (tr("While the scene has one model, there is one patch — "
+                    "there is nothing to split."))
             colour = "#7c8894"
         else:
-            text = tr("Патчі: {join}", join=", ".join(b.name for b in bodies))
+            text = tr("Patches: {join}", join=", ".join(b.name for b in bodies))
             colour = "#7c8894"
         bad = [t for lvl, t in guard if lvl == "bad"]
         if bad:
@@ -1603,11 +1607,12 @@ class GeometryPanel(Panel):
         r_root, r_tip = max(hub / 2.0, 1e-6), max(d / 2.0, 1e-6)
         b_root = math.degrees(math.atan2(pitch, 2 * math.pi * r_root))
         b_tip = math.degrees(math.atan2(pitch, 2 * math.pi * r_tip))
-        text = (tr("Кут установки: {b_root:.0f}° біля втулки, {b_tip:.0f}° на "
-                "кінці. Крок/діаметр = {v:.2f}.", b_root=b_root, b_tip=b_tip, v=pitch / max(d, 1e-9)))
+        text = (tr("Blade angle: {b_root:.0f}° at the hub, {b_tip:.0f}° "
+                   "at the tip. Pitch/diameter = {v:.2f}.", b_root=b_root, b_tip=b_tip, v=pitch / max(d, 1e-9)))
         if b_root > 80:
-            text += ("  УВАГА: біля втулки лопать стає майже впоперек "
-                     "потоку — крок завеликий для такої втулки.")
+            text += (tr("  WARNING: near the hub the blade becomes almost "
+                     "perpendicular to the flow — the pitch is too large "
+                     "for this hub."))
         self.prop_note.setText(text)
 
     def _show_level_cost(self, level) -> None:
@@ -1625,17 +1630,15 @@ class GeometryPanel(Panel):
             return
         if not level:
             self.lbl_level.setText(
-                tr("Спільний рівень {common} — комірка "
-                "{fmt_len}.", common=common, fmt_len=phys.fmt_len(base / 2 ** common)))
+                tr("Common level {common} — cell {fmt_len}.", common=common, fmt_len=phys.fmt_len(base / 2 ** common)))
         else:
             own = int(level[1])
             cost = 4.0 ** (own - common)
-            how = (tr("у {cost:.0f} разів більше", cost=cost) if cost >= 1
-                   else tr("у {v:.0f} разів менше", v=1 / cost))
+            how = (tr("{cost:.0f} times more", cost=cost) if cost >= 1
+                   else tr("{v:.0f} times fewer", v=1 / cost))
             self.lbl_level.setText(
-                tr("Рівень {own} — комірка {fmt_len} "
-                "проти спільних {fmt_len2}. "
-                "Граней на цій поверхні {how}.", own=own, fmt_len=phys.fmt_len(base / 2 ** own), fmt_len2=phys.fmt_len(base / 2 ** common), how=how))
+                tr("Level {own} — cell {fmt_len} versus the common "
+                   "{fmt_len2}. This surface gets {how} faces.", own=own, fmt_len=phys.fmt_len(base / 2 ** own), fmt_len2=phys.fmt_len(base / 2 ** common), how=how))
         self.lbl_level.setVisible(True)
 
     def _role_changed(self, *_):
@@ -1819,7 +1822,7 @@ class GeometryPanel(Panel):
             if not label:
                 self.box_role.setVisible(False)
                 return
-            self.lbl_role_for.setText(tr("Для моделі: {label}", label=label))
+            self.lbl_role_for.setText(tr("For model: {label}", label=label))
             idx = self.cmb_role.findData(role)
             self.cmb_role.setCurrentIndex(max(idx, 0))
             self.role_rpm.setValue(rpm)
@@ -1864,22 +1867,22 @@ class GeometryPanel(Panel):
             # на питання «а котрий із них».
             label = (self._part_labels[row] if row < len(self._part_labels)
                      else self._part_names[row])
-            self.btn_drop.setText(tr("Прибрати зі списку: {label}", label=label))
+            self.btn_drop.setText(tr("Remove from list: {label}", label=label))
             self.btn_drop.setToolTip(
-                tr("Забути цю модель. Сам файл лишається на диску."
-                "\n{part_names}", part_names=self._part_names[row]))
+                tr("Forget this model. The file itself stays on "
+                   "disk.\n{part_names}", part_names=self._part_names[row]))
         else:
-            self.btn_drop.setText("Прибрати зі списку")
+            self.btn_drop.setText("Remove from list")
             self.btn_drop.setToolTip(
-                "Спершу виберіть рядок у списку — кнопка прибере саме його. "
-                "Сам файл лишається на диску.")
+                "First select a row in the list — the button removes "
+                "that row. The file itself stays on the disk.")
 
     def _drop_current(self):
         row = self.parts.currentRow()
         if row < 0:
             # Сюди вже не мало б доходити: кнопка при порожньому виборі
             # вимкнена. Але як дійде — хай скаже, а не змовчить.
-            self.btn_drop.setToolTip("Немає вибраного рядка.")
+            self.btn_drop.setToolTip("No row selected.")
             return
         self.part_removed.emit(row)
 
@@ -1968,7 +1971,7 @@ class GeometryPanel(Panel):
         for level, text in notes:
             html.append(
                 f'<p style="margin:2px 0; color:{LEVEL_COLOR[level]}">• {text}</p>')
-        self.notes.setHtml("".join(html) or "<p style='color:#777'>—</p>")
+        self.notes.setHtml(fs_i18n.join("", html) or "<p style='color:#777'>—</p>")
 
     def unit_factor(self, auto_factor: float) -> float:
         return units_factor(self.cmb_units.currentText(), auto_factor)
@@ -1992,8 +1995,9 @@ class DomainPanel(Panel):
         d = cfg.domain
 
         self.v.insertWidget(0, hint(
-            "Розміри задаються в довжинах тіла вздовж потоку. Для крила "
-            "нормою є 5 попереду і 10-15 позаду, щоб слід встиг вирівнятися.", "upstream", title="Як задаються розміри домену"))
+            tr("Sizes are set in body lengths along the flow. For a wing, "
+            "the norm is 5 in front and 10-15 behind, so that the wake "
+            "has time to settle."), "upstream", title="How the domain size is set"))
 
         self.up = self.bind(dspin(0.5, 50, d.upstream, 0.5, 1, " L"),
                             lambda: setattr(d, "upstream", self.up.value()))
@@ -2005,44 +2009,44 @@ class DomainPanel(Panel):
                                lambda: setattr(d, "above", self.above.value()))
         self.below = self.bind(dspin(0.5, 50, d.below, 0.5, 1, " L"),
                                lambda: setattr(d, "below", self.below.value()))
-        self.form.addRow("Попереду", self.up)
+        self.form.addRow(tr("Upstream", ctx="domain"), self.up)
         _b = explain(self.up, "upstream")
         if _b: self.form.addRow(_b)
-        self.form.addRow("Позаду", self.down)
+        self.form.addRow(tr("Downstream", ctx="domain"), self.down)
         _b = explain(self.down, "downstream")
         if _b: self.form.addRow(_b)
-        self.form.addRow("З боків", self.side)
+        self.form.addRow("Sides", self.side)
         _b = explain(self.side, "side")
         if _b: self.form.addRow(_b)
-        self.form.addRow("Згори", self.above)
-        self.form.addRow("Знизу", self.below)
+        self.form.addRow("Top", self.above)
+        self.form.addRow("Bottom", self.below)
 
-        self.v.addWidget(section("Фонова сітка"))
+        self.v.addWidget(section(tr("Background Mesh")))
         self.ncells = self.bind(ispin(5, 400, d.base_cells_along_x, 5),
                                 lambda: setattr(d, "base_cells_along_x",
                                                 self.ncells.value()))
-        self.form.addRow("Комірок уздовж X", self.ncells)
+        self.form.addRow("Cells along X", self.ncells)
         _b = explain(self.ncells, "base_cells_x")
         if _b: self.form.addRow(_b)
         self.v.addWidget(hint(
-            "blockMesh робить кубічні комірки: поділ по Y і Z рахується "
-            "автоматично з цього числа.", "base_cells_x",
-            title="Як ділиться фонова сітка"))
+            tr("blockMesh makes cubic cells: the division along Y and Z is "
+            "calculated automatically from this number."), "base_cells_x",
+            title="How the background mesh is divided"))
 
-        self.v.addWidget(section("Земля"))
-        self.ground = QtWidgets.QCheckBox("Нижня межа — стінка (ефект землі)")
+        self.v.addWidget(section(tr("Ground")))
+        self.ground = QtWidgets.QCheckBox("Bottom boundary is a wall (ground effect)")
         self.ground.setChecked(d.ground)
         self.ground.toggled.connect(self._ground_changed)
         self.v.addWidget(self.ground)
-        self.ground_z = self.bind(dspin(-100, 100, d.ground_offset, 0.05, 4, " м"),
+        self.ground_z = self.bind(dspin(-100, 100, d.ground_offset, 0.05, 4, " m"),
                                   lambda: setattr(d, "ground_offset",
                                                   self.ground_z.value()))
         self.ground_z.setEnabled(d.ground)
         self.form2 = QtWidgets.QFormLayout()
-        self.form2.addRow("Висота землі", self.ground_z)
+        self.form2.addRow("Ground height", self.ground_z)
         self.v.addLayout(self.form2)
 
-        self.v.addWidget(section("Результат"))
+        self.v.addWidget(section(tr("Result")))
         self.info = WrapLabel()
         self.info.setWordWrap(True)
         self.info.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
@@ -2078,12 +2082,10 @@ class DomainPanel(Panel):
         nx, ny, nz = c.block_divisions
         x0, x1, y0, y1, z0, z1 = c.bounds
         self.info.setText(
-            tr("Домен      {sx:.4g} × {sy:.4g} × {sz:.4g} м\n"
-            "X          {x0:.4g} … {x1:.4g}\n"
-            "Y          {y0:.4g} … {y1:.4g}\n"
-            "Z          {z0:.4g} … {z1:.4g}\n"
-            "blockMesh  {nx} × {ny} × {nz} = {fmt_cells}\n"
-            "Комірка    {base_cell}", sx=sx, sy=sy, sz=sz, x0=x0, x1=x1, y0=y0, y1=y1, z0=z0, z1=z1, nx=nx, ny=ny, nz=nz, fmt_cells=phys.fmt_cells(nx * ny * nz), base_cell=phys.fmt_len(c.base_cell))
+            tr("Domain     {sx:.4g} × {sy:.4g} × {sz:.4g} m\nX          "
+               "{x0:.4g} … {x1:.4g}\nY          {y0:.4g} … {y1:.4g}\nZ     "
+               "     {z0:.4g} … {z1:.4g}\nblockMesh  {nx} × {ny} × {nz} = "
+               "{fmt_cells}\nCell       {base_cell}", sx=sx, sy=sy, sz=sz, x0=x0, x1=x1, y0=y0, y1=y1, z0=z0, z1=z1, nx=nx, ny=ny, nz=nz, fmt_cells=phys.fmt_cells(nx * ny * nz), base_cell=phys.fmt_len(c.base_cell))
         )
 
 
@@ -2101,24 +2103,24 @@ class MeshPanel(Panel):
         super().__init__(cfg, parent)
         m = cfg.mesh
 
-        self.v.insertWidget(0, section("Рефайнмент поверхні"))
+        self.v.insertWidget(0, section(tr("Surface Refinement")))
         self.lmin = self.bind(ispin(0, 10, m.surface_level_min),
                               lambda: setattr(m, "surface_level_min", self.lmin.value()))
         self.lmax = self.bind(ispin(0, 10, m.surface_level_max),
                               lambda: setattr(m, "surface_level_max", self.lmax.value()))
         self.lfeat = self.bind(ispin(0, 10, m.feature_level),
                                lambda: setattr(m, "feature_level", self.lfeat.value()))
-        self.form.addRow("Рівень min", self.lmin)
-        self.form.addRow("Рівень max", self.lmax)
+        self.form.addRow("Level min", self.lmin)
+        self.form.addRow("Level max", self.lmax)
         _b = explain(self.lmax, "level_max")
         if _b: self.form.addRow(_b)
-        self.form.addRow("Рівень кромок", self.lfeat)
+        self.form.addRow("Edge level", self.lfeat)
         _b = explain(self.lfeat, "feature_level")
         if _b: self.form.addRow(_b)
         self.v.addWidget(hint(
-            "Кожен рівень ділить комірку навпіл. Рівень 5 від фонової комірки "
-            "означає поділ у 32 рази.", "level_max",
-            title="Що означає рівень"))
+            tr("Each level splits the cell in half. Level 5 from the "
+            "background cell means division by 32."), "level_max",
+            title="What the level means"))
 
         self.angle = self.bind(ispin(0, 180, m.resolve_feature_angle, 5, "°"),
                                lambda: setattr(m, "resolve_feature_angle",
@@ -2132,12 +2134,13 @@ class MeshPanel(Panel):
         self.form.addRow("includedAngle", self.incl)
         _b = explain(self.incl, "included_angle")
         if _b: self.form.addRow(_b)
-        self.form.addRow("Комірок між рівнями", self.between)
+        self.form.addRow("Cells between levels", self.between)
         _b = explain(self.between, "cells_between_levels")
         if _b: self.form.addRow(_b)
         self.v.addWidget(hint(
-            "includedAngle нижче 150° на фасетованій моделі перетворює кожен "
-            "шов між трикутниками на «кромку». Для органіки ставте 160-170.", "included_angle", title="includedAngle на фасетованій моделі"))
+            tr("includedAngle below 150° on a faceted model turns each seam "
+            "between triangles into an “edge”. For organic shapes, set "
+            "160-170."), "included_angle", title="includedAngle on a faceted model"))
 
         self.maxcells = self.bind(ispin(100_000, 200_000_000, m.max_global_cells,
                                         500_000),
@@ -2145,8 +2148,8 @@ class MeshPanel(Panel):
                                                   self.maxcells.value()))
         self.form.addRow("maxGlobalCells", self.maxcells)
 
-        self.v.addWidget(section("Коробка згущення"))
-        self.box_on = QtWidgets.QCheckBox("Коробка навколо тіла зі слідом")
+        self.v.addWidget(section(tr("Refinement Box")))
+        self.box_on = QtWidgets.QCheckBox("Box around the body with wake")
         self.box_on.setChecked(True)
         self.box_on.toggled.connect(lambda _: self.emit_changed())
         self.v.addWidget(self.box_on)
@@ -2156,11 +2159,11 @@ class MeshPanel(Panel):
         self.box_level = ispin(0, 8, 2)
         for w in (self.box_factor, self.box_wake, self.box_level):
             w.valueChanged.connect(lambda _: self.emit_changed())
-        bf.addRow("Запас навколо тіла", self.box_factor)
-        bf.addRow("Довжина сліду", self.box_wake)
+        bf.addRow("Margin around the body", self.box_factor)
+        bf.addRow("Wake length", self.box_wake)
         _b = explain(self.box_wake, "box_wake")
         if _b: bf.addRow(_b)
-        bf.addRow("Рівень", self.box_level)
+        bf.addRow("Level", self.box_level)
         self.v.addLayout(bf)
 
         # --- КООРДИНАТИ РУКАМИ ------------------------------------------
@@ -2174,22 +2177,22 @@ class MeshPanel(Panel):
         # порахована коробка, а введене лишилося й чекає. Інакше кожне
         # перемикання коштувало б шести чисел наново.
         self.box_manual = QtWidgets.QCheckBox(
-            "Задати координати руками")
+            "Set coordinates manually")
         self.box_manual.setToolTip(
-            "Зняти галочку — повернеться коробка, порахована з габариту "
-            "тіла. Введені числа при цьому не пропадуть.")
+            "Clear the check box — the box computed from the body size "
+            "comes back. The numbers you entered are not lost.")
         self.box_manual.toggled.connect(self._box_manual_toggled)
         self.v.addWidget(self.box_manual)
 
         self.box_lo, self.box_hi = [], []
         mf = QtWidgets.QFormLayout()
-        for label, store in (("Від (мін)", self.box_lo),
-                             ("До (макс)", self.box_hi)):
+        for label, store in (("From (min)", self.box_lo),
+                             ("To (max)", self.box_hi)):
             row = QtWidgets.QHBoxLayout()
             for ax in "XYZ":
-                sp = dspin(-1000.0, 1000.0, 0.0, 0.01, 4, " м")
-                sp.setToolTip(tr("{ax} межі коробки згущення, у метрах "
-                              "кейсу", ax=ax))
+                sp = dspin(-1000.0, 1000.0, 0.0, 0.01, 4, " m")
+                sp.setToolTip(tr("{ax} bound of the refinement box, in "
+                                 "case meters", ax=ax))
                 sp.valueChanged.connect(lambda _: self.emit_changed())
                 store.append(sp)
                 row.addWidget(QtWidgets.QLabel(ax))
@@ -2198,10 +2201,11 @@ class MeshPanel(Panel):
         self.v.addLayout(mf)
 
         self.btn_box_fit = QtWidgets.QPushButton(
-            "Підставити пораховану коробку")
+            "Insert computed box")
         self.btn_box_fit.setToolTip(
-            "Заповнити поля тим, що дали б «Запас» і «Довжина сліду» — "
-            "щоб правити від чогось розумного, а не від нулів.")
+            "Fill the fields with what “Margin” and “Wake length” would "
+            "give — so that you edit from something reasonable, not from "
+            "zeros.")
         self.btn_box_fit.clicked.connect(self.fill_box_from_auto)
         self.v.addWidget(self.btn_box_fit)
 
@@ -2217,10 +2221,10 @@ class MeshPanel(Panel):
         # неї додаються чотири навколо гвинтів, і всі вони досі жили без
         # жодного важеля. Побачити їх можна було тільки у вювпорті
         # жовтими рамками, а змінити — ніяк.
-        self.v.addWidget(section("Кожна коробка окремо"))
+        self.v.addWidget(section(tr("Each box separately")))
         self.boxes = QtWidgets.QTableWidget(0, 4)
         self.boxes.setHorizontalHeaderLabels(
-            ["Коробка", "Звідки", "Розмір, мм", "Рівень"])
+            ["Box", "Source", "Size, mm", "Level"])
         self.boxes.verticalHeader().setVisible(False)
         self.boxes.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectRows)
@@ -2231,43 +2235,44 @@ class MeshPanel(Panel):
         hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.v.addWidget(self.boxes)
         self.v.addWidget(hint(
-            "Рівень кожної коробки правиться просто тут. Коробки навколо "
-            "гвинтів зʼявляються самі з обертових зон і їдуть за ними, "
-            "якщо гвинт посунути — а рівень, поставлений руками, "
-            "перебудову переживає.", title="Рівні коробок і коробки гвинтів"))
+            tr("You edit the level of each box right here. Boxes around "
+            "propellers come automatically from the rotating zones and "
+            "move with them if you move the propeller — and a level set "
+            "by hand survives the rebuild."), title="Box levels and propeller boxes"))
         self.lbl_boxes = WrapLabel("")
         self.lbl_boxes.setStyleSheet("color:#7c8894; font-size:11px;")
         self.v.addWidget(self.lbl_boxes)
 
-        self.v.addWidget(section("Оболонка навколо тіла"))
+        self.v.addWidget(section(tr("Shell around the body")))
         self.shell_on = QtWidgets.QCheckBox(
-            "Згущувати шаром, що повторює форму тіла")
+            "Refine with a layer that follows the body shape")
         self.shell_on.setChecked(m.shell_on)
         self.shell_on.toggled.connect(lambda _: self.emit_changed())
         self.v.addWidget(self.shell_on)
         sf = QtWidgets.QFormLayout()
-        self.shell_reach = dspin(0.0, 10.0, m.shell_reach, 0.005, 3, " м")
+        self.shell_reach = dspin(0.0, 10.0, m.shell_reach, 0.005, 3, " m")
         self.shell_level = ispin(0, 9, m.shell_level)
         self.shell_steps = ispin(1, 5, m.shell_steps)
         for w in (self.shell_reach, self.shell_level, self.shell_steps):
             w.valueChanged.connect(lambda _: self.emit_changed())
-        sf.addRow("Товщина (0 — авто)", self.shell_reach)
+        sf.addRow("Thickness (0 — auto)", self.shell_reach)
         _s = explain(self.shell_reach, "shell_reach")
         if _s: sf.addRow(_s)
-        sf.addRow("Рівень біля стінки (0 — авто)", self.shell_level)
-        sf.addRow("Сходинок", self.shell_steps)
+        sf.addRow("Level at the wall (0 — auto)", self.shell_level)
+        sf.addRow("Steps", self.shell_steps)
         self.v.addLayout(sf)
         self.v.addWidget(hint(
-            "Коробка навколо тонкого тіла згущує гори порожнього повітря над "
-            "ним і під ним. Оболонка задається ВІДСТАННЮ від поверхні, тому "
-            "повторює форму: тонка на кромці, товща там, де тіло товсте. На "
-            "тестовому літаку коробка займає 2.3 м³, оболонка 0.077 — у "
-            "тридцять разів менше при тій самій роздільності біля стінки. "
-            "Зона виходить і перед носом теж: відстань міряється в усі боки.",
-            "shell_reach", title="Оболонка проти коробки"))
+            tr("A box around a thin body refines piles of empty air above "
+            "and below it. A shell is set by DISTANCE from the surface, "
+            "so it follows the shape: thin at the edge, thicker where "
+            "the body is thick. On the test aircraft the box takes 2.3 "
+            "m³, the shell 0.077 — thirty times less at the same "
+            "resolution near the wall. The zone also goes in front of "
+            "the nose: the distance is measured in all directions."),
+            "shell_reach", title="Shell versus box"))
 
-        self.v.addWidget(section("Призматичні шари"))
-        self.layers_on = QtWidgets.QCheckBox("Нарощувати пограншар")
+        self.v.addWidget(section(tr("Prism Layers")))
+        self.layers_on = QtWidgets.QCheckBox("Grow boundary layer")
         self.layers_on.setChecked(m.add_layers)
         self.layers_on.toggled.connect(self._layers_toggled)
         self.v.addWidget(self.layers_on)
@@ -2283,7 +2288,7 @@ class MeshPanel(Panel):
         self.minthick = self.bind(dspin(0.001, 0.5, m.min_thickness_rel, 0.01, 3),
                                   lambda: setattr(m, "min_thickness_rel",
                                                   self.minthick.value()))
-        lf.addRow("Кількість шарів", self.nlayers)
+        lf.addRow("Number of layers", self.nlayers)
         _b = explain(self.nlayers, "n_layers")
         if _b: lf.addRow(_b)
         lf.addRow("expansionRatio", self.expansion)
@@ -2300,16 +2305,16 @@ class MeshPanel(Panel):
         row = QtWidgets.QHBoxLayout()
         self.target_yplus = dspin(0.3, 500, m.target_yplus or 50, 5, 1)
         self.target_yplus.valueChanged.connect(self._target_typed)
-        self.btn_fit = QtWidgets.QPushButton("Підібрати шари")
+        self.btn_fit = QtWidgets.QPushButton("Fit layers")
         self.btn_fit.clicked.connect(self._fit_clicked)
-        self.chk_auto = QtWidgets.QCheckBox("Авто")
+        self.chk_auto = QtWidgets.QCheckBox("Auto")
         self.chk_auto.setChecked(m.yplus_auto)
         self.chk_auto.setToolTip(
-            "Програма сама вибирає y+ під модель турбулентності й Re і\n"
-            "підбирає шари після кожної зміни, що на це впливає.\n"
-            "Введений вручну y+ або кількість шарів вимикають «Авто».")
+            "The program itself picks y+ for the turbulence model and Re "
+            "and\nfits the layers after each change that affects them.\nA "
+            "y+ or a layer count entered by hand turns off “Auto”.")
         self.chk_auto.toggled.connect(self._auto_toggled)
-        row.addWidget(QtWidgets.QLabel("Цільовий y+"))
+        row.addWidget(QtWidgets.QLabel("Target y+"))
         row.addWidget(self.target_yplus)
         row.addWidget(self.btn_fit)
         row.addWidget(self.chk_auto)
@@ -2339,21 +2344,21 @@ class MeshPanel(Panel):
         fix_row.addStretch(1)
         self.v.addLayout(fix_row)
         self.yplus_hint = hint(fy.model_hint(cfg.flow.turbulence),
-                               title="Який y+ потрібен цій моделі")
+                               title="Which y+ this model needs")
         self.v.addWidget(self.yplus_hint)
 
-        self.v.addWidget(section("Адаптація: згущувати за розвʼязком"))
+        self.v.addWidget(section(tr("Adaptation: refine by the solution")))
         self.adapt_mode = QtWidgets.QComboBox()
         # Порядок не випадковий: спершу те, що нічого не змінює, далі
         # дешеве, далі дороге. Підписи кажуть ЦІНУ, а не назву механізму —
         # людині вибирати між «швидко» й «точно», а не між іменами
         # класів OpenFOAM.
         for key, label in (
-                ("none", "немає — сітка така, як задано вище"),
-                ("rebuild", "перебудова: дешевий прогін, потім сітка "
-                            "наново (стаціонарний, зі шарами)"),
-                ("native", "рідна OpenFOAM: ділити під час прогону "
-                           "(лише нестаціонарний)")):
+                ("none", "none — the mesh is as set above"),
+                ("rebuild", "rebuild: a cheap run, then the mesh again "
+                            "(steady, with layers)"),
+                ("native", "native OpenFOAM: split during the run "
+                           "(transient only)")):
             self.adapt_mode.addItem(label, key)
         idx = self.adapt_mode.findData(getattr(ad := cfg.adapt, "mode", "none"))
         self.adapt_mode.setCurrentIndex(max(idx, 0))
@@ -2365,7 +2370,7 @@ class MeshPanel(Panel):
         self.adapt_frac = dspin(0.01, 0.40, ad.fraction, 0.01, 2)
         self.adapt_every = ispin(1, 500, ad.interval)
         self.adapt_curl = QtWidgets.QCheckBox(
-            "брати ще завихреність — щоб бачити слід")
+            "also use vorticity — to see the wake")
         self.adapt_curl.setChecked(ad.use_curl)
         for w in (self.adapt_level, self.adapt_frac, self.adapt_every):
             w.valueChanged.connect(lambda _: self._adapt_changed())
@@ -2375,23 +2380,25 @@ class MeshPanel(Panel):
         # не поділилася жодна комірка. Число, що піде у словник, показуємо
         # нижче окремим рядком, щоб не треба було тримати перерахунок у
         # голові.
-        af.addRow("Ділити глибше на, рівнів", self.adapt_level)
-        af.addRow("Частка комірок", self.adapt_frac)
-        af.addRow("Перевіряти кожні, кроків", self.adapt_every)
+        af.addRow("Split deeper by, levels", self.adapt_level)
+        af.addRow("Cell fraction", self.adapt_frac)
+        af.addRow("Check every, steps", self.adapt_every)
         self.v.addLayout(af)
         self.v.addWidget(self.adapt_curl)
         self.adapt_note = WrapLabel()
         self.adapt_note.setWordWrap(True)
         self.v.addWidget(self.adapt_note)
         self.v.addWidget(hint(
-            "Показник — градієнт тиску, помножений на розмір комірки, плюс "
-            "завихреність. Множення на розмір робить із крутизни поля "
-            "оцінку похибки на комірці. Завихреність додається заради "
-            "СЛІДУ: у ньому тиск рівний, і градієнт тиску там сліпий. У "
-            "перевірці зона за самим градієнтом тягнулася на 0.4 м від "
-            "носа, а з завихреністю — на 6.8 м, тобто разом зі слідом.", title="З чого рахується показник адаптації"))
+            tr("The indicator is the pressure gradient multiplied by the "
+            "cell size, plus vorticity. Multiplication by the size turns "
+            "the steepness of the field into an error estimate on the "
+            "cell. Vorticity is added for the WAKE: in it the pressure "
+            "is flat, and the pressure gradient is blind there. In a "
+            "test, the zone from the gradient alone extended 0.4 m from "
+            "the nose, and with vorticity — 6.8 m, that is, together "
+            "with the wake."), title="What the adaptation indicator is computed from"))
 
-        self.v.addWidget(section("Оцінка"))
+        self.v.addWidget(section(tr("Estimate")))
         self.info = WrapLabel()
         self.info.setWordWrap(True)
         self.info.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
@@ -2432,8 +2439,8 @@ class MeshPanel(Panel):
             # Спершу найдорожчий наслідок вибору, а тоді подробиці. Вибір
             # режиму адаптації тягне за собою РОЗВʼЯЗУВАЧА, і дізнатися
             # про це треба тут, а не падінням через двадцять хвилин.
-            lines.append("Потрібен НЕСТАЦІОНАРНИЙ розвʼязувач: сітка "
-                         "міняється під час прогону.")
+            lines.append(tr("A TRANSIENT solver is necessary: the mesh "
+                         "changes during the run."))
             # Далі — число, у якому найлегше помилитися: людина ставить
             # «на скільки», а OpenFOAM читає «до якого». Показуємо обидва
             # й розмір комірки, бо саме він відповідає на «чи не занадто».
@@ -2441,38 +2448,38 @@ class MeshPanel(Panel):
             top = base + max(a.max_level, 1)
             small = self.cfg.base_cell / 2 ** top
             lines.append(
-                tr("Сітка вже має рівень {base}; ділити дозволено до {top}. "
-                "Найдрібніша комірка стане {v:.2f} мм "
-                "(зараз {v2:.2f} мм).", base=base, top=top, v=small * 1000, v2=self.cfg.base_cell / 2 ** base * 1000))
+                tr("The mesh already has level {base}; division is "
+                   "allowed up to {top}. The smallest cell will be "
+                   "{v:.2f} mm (now {v2:.2f} mm).", base=base, top=top, v=small * 1000, v2=self.cfg.base_cell / 2 ** base * 1000))
             # Пристінний пояс — не подробиця, а третина-половина сітки,
             # якої адаптація не торкнеться. Краще побачити це тут, ніж
             # дивуватися потім, чому біля тіла нічого не змінилося.
             guard = self.cfg.adapt_wall_guard
             ref = self.cfg.flow.l_ref or self.cfg.body_length
-            share = tr(", тобто {v:.0f}% опорної довжини", v=guard / ref * 100) \
+            share = tr(", that is {v:.0f}% of the reference length", v=guard / ref * 100) \
                 if ref > 0 else ""
             lines.append(
-                tr("Пристінний пояс {v:.1f} мм{share} адаптація "
-                "не чіпає: hexRef8 не вміє ділити пригнані до поверхні "
-                "комірки, а там цього й не треба.", v=guard * 1000, share=share))
+                tr("The adaptation does not touch the near-wall band of "
+                   "{v:.1f} mm{share}: hexRef8 cannot divide cells "
+                   "snapped to the surface, and they do not need it.", v=guard * 1000, share=share))
             # Стеля на комірки мʼяка, і це виміряно: при 1 200 000 сітка
             # стала на 1 461 595. Сказати про це треба там, де людина
             # прикидає памʼять, а не постфактум у журналі.
             soft = int(a.max_cells * 1.25)
             lines.append(
-                tr("Стеля {v:.1f} млн комірок — мʼяка: "
-                "OpenFOAM додає цілий рівень, перш ніж перевірити запас, "
-                "а тоді ще дописує сусідів заради правила 2:1. На "
-                "перевірці вийшло на 22% більше. Памʼять рахуйте "
-                "приблизно на {v2:.1f} млн.", v=a.max_cells / 1e6, v2=soft / 1e6))
+                tr("The cap of {v:.1f} M cells is soft: OpenFOAM adds a "
+                   "whole level before it checks the margin, and then "
+                   "adds neighbors for the 2:1 rule. In a test the mesh "
+                   "came out 22% larger. Plan memory for about {v2:.1f} "
+                   "M.", v=a.max_cells / 1e6, v2=soft / 1e6))
         else:
-            lines.append("Працює зі стаціонарним і з призматичними шарами. "
-                         "Ціна — два проходи замість одного.")
+            lines.append(tr("Works with steady and with prism layers. The "
+                         "cost — two passes instead of one."))
         for t in bad:
             lines.append("⛔ " + t)
         for t in warn:
             lines.append("⚠ " + t)
-        self.adapt_note.setText("\n".join(lines))
+        self.adapt_note.setText(fs_i18n.join("\n", lines))
 
     def _layers_toggled(self, on):
         self.cfg.mesh.add_layers = on
@@ -2588,7 +2595,7 @@ class MeshPanel(Panel):
             target, c.flow.u_inf, c.flow.l_ref, c.flow.nu,
             c.surface_cell, c.mesh.expansion, c.mesh.final_layer_rel)
         if not n:
-            self.fit_note.setText("Не вдалося підібрати: перевірте швидкість і Lref.")
+            self.fit_note.setText("Could not find a value: check the speed and Lref.")
             return
         self.nlayers.setValue(n)
         self.fit_note.setStyleSheet("color:#b8860b; font-size:11px;")
@@ -2600,13 +2607,14 @@ class MeshPanel(Panel):
             # Навіть один шар виходить товщим за потрібний: обмежує не кількість
             # шарів, а розмір комірки на поверхні.
             self.fit_note.setText(
-                tr("Нижче y+ ≈ {got:.0f} не опуститися: перший шар уже дорівнює "
-                "finalLayerThickness. Зменшіть finalLayerThickness або "
-                "підніміть рівень рефайнменту поверхні.", got=got))
+                tr("y+ cannot go below ≈ {got:.0f}: the first layer "
+                   "already equals finalLayerThickness. Decrease "
+                   "finalLayerThickness or raise the surface refinement "
+                   "level.", got=got))
         elif abs(got - target) / max(target, 1e-9) > 0.3:
-            self.fit_note.setText(tr("Найближче можливе: {n} шарів дає y+ ≈ {got:.1f}.", n=n, got=got))
+            self.fit_note.setText(tr("Closest possible: {n} layers give y+ ≈ {got:.1f}.", n=n, got=got))
         else:
-            self.fit_note.setText(tr("{n} шарів дає y+ ≈ {got:.1f}.", n=n, got=got))
+            self.fit_note.setText(tr("{n} layers give y+ ≈ {got:.1f}.", n=n, got=got))
 
     def load_cfg(self):
         m = self.cfg.mesh
@@ -2708,8 +2716,8 @@ class MeshPanel(Panel):
                 size = [(h - lo) * 1000 for lo, h in zip(b.min, b.max)]
                 for col, text in enumerate((
                         b.name,
-                        {"body": tr("тіло"), "zone": tr("гвинт"),
-                         "manual": tr("руками")}.get(b.source, b.source),
+                        {"body": tr("body"), "zone": tr("propeller"),
+                         "manual": tr("manual")}.get(b.source, b.source),
                         f"{size[0]:.0f} × {size[1]:.0f} × {size[2]:.0f}")):
                     item = self.boxes.item(row, col)
                     if item is None:
@@ -2728,7 +2736,7 @@ class MeshPanel(Panel):
                     sp.blockSignals(True)
                     sp.setValue(b.level)
                     sp.blockSignals(False)
-                sp.setToolTip(tr("Комірка в цій коробці: {cell}{v}", cell=phys.fmt_len(cell), v="  (рівень поставлено руками)"
+                sp.setToolTip(tr("Cell in this box: {cell}{v}", cell=phys.fmt_len(cell), v="  (level set by hand)"
                                  if b.level_by_hand else ""))
             self.boxes.resizeColumnsToContents()
             self.boxes.horizontalHeader().setSectionResizeMode(
@@ -2736,13 +2744,12 @@ class MeshPanel(Panel):
         finally:
             self._filling_boxes = False
         if not boxes:
-            self.lbl_boxes.setText("Коробок згущення немає.")
+            self.lbl_boxes.setText("No refinement boxes.")
         else:
             worst = min(base / 2 ** max(b.level, 0) for b in boxes) \
                 if base > 0 else 0.0
             self.lbl_boxes.setText(
-                tr("Коробок: {n_boxes}. Найдрібніша комірка в них — "
-                "{worst}.", n_boxes=len(boxes), worst=phys.fmt_len(worst)))
+                tr("Boxes: {n_boxes}. The smallest cell in them is {worst}.", n_boxes=len(boxes), worst=phys.fmt_len(worst)))
 
     def _box_level_changed(self, name: str, level: int):
         if getattr(self, "_filling_boxes", False):
@@ -2813,26 +2820,25 @@ class MeshPanel(Panel):
         stack = c.layer_stack
         f = c.flow
         lines = [
-            tr("Комірка на поверхні  {surface_cell}", surface_cell=phys.fmt_len(c.surface_cell)),
-            tr("Комірка на кромках   {fmt_len}", fmt_len=phys.fmt_len(c.base_cell / 2 ** c.mesh.feature_level)),
+            tr("Cell on surface  {surface_cell}", surface_cell=phys.fmt_len(c.surface_cell)),
+            tr("Cell on edges    {fmt_len}", fmt_len=phys.fmt_len(c.base_cell / 2 ** c.mesh.feature_level)),
         ]
         if stack.n_layers:
             yp = stack.yplus(f.u_inf, f.l_ref, f.nu)
             label, level = phys.yplus_regime(yp)
             cover = stack.covers_bl(f.u_inf, f.l_ref, f.nu)
             lines += [
-                tr("Перший шар           {first_abs}", first_abs=phys.fmt_len(stack.first_abs)),
-                tr("Стек шарів           {total}", total=phys.fmt_len(stack.total)),
-                tr("Пограншар            {fmt_len}", fmt_len=phys.fmt_len(phys.bl_thickness(f.u_inf, f.l_ref, f.nu))),
+                tr("First layer          {first_abs}", first_abs=phys.fmt_len(stack.first_abs)),
+                tr("Layer stack          {total}", total=phys.fmt_len(stack.total)),
+                tr("Boundary layer       {fmt_len}", fmt_len=phys.fmt_len(phys.bl_thickness(f.u_inf, f.l_ref, f.nu))),
                 # Не «покриття»: так називається ще й частка граней, які
                 # отримали шари після прогону, а це зовсім інше число.
-                tr("Стек / пограншар     {cover:.2f}  "
-                "({v})", cover=cover, v='досить' if cover >= 0.5 else 'стек надто тонкий'),
-                tr("y+ (оцінка)          {yp:.1f} — {label}", yp=yp, label=label),
+                tr("Stack / BL thickness {cover:.2f}  ({v})", cover=cover, v='enough' if cover >= 0.5 else 'stack too thin'),
+                tr("y+ (estimate)        {yp:.1f} — {label}", yp=yp, label=label),
             ]
         else:
-            lines.append("Шарів немає — пристінні функції на «голій» сітці")
-        self.info.setText("\n".join(lines))
+            lines.append(tr("No layers — wall functions on a “bare” mesh"))
+        self.info.setText(fs_i18n.join("\n", lines))
         self.refresh_yplus()
 
 
@@ -2845,30 +2851,31 @@ class FlowPanel(Panel):
         super().__init__(cfg, parent)
         f = cfg.flow
 
-        self.u = self.bind(dspin(0.001, 2000, f.u_inf, 1, 3, " м/с"),
+        self.u = self.bind(dspin(0.001, 2000, f.u_inf, 1, 3, " m/s"),
                            lambda: setattr(f, "u_inf", self.u.value()))
         self.aoa = self.bind(dspin(-90, 90, f.aoa_deg, 0.5, 2, "°"),
                              lambda: setattr(f, "aoa_deg", self.aoa.value()))
         self.aos = self.bind(dspin(-90, 90, f.aos_deg, 0.5, 2, "°"),
                              lambda: setattr(f, "aos_deg", self.aos.value()))
-        self.form.addRow("Швидкість", self.u)
+        self.form.addRow("Speed", self.u)
         _b = explain(self.u, "u_inf")
         if _b: self.form.addRow(_b)
-        self.form.addRow("Кут атаки", self.aoa)
+        self.form.addRow("Angle of attack", self.aoa)
         _b = explain(self.aoa, "aoa")
         if _b: self.form.addRow(_b)
-        self.form.addRow("Кут ковзання", self.aos)
+        self.form.addRow("Sideslip angle", self.aos)
         self.v.addWidget(hint(
-            "Кут задається поворотом набігаючого потоку, а не геометрії — "
-            "напрямки підйомної сили й опору переставляються автоматично.", "aoa", title="Як задається кут атаки"))
+            tr("The angle is set by rotating the freestream, not the "
+            "geometry — the lift and drag directions change "
+            "automatically."), "aoa", title="How the angle of attack is set"))
 
-        self.v.addWidget(section("Дальнє поле"))
+        self.v.addWidget(section(tr("Far Field")))
         self.cmb_far = QtWidgets.QComboBox()
-        self.cmb_far.addItem("freestream (рекомендовано)", "freestream")
-        self.cmb_far.addItem("аеротруба: вхід-вихід + slip", "tunnel")
+        self.cmb_far.addItem("freestream (recommended)", "freestream")
+        self.cmb_far.addItem("wind tunnel: inlet-outlet + slip", "tunnel")
         self.cmb_far.currentIndexChanged.connect(self._far_changed)
         self.form_far = QtWidgets.QFormLayout()
-        self.form_far.addRow("Тип меж", self.cmb_far)
+        self.form_far.addRow("Boundary type", self.cmb_far)
         _b = explain(self.cmb_far, "farfield")
         if _b: self.form_far.addRow(_b)
         self.v.addLayout(self.form_far)
@@ -2878,20 +2885,22 @@ class FlowPanel(Panel):
         self.lbl_far.setWordWrap(True)
         self.v.addWidget(self.lbl_far)
         self.v.addWidget(hint(
-            "freestream сам визначає, де вхід, а де вихід, за напрямком "
-            "потоку крізь грань. Режим аеротруби зі slip на бічних межах "
-            "занулює нормальну складову швидкості, тобто зрізає кут атаки.", "farfield", title="freestream і режим аеротруби"))
+            tr("freestream itself decides where the inlet is and where the "
+            "outlet is, from the flow direction through the face. The "
+            "wind tunnel mode with slip on the side boundaries sets the "
+            "normal velocity component to zero, so it cuts the angle of "
+            "attack."), "farfield", title="freestream and wind tunnel mode"))
 
-        self.v.addWidget(section("Режим течії"))
+        self.v.addWidget(section(tr("Flow Regime")))
         self.cmb_regime = QtWidgets.QComboBox()
-        self.cmb_regime.addItem("нестислива — simpleFoam", "incompressible")
-        self.cmb_regime.addItem("стислива — rhoSimpleFoam", "compressible")
+        self.cmb_regime.addItem("incompressible — simpleFoam", "incompressible")
+        self.cmb_regime.addItem("compressible — rhoSimpleFoam", "compressible")
         index = self.cmb_regime.findData(f.regime)
         if index >= 0:
             self.cmb_regime.setCurrentIndex(index)
         self.cmb_regime.currentIndexChanged.connect(self._regime_changed)
         self.form_reg = QtWidgets.QFormLayout()
-        self.form_reg.addRow("Режим", self.cmb_regime)
+        self.form_reg.addRow("Mode", self.cmb_regime)
         _b = explain(self.cmb_regime, "regime")
         if _b: self.form_reg.addRow(_b)
         self.v.addLayout(self.form_reg)
@@ -2902,43 +2911,44 @@ class FlowPanel(Panel):
         self.box_thermo = QtWidgets.QWidget()
         form_thermo = QtWidgets.QFormLayout(self.box_thermo)
         form_thermo.setContentsMargins(0, 0, 0, 0)
-        self.t_inf = self.bind(dspin(50, 3000, f.t_inf, 1, 2, " К"),
+        self.t_inf = self.bind(dspin(50, 3000, f.t_inf, 1, 2, " K"),
                                self._thermo_changed)
-        self.p_inf = self.bind(dspin(100, 1e7, f.p_inf, 1000, 1, " Па"),
+        self.p_inf = self.bind(dspin(100, 1e7, f.p_inf, 1000, 1, " Pa"),
                                self._thermo_changed)
-        form_thermo.addRow("Температура", self.t_inf)
-        form_thermo.addRow("Тиск", self.p_inf)
+        form_thermo.addRow("Temperature", self.t_inf)
+        form_thermo.addRow("Pressure", self.p_inf)
         self.v.addWidget(self.box_thermo)
         self.lbl_regime = WrapLabel("")
         self.lbl_regime.setWordWrap(True)
         self.lbl_regime.setStyleSheet("color:#7c8894; font-size:11px;")
         self.v.addWidget(self.lbl_regime)
         self.v.addWidget(hint(
-            "simpleFoam не бачить стисливості й занижує опір при M > 0.3. "
-            "rhoSimpleFoam рахує густину з тиску й температури — тому там "
-            "nu і rho не задаються, а виходять самі.", "regime", title="Стисливість: simpleFoam чи rhoSimpleFoam"))
+            tr("simpleFoam does not see compressibility and underestimates "
+            "drag at M > 0.3. rhoSimpleFoam calculates density from "
+            "pressure and temperature — so nu and rho are not set there "
+            "but come out by themselves."), "regime", title="Compressibility: simpleFoam or rhoSimpleFoam"))
 
-        self.v.addWidget(section("Середовище"))
+        self.v.addWidget(section(tr("Medium")))
         self.cmb_media = ValueCombo()
         self.cmb_media.add_values(MEDIA)
         self.cmb_media.currentTextChanged.connect(self._media_changed)
         self.form2 = QtWidgets.QFormLayout()
-        self.form2.addRow("Готовий набір", self.cmb_media)
+        self.form2.addRow("Preset", self.cmb_media)
         self.nu = self.bind(sci(1e-9, 1.0, f.nu),
                             lambda: setattr(f, "nu", self.nu.value()))
-        self.rho = self.bind(dspin(0.001, 20000, f.rho, 0.1, 4, " кг/м³"),
+        self.rho = self.bind(dspin(0.001, 20000, f.rho, 0.1, 4, " kg/m³"),
                              lambda: setattr(f, "rho", self.rho.value()))
-        self.form2.addRow("nu (м²/с)", self.nu)
+        self.form2.addRow("nu (m²/s)", self.nu)
         self.form2.addRow("rho", self.rho)
         self.v.addLayout(self.form2)
 
-        self.v.addWidget(section("Турбулентність"))
+        self.v.addWidget(section(tr("Turbulence")))
         self.cmb_turb = QtWidgets.QComboBox()
         self.cmb_turb.addItems(list(fc.TURBULENCE_MODELS))
         self.cmb_turb.setCurrentText(f.turbulence)
         self.cmb_turb.currentTextChanged.connect(self._turb_changed)
         self.form3 = QtWidgets.QFormLayout()
-        self.form3.addRow("Модель", self.cmb_turb)
+        self.form3.addRow("Model", self.cmb_turb)
         _b = explain(self.cmb_turb, "turbulence")
         if _b: self.form3.addRow(_b)
         # Wall treatment. The item text says its y+ range; the items that do
@@ -2947,41 +2957,43 @@ class FlowPanel(Panel):
         for key in fy.TREATMENT_ORDER:
             self.cmb_wall.addItem(fy.TREATMENT_LABELS[key], key)
         self.cmb_wall.setToolTip(
-            "Що OpenFOAM ставить на стінку (0/nut, 0/k).\n"
-            "Spalding працює при будь-якому y+ — найбезпечніший вибір.\n"
-            "Стандартна функція — лише коли y+ 30–300; Low-Re — лише y+ ≈ 1.\n"
-            "«Авто» біля y+ на вкладці «Сітка» підбирає шари під вибране.")
+            "What OpenFOAM puts on the wall (0/nut, 0/k).\nSpalding works "
+            "at any y+ — the safest choice.\nThe standard function — only "
+            "when y+ is 30–300; Low-Re — only at y+ ≈ 1.\n“Auto” next to "
+            "y+ on the “Mesh” tab fits the layers to the selected option.")
         self.cmb_wall.currentIndexChanged.connect(self._wall_changed)
-        self.form3.addRow("Обробка стінки", self.cmb_wall)
+        self.form3.addRow("Wall treatment", self.cmb_wall)
         self._sync_wall_items()
         self.intensity = self.bind(dspin(0.01, 30, f.intensity * 100, 0.1, 2, " %"),
                                    lambda: setattr(f, "intensity",
                                                    self.intensity.value() / 100))
         self.ratio = self.bind(dspin(0.1, 1000, f.viscosity_ratio, 1, 1),
                                lambda: setattr(f, "viscosity_ratio", self.ratio.value()))
-        self.form3.addRow("Інтенсивність", self.intensity)
-        self.form3.addRow("nut / nu на вході", self.ratio)
+        self.form3.addRow("Intensity", self.intensity)
+        self.form3.addRow("nut / nu at inlet", self.ratio)
         self.v.addLayout(self.form3)
         self.v.addWidget(hint(
-            "SpalartAllmaras — класика для зовнішньої аеродинаміки при малих "
-            "відривах. kOmegaSST точніший на відривних режимах. "
-            "kOmegaSSTLM додає до нього перехід ламінарного в турбулентне, "
-            "але вимагає y+ ≈ 1 — на сітці з пристінною функцією вона "
-            "безсила.", "turbulence", title="Яку модель турбулентності брати"))
+            tr("SpalartAllmaras — the classic for external aerodynamics "
+            "with small separations. kOmegaSST is more accurate in "
+            "separated regimes. kOmegaSSTLM adds laminar-to-turbulent "
+            "transition to it, but needs y+ ≈ 1 — on a mesh with a wall "
+            "function it cannot help."), "turbulence", title="Which turbulence model to use"))
         self.v.addWidget(hint(
-            "Моделі з DES у назві — вихрові. Вони рахують вихори за часом і "
-            "вимагають нестаціонарної постановки: зі стаціонарним "
-            "розвʼязувачем дадуть ту саму усереднену картину, що й звичайна "
-            "RANS, тільки втричі дорожче. Беріть їх для відриву й зриву — "
-            "там RANS не збігається взагалі: на тестовому крилі при 10 "
-            "градусах Cl гуляв від 0.31 до 0.77 і не зупинявся.", "les", title="Моделі DES (вихрові)"))
+            tr("Models with DES in the name are eddy-resolving. They "
+            "calculate eddies in time and need a transient formulation: "
+            "with a steady solver they give the same averaged picture as "
+            "normal RANS, only three times more expensive. Use them for "
+            "separation and stall — there RANS does not converge at all: "
+            "on the test wing at 10 degrees Cl moved between 0.31 and "
+            "0.77 and did not stop."), "les", title="DES models (eddy-resolving)"))
 
-        self.v.addWidget(section("Пориста зона"))
-        self.por_on = QtWidgets.QCheckBox("Радіатор, сітка або фільтр у потоці")
+        self.v.addWidget(section(tr("Porous Zone")))
+        self.por_on = QtWidgets.QCheckBox("Radiator, screen or filter in the flow")
         self.por_on.setToolTip(
-            "Коробка, всередині якої потік гальмується так, ніби крізь нього "
-            "стоїть перешкода. Саме так рахують радіатори, вхідні сітки, "
-            "фільтри й парашути: моделювати кожен отвір нема сенсу.")
+            "A box inside which the flow slows down as if an obstacle "
+            "stood in it. This is how radiators, inlet screens, filters "
+            "and parachutes are computed: there is no sense in modeling "
+            "every opening.")
         self.por_on.setChecked(bool(cfg.porous))
         self.por_on.toggled.connect(self._porous_toggled)
         self.v.addWidget(self.por_on)
@@ -2993,30 +3005,30 @@ class FlowPanel(Panel):
         pf.setContentsMargins(0, 0, 0, 0)
         # Перепад тиску, а не коефіцієнти Дарсі: у паспорті радіатора стоїть
         # саме він, а d = 5.8e6 не введе усвідомлено ніхто.
-        self.por_dp = dspin(0.1, 1e6, 200.0, 10.0, 2, " Па")
-        self.por_u = dspin(0.1, 500.0, 10.0, 1.0, 2, " м/с")
+        self.por_dp = dspin(0.1, 1e6, 200.0, 10.0, 2, " Pa")
+        self.por_u = dspin(0.1, 500.0, 10.0, 1.0, 2, " m/s")
         self.cmb_por_mode = QtWidgets.QComboBox()
-        self.cmb_por_mode.addItem("сітка або радіатор (квадратично)", "inertial")
-        self.cmb_por_mode.addItem("дрібний фільтр (лінійно)", "viscous")
-        self.por_cx = dspin(-1e4, 1e4, 0.0, 0.05, 4, " м")
-        self.por_cy = dspin(-1e4, 1e4, 0.0, 0.05, 4, " м")
-        self.por_cz = dspin(-1e4, 1e4, 0.0, 0.05, 4, " м")
-        self.por_sx = dspin(1e-4, 1e4, 0.05, 0.01, 4, " м")
-        self.por_sy = dspin(1e-4, 1e4, 0.3, 0.01, 4, " м")
-        self.por_sz = dspin(1e-4, 1e4, 0.3, 0.01, 4, " м")
+        self.cmb_por_mode.addItem("screen or radiator (quadratic)", "inertial")
+        self.cmb_por_mode.addItem("fine filter (linear)", "viscous")
+        self.por_cx = dspin(-1e4, 1e4, 0.0, 0.05, 4, " m")
+        self.por_cy = dspin(-1e4, 1e4, 0.0, 0.05, 4, " m")
+        self.por_cz = dspin(-1e4, 1e4, 0.0, 0.05, 4, " m")
+        self.por_sx = dspin(1e-4, 1e4, 0.05, 0.01, 4, " m")
+        self.por_sy = dspin(1e-4, 1e4, 0.3, 0.01, 4, " m")
+        self.por_sz = dspin(1e-4, 1e4, 0.3, 0.01, 4, " m")
         for w in (self.por_dp, self.por_u, self.por_cx, self.por_cy,
                   self.por_cz, self.por_sx, self.por_sy, self.por_sz):
             w.valueChanged.connect(lambda _: self._porous_changed())
         self.cmb_por_mode.currentIndexChanged.connect(
             lambda _: self._porous_changed())
-        pf.addRow("Втрата тиску", self.por_dp)
+        pf.addRow("Pressure loss", self.por_dp)
         _b = explain(self.por_dp, "porous_dp")
         if _b: pf.addRow(_b)
-        pf.addRow("при швидкості", self.por_u)
-        pf.addRow("Характер втрат", self.cmb_por_mode)
-        for label, w in (("Центр X", self.por_cx), ("Центр Y", self.por_cy),
-                         ("Центр Z", self.por_cz), ("Розмір X", self.por_sx),
-                         ("Розмір Y", self.por_sy), ("Розмір Z", self.por_sz)):
+        pf.addRow("at speed", self.por_u)
+        pf.addRow("Loss type", self.cmb_por_mode)
+        for label, w in (("Center X", self.por_cx), ("Center Y", self.por_cy),
+                         ("Center Z", self.por_cz), ("Size X", self.por_sx),
+                         ("Size Y", self.por_sy), ("Size Z", self.por_sz)):
             pf.addRow(label, w)
         self.v.addWidget(self.box_por)
         self.lbl_por = WrapLabel("")
@@ -3024,13 +3036,14 @@ class FlowPanel(Panel):
         self.lbl_por.setStyleSheet("color:#7c8894; font-size:11px;")
         self.v.addWidget(self.lbl_por)
 
-        self.v.addWidget(section("Обертова зона (гвинт)"))
-        self.rot_on = QtWidgets.QCheckBox("Гвинт або ротор у потоці")
+        self.v.addWidget(section(tr("Rotating Zone (Propeller)")))
+        self.rot_on = QtWidgets.QCheckBox("Propeller or rotor in the flow")
         self.rot_on.setToolTip(
-            "Циліндр, усередині якого повітря рахується в обертовій системі "
-            "відліку (MRF). Так рахують гвинти, не рухаючи сітку. "
-            "ВАЖЛИВО: тягу створює не зона, а лопаті всередині неї — "
-            "геометрія гвинта має бути в сцені.")
+            "A cylinder inside which the air is computed in a rotating "
+            "reference frame (MRF). This is how propellers are computed "
+            "without moving the mesh. IMPORTANT: the thrust comes not "
+            "from the zone but from the blades inside it — the propeller "
+            "geometry must be in the scene.")
         self.rot_on.setChecked(bool(cfg.rotating))
         self.rot_on.toggled.connect(self._rotating_toggled)
         self.v.addWidget(self.rot_on)
@@ -3051,33 +3064,33 @@ class FlowPanel(Panel):
         self.box_rot = QtWidgets.QWidget()
         rf = QtWidgets.QFormLayout(self.box_rot)
         rf.setContentsMargins(0, 0, 0, 0)
-        self.rot_rpm = dspin(-100000.0, 100000.0, 3000.0, 100.0, 1, " об/хв")
-        self.rot_r = dspin(1e-4, 100.0, 0.15, 0.01, 4, " м")
-        self.rot_len = dspin(1e-4, 100.0, 0.05, 0.01, 4, " м")
-        self.rot_cx = dspin(-1e4, 1e4, 0.0, 0.05, 4, " м")
-        self.rot_cy = dspin(-1e4, 1e4, 0.0, 0.05, 4, " м")
-        self.rot_cz = dspin(-1e4, 1e4, 0.0, 0.05, 4, " м")
+        self.rot_rpm = dspin(-100000.0, 100000.0, 3000.0, 100.0, 1, " rpm")
+        self.rot_r = dspin(1e-4, 100.0, 0.15, 0.01, 4, " m")
+        self.rot_len = dspin(1e-4, 100.0, 0.05, 0.01, 4, " m")
+        self.rot_cx = dspin(-1e4, 1e4, 0.0, 0.05, 4, " m")
+        self.rot_cy = dspin(-1e4, 1e4, 0.0, 0.05, 4, " m")
+        self.rot_cz = dspin(-1e4, 1e4, 0.0, 0.05, 4, " m")
         for w in (self.rot_rpm, self.rot_r, self.rot_len, self.rot_cx,
                   self.rot_cy, self.rot_cz):
             w.valueChanged.connect(lambda _: self._rotating_changed())
-        rf.addRow("Оберти", self.rot_rpm)
+        rf.addRow("RPM", self.rot_rpm)
         _b = explain(self.rot_rpm, "rpm")
         if _b: rf.addRow(_b)
-        rf.addRow("Радіус зони", self.rot_r)
-        rf.addRow("Товщина зони", self.rot_len)
-        for label, w in (("Центр X", self.rot_cx), ("Центр Y", self.rot_cy),
-                         ("Центр Z", self.rot_cz)):
+        rf.addRow("Zone radius", self.rot_r)
+        rf.addRow("Zone thickness", self.rot_len)
+        for label, w in (("Center X", self.rot_cx), ("Center Y", self.rot_cy),
+                         ("Center Z", self.rot_cz)):
             rf.addRow(label, w)
         # Вписувати координати зони руками — найкоротший шлях до головної
         # пастки MRF: зона повз лопаті рахується БЕЗ ПОМИЛОК і просто не
         # дає тяги. Кнопка бере габарит самої моделі гвинта, і промахнутися
         # стає ніде.
         self.btn_rot_fit = QtWidgets.QPushButton(
-            "Підігнати зону до вибраної моделі")
+            "Fit zone to selected model")
         self.btn_rot_fit.setToolTip(
-            "Виберіть у списку на вкладці «Геометрія» модель гвинта — "
-            "кнопка візьме її габарит і поставить зону так, щоб лопаті "
-            "напевно опинилися всередині.")
+            "Select the propeller model in the list on the “Geometry” "
+            "tab — the button takes its size and places the zone so that "
+            "the blades are surely inside.")
         rf.addRow("", self.btn_rot_fit)
         self.v.addWidget(self.box_rot)
         self.lbl_rot = WrapLabel("")
@@ -3085,11 +3098,11 @@ class FlowPanel(Panel):
         self.lbl_rot.setStyleSheet("color:#7c8894; font-size:11px;")
         self.v.addWidget(self.lbl_rot)
 
-        self.v.addWidget(section("Опорні величини для коефіцієнтів"))
+        self.v.addWidget(section(tr("Reference Values for Coefficients")))
         self.form4 = QtWidgets.QFormLayout()
-        self.aref = self.bind(dspin(1e-6, 1e6, f.a_ref, 0.01, 6, " м²"),
+        self.aref = self.bind(dspin(1e-6, 1e6, f.a_ref, 0.01, 6, " m²"),
                               lambda: setattr(f, "a_ref", self.aref.value()))
-        self.lref = self.bind(dspin(1e-6, 1e6, f.l_ref, 0.01, 6, " м"),
+        self.lref = self.bind(dspin(1e-6, 1e6, f.l_ref, 0.01, 6, " m"),
                               lambda: setattr(f, "l_ref", self.lref.value()))
         self.form4.addRow("Aref", self.aref)
         _b = explain(self.aref, "aref")
@@ -3097,7 +3110,7 @@ class FlowPanel(Panel):
         self.form4.addRow("Lref", self.lref)
         _b = explain(self.lref, "lref")
         if _b: self.form4.addRow(_b)
-        self.btn_auto = QtWidgets.QPushButton("Взяти з габариту моделі")
+        self.btn_auto = QtWidgets.QPushButton("Take from model size")
         self.form4.addRow("", self.btn_auto)
         self.v.addLayout(self.form4)
         self.lbl_area = WrapLabel("")
@@ -3107,12 +3120,13 @@ class FlowPanel(Panel):
         self.lbl_area.setStyleSheet("color:#777; font-size:11px;")
         self.v.addWidget(self.lbl_area)
         self.v.addWidget(hint(
-            "Aref — площа, до якої нормуються Cd і Cl. Для крилатого апарата "
-            "це площа в плані, для компактного тіла — міделевий переріз. "
-            "Кнопка бере справжній силует моделі, а не добуток сторін "
-            "габариту: різниця буває в кілька разів.", title="Що таке Aref і як його взяти"))
+            tr("Aref — the area to which Cd and Cl are normalized. For a "
+            "winged aircraft it is the planform area, for a compact body "
+            "it is the frontal area. The button uses the real silhouette "
+            "of the model, not the product of the bounding box sides: "
+            "the difference can be several times."), title="What Aref is and how to get it"))
 
-        self.v.addWidget(section("Розраховані величини"))
+        self.v.addWidget(section(tr("Calculated Values")))
         self.info = WrapLabel()
         self.info.setWordWrap(True)
         self.info.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
@@ -3217,12 +3231,11 @@ class FlowPanel(Panel):
         self._check_farfield()
 
     def set_area_hint(self, winged: bool, diag) -> None:
-        kind = "планформа (силует згори)" if winged else "мідель (силует спереду)"
+        kind = tr("planform (silhouette from above)") if winged else tr("frontal area (silhouette from the front)")
         self.lbl_area.setText(
-            tr("Aref взято як {kind}. Силует X/Y/Z: "
-            "{projected:.4g} / {projected2:.4g} / "
-            "{projected3:.4g} м². Габаритна планформа була б "
-            "{v:.4g} м².", kind=kind, projected=diag.projected[0], projected2=diag.projected[1], projected3=diag.projected[2], v=diag.size[0] * diag.size[1]))
+            tr("Aref is taken as {kind}. Silhouette X/Y/Z: "
+               "{projected:.4g} / {projected2:.4g} / {projected3:.4g} "
+               "m². The bounding box planform would be {v:.4g} m².", kind=kind, projected=diag.projected[0], projected2=diag.projected[1], projected3=diag.projected[2], v=diag.size[0] * diag.size[1]))
 
     def _far_changed(self, _):
         self.cfg.flow.farfield_mode = self.cmb_far.currentData()
@@ -3235,9 +3248,10 @@ class FlowPanel(Panel):
                and (abs(f.aoa_deg) > 0.01 or abs(f.aos_deg) > 0.01))
         if bad:
             self.lbl_far.setText(
-                "⚠ Аеротруба зі slip несумісна з ненульовим кутом: бічні межі "
-                "зріжуть поперечну складову потоку і Cl впаде в рази. "
-                "Перемкніться на freestream.")
+                "⚠ A wind tunnel with slip is not compatible with a "
+                "non-zero angle: the side boundaries cut the cross "
+                "component of the flow and Cl drops several times. "
+                "Switch to freestream.")
             self.lbl_far.setStyleSheet(
                 f"color:{LEVEL_COLOR['bad']}; font-size:11px; font-weight:bold;")
         else:
@@ -3295,8 +3309,8 @@ class FlowPanel(Panel):
             return
         z = self.cfg.porous[0]
         d, f = z.darcy(self.cfg.flow.nu, self.cfg.flow.rho)
-        text = (tr("Шар завтовшки {thickness} уздовж потоку. "
-                "Коефіцієнти для OpenFOAM: d = {d:.4g}, f = {f:.4g}.", thickness=phys.fmt_len(z.thickness), d=d, f=f))
+        text = (tr("Layer {thickness} thick along the flow. Coefficients "
+                   "for OpenFOAM: d = {d:.4g}, f = {f:.4g}.", thickness=phys.fmt_len(z.thickness), d=d, f=f))
         notes = [t for lvl, t in self.cfg.guard_porous()]
         worst = next((lvl for lvl, _ in self.cfg.guard_porous()
                       if lvl == "bad"), None)
@@ -3360,8 +3374,8 @@ class FlowPanel(Panel):
             return
         z = self.cfg.rotating[0]
         ma = phys.mach(z.tip_speed, self.cfg.flow.sound_speed)
-        text = (tr("Кінець лопаті йде {tip_speed:.4g} м/с — це M = {ma:.2f} "
-                "при M = {mach:.2f} у набігаючому потоці.", tip_speed=z.tip_speed, ma=ma, mach=self.cfg.flow.mach))
+        text = (tr("The blade tip moves at {tip_speed:.4g} m/s — that is "
+                   "M = {ma:.2f} at M = {mach:.2f} in the freestream.", tip_speed=z.tip_speed, ma=ma, mach=self.cfg.flow.mach))
         # Однакові застороги про однакові гвинти складаємо в одну: на
         # чотиримоторному апараті їх інакше вчетверо більше, і серед копій
         # губиться те, заради чого список і читають.
@@ -3412,9 +3426,9 @@ class FlowPanel(Panel):
             self.rho.setValue(f.rho)
             self._loading = False
             self.lbl_regime.setText(
-                tr("З цих тиску й температури: rho = {rho:.4f} кг/м³, "
-                "nu = {nu:.4g} м²/с, швидкість звуку "
-                "{sound_speed:.1f} м/с, M = {mach:.3f}.", rho=f.rho, nu=f.nu, sound_speed=f.sound_speed, mach=f.mach))
+                tr("From this pressure and temperature: rho = {rho:.4f} "
+                   "kg/m³, nu = {nu:.4g} m²/s, speed of sound "
+                   "{sound_speed:.1f} m/s, M = {mach:.3f}.", rho=f.rho, nu=f.nu, sound_speed=f.sound_speed, mach=f.mach))
         else:
             self.lbl_regime.setText("")
         self.lbl_regime.setVisible(on)
@@ -3436,11 +3450,12 @@ class FlowPanel(Panel):
             return
         names = ", ".join(z.name for z in from_parts[:6])
         self.lbl_rot_roles.setText(
-            tr("Зони беруться З РОЛЕЙ ДЕТАЛЕЙ: їх {n_from_parts} "
-            "({names}). Кожна зібрана з габариту своєї моделі — свій "
-            "радіус, своє місце, свої оберти. Поля нижче ні на що не "
-            "впливають: оберти й вісь міняйте на вкладці «Геометрія», "
-            "вибравши деталь у списку.", n_from_parts=len(from_parts), names=names))
+            tr("The zones come FROM THE PART ROLES: there are "
+               "{n_from_parts} ({names}). Each is built from the "
+               "bounding box of its model — its own radius, its own "
+               "position, its own rpm. The fields below have no effect: "
+               "change the rpm and the axis in the “Geometry” tab after "
+               "you select the part in the list.", n_from_parts=len(from_parts), names=names))
 
     def refresh(self):
         f = self.cfg.flow
@@ -3463,16 +3478,17 @@ class FlowPanel(Panel):
         self._check_farfield()
         warn = ""
         if ma > 0.3:
-            warn += "\n⚠ M > 0.3 — стисливість уже помітна, simpleFoam занижує опір"
+            warn += tr("\n⚠ M > 0.3 — compressibility is already noticeable, simpleFoam underestimates drag")
         if phys.is_transitional(re):
-            warn += ("\n⚠ Re < 5·10⁵ — пограншар частково ламінарний. RANS "
-                     "вважає його турбулентним усюди й завищить опір тертя.")
+            warn += (tr("\n⚠ Re < 5·10⁵ — the boundary layer is partly "
+                     "laminar. RANS treats it as turbulent everywhere "
+                     "and will overestimate the friction drag."))
         d = f.direction
         self.info.setText(
-            tr("Re            {re:.4g}\nMach          {ma:.3f}\nU вектор   "
+            tr("Re            {re:.4g}\nMach          {ma:.3f}\nU vector   "
                "   ({v:.4g}, {v2:.4g}, {v3:.4g})\nk             {k:.5g} "
-               "м²/с²\nomega         {omega:.5g} 1/с\nepsilon       "
-               "{epsilon:.5g} м²/с³\nnut вхід      {nut:.4g} м²/с{warn}", re=re, ma=ma, v=d[0] * f.u_inf, v2=d[1] * f.u_inf, v3=d[2] * f.u_inf, k=t.k, omega=t.omega, epsilon=t.epsilon, nut=t.nut, warn=warn)
+               "m²/s²\nomega         {omega:.5g} 1/s\nepsilon       "
+               "{epsilon:.5g} m²/s³\nnut inlet     {nut:.4g} m²/s{warn}", re=re, ma=ma, v=d[0] * f.u_inf, v2=d[1] * f.u_inf, v3=d[2] * f.u_inf, k=t.k, omega=t.omega, epsilon=t.epsilon, nut=t.nut, warn=warn)
         )
 
 
@@ -3486,11 +3502,11 @@ class SolverPanel(Panel):
         s = cfg.solver
 
         self.cmb_time = QtWidgets.QComboBox()
-        self.cmb_time.addItem("стаціонарна — один усталений стан", True)
-        self.cmb_time.addItem("нестаціонарна — розвиток у часі", False)
+        self.cmb_time.addItem("steady — one settled state", True)
+        self.cmb_time.addItem("transient — development in time", False)
         self.cmb_time.setCurrentIndex(0 if s.steady else 1)
         self.cmb_time.currentIndexChanged.connect(self._time_mode_changed)
-        self.form.addRow("Постановка", self.cmb_time)
+        self.form.addRow("Formulation", self.cmb_time)
         _b = explain(self.cmb_time, "steady")
         if _b: self.form.addRow(_b)
 
@@ -3503,22 +3519,22 @@ class SolverPanel(Panel):
         self.box_steady = QtWidgets.QWidget()
         form_steady = QtWidgets.QFormLayout(self.box_steady)
         form_steady.setContentsMargins(0, 0, 0, 0)
-        form_steady.addRow("Ітерацій", self.iters)
+        form_steady.addRow("Iterations", self.iters)
         _b = explain(self.iters, "iterations")
         if _b: form_steady.addRow(_b)
-        form_steady.addRow("Запис кожні", self.write)
+        form_steady.addRow("Write every", self.write)
         self.v.addWidget(self.box_steady)
 
         self.box_unsteady = QtWidgets.QWidget()
         form_un = QtWidgets.QFormLayout(self.box_unsteady)
         form_un.setContentsMargins(0, 0, 0, 0)
-        self.end_time = self.bind(dspin(1e-6, 1e6, s.end_time, 0.1, 6, " с"),
+        self.end_time = self.bind(dspin(1e-6, 1e6, s.end_time, 0.1, 6, " s"),
                                   lambda: self._unsteady_changed(
                                       "end_time", self.end_time.value()))
         self.dt = self.bind(sci(1e-9, 1.0, s.time_step),
                             lambda: self._unsteady_changed(
                                 "time_step", self.dt.value()))
-        self.write_every = self.bind(dspin(1e-6, 1e5, s.write_every, 0.01, 6, " с"),
+        self.write_every = self.bind(dspin(1e-6, 1e5, s.write_every, 0.01, 6, " s"),
                                      lambda: self._unsteady_changed(
                                          "write_every", self.write_every.value()))
         self.courant = self.bind(dspin(0.05, fc.MAX_COURANT, s.max_courant, 0.5, 2),
@@ -3527,23 +3543,23 @@ class SolverPanel(Panel):
         self.outer = self.bind(ispin(1, 10, s.n_outer_correctors),
                                lambda: self._unsteady_changed(
                                    "n_outer_correctors", self.outer.value()))
-        form_un.addRow("Кінцевий час", self.end_time)
+        form_un.addRow("End time", self.end_time)
         _b = explain(self.end_time, "end_time")
         if _b: form_un.addRow(_b)
-        form_un.addRow("Початковий крок", self.dt)
-        form_un.addRow("Запис кожні", self.write_every)
-        form_un.addRow("Куранта (стеля)", self.courant)
+        form_un.addRow("Initial time step", self.dt)
+        form_un.addRow("Write every", self.write_every)
+        form_un.addRow("Courant (max)", self.courant)
         _b = explain(self.courant, "courant")
         if _b: form_un.addRow(_b)
-        form_un.addRow("Зовнішніх проходів", self.outer)
+        form_un.addRow("Outer passes", self.outer)
         self.warm = self.bind(ispin(0, 5000, s.warm_iterations),
                               lambda: self._unsteady_changed(
                                   "warm_iterations", self.warm.value()))
-        self.warm.setSuffix(" ітер.")
-        self.warm.setSpecialValueText("вимкнено")
-        self.warm.setToolTip("Лише для стисливого нестаціонару: перед ним "
-                             "стільки ітерацій rhoSimpleFoam.")
-        form_un.addRow("Теплий старт", self.warm)
+        self.warm.setSuffix(" iter.")
+        self.warm.setSpecialValueText("off")
+        self.warm.setToolTip("Only for compressible transient: this many "
+                             "rhoSimpleFoam iterations run before it.")
+        form_un.addRow("Warm start", self.warm)
         _b = explain(self.warm, "warm_iterations")
         if _b: form_un.addRow(_b)
         self.v.addWidget(self.box_unsteady)
@@ -3560,35 +3576,35 @@ class SolverPanel(Panel):
         self.tol.setCurrentText("1e-4")
         self.tol.currentTextChanged.connect(
             lambda t: (setattr(s, "residual_tol", float(t)), self.emit_changed()))
-        self.form.addRow("Поріг збіжності", self.tol)
+        self.form.addRow("Convergence threshold", self.tol)
         _b = explain(self.tol, "residual_tol")
         if _b: self.form.addRow(_b)
         self.v.addWidget(hint(
-            "Розрахунок зупиниться раніше за ліміт ітерацій, щойно всі "
-            "резидуали впадуть нижче порога.", "residual_tol",
-            title="Коли розрахунок зупиняється"))
+            tr("The run stops before the iteration limit as soon as all "
+            "residuals fall below the threshold."), "residual_tol",
+            title="When the run stops"))
 
-        self.v.addWidget(section("Паралельність"))
+        self.v.addWidget(section(tr("Parallel")))
         self.procs = self.bind(ispin(1, 256, s.n_procs),
                                lambda: setattr(s, "n_procs", self.procs.value()))
         self.form2 = QtWidgets.QFormLayout()
-        self.form2.addRow("Процесів", self.procs)
+        self.form2.addRow(tr("Processes", ctx="count"), self.procs)
         _b = explain(self.procs, "procs")
         if _b: self.form2.addRow(_b)
         self.cmb_decomp = QtWidgets.QComboBox()
         self.cmb_decomp.addItems(["scotch", "hierarchical", "simple"])
         self.cmb_decomp.currentTextChanged.connect(
             lambda t: (setattr(s, "decompose_method", t), self.emit_changed()))
-        self.form2.addRow("Декомпозиція", self.cmb_decomp)
+        self.form2.addRow("Decomposition", self.cmb_decomp)
         self.v.addLayout(self.form2)
         self.lbl_res = WrapLabel()
         self.lbl_res.setStyleSheet("color:#777; font-size:11px;")
         self.lbl_res.setWordWrap(True)
         self.v.addWidget(self.lbl_res)
 
-        self.v.addWidget(section("Стабілізація"))
+        self.v.addWidget(section(tr("Stabilization")))
         self.chk_potential = QtWidgets.QCheckBox(
-            "Стартувати з potentialFoam (швидша збіжність)")
+            "Start from potentialFoam (faster convergence)")
         self.chk_potential.setChecked(s.potential_init)
         self.chk_potential.toggled.connect(
             lambda v: (setattr(s, "potential_init", v), self.emit_changed()))
@@ -3599,52 +3615,53 @@ class SolverPanel(Panel):
         self.chk_consistent.toggled.connect(self._consistent_changed)
         self.v.addWidget(self.chk_consistent)
 
-        self.chk_check = QtWidgets.QCheckBox("Проганяти checkMesh після сітки")
+        self.chk_check = QtWidgets.QCheckBox("Run checkMesh after meshing")
         self.chk_check.setChecked(s.run_check_mesh)
         self.chk_check.toggled.connect(
             lambda v: (setattr(s, "run_check_mesh", v), self.emit_changed()))
         self.v.addWidget(self.chk_check)
 
         self.chk_stop_bad = QtWidgets.QCheckBox(
-            "Зупинятися, якщо checkMesh не пройшов")
+            "Stop if checkMesh fails")
         self.chk_stop_bad.setChecked(s.stop_on_bad_mesh)
         self.chk_stop_bad.toggled.connect(
             lambda v: (setattr(s, "stop_on_bad_mesh", v), self.emit_changed()))
         self.v.addWidget(self.chk_stop_bad)
 
-        self.v.addWidget(section("Стійкий старт"))
+        self.v.addWidget(section(tr("Robust start")))
         self.chk_robust = QtWidgets.QCheckBox(
-            "Схеми першого порядку, низька релаксація, стеля на швидкість")
+            "First-order schemes, low relaxation, speed cap")
         self.chk_robust.setChecked(s.robust_start)
         self.chk_robust.toggled.connect(self._robust_changed)
         self.v.addWidget(self.chk_robust)
         self.v.addWidget(hint(
-            "Вмикайте, якщо розрахунок вибухає в перші сотні ітерацій. "
-            "Замість linearUpwind ставиться upwind, замість SIMPLEC 0.9 — "
-            "класичний SIMPLE з p 0.3 / U 0.7, додається корекція "
-            "неортогональності й обмежувач швидкості через fvOptions. "
-            "Розвʼязок виходить розмитішим — це спосіб дійти до збіжності, "
-            "а не отримати остаточні цифри. Дійшовши, вимкніть і перезапустіть "
-            "із готового поля.", title="Коли вмикати стійкий старт"))
+            tr("Turn this on if the run blows up in the first hundreds of "
+            "iterations. upwind replaces linearUpwind, and classic "
+            "SIMPLE with p 0.3 / U 0.7 replaces SIMPLEC 0.9; "
+            "non-orthogonal correction and a speed limiter through "
+            "fvOptions are added. The solution comes out more smeared — "
+            "this is a way to get to convergence, not to get final "
+            "numbers. When you get there, turn it off and restart from "
+            "the ready field."), title="When to turn on the robust start"))
         self.form_cap = QtWidgets.QFormLayout()
         self.cap = self.bind(dspin(1.05, 10.0, s.velocity_cap_factor, 0.1, 2, " × U"),
                              lambda: setattr(s, "velocity_cap_factor", self.cap.value()))
         self.robust_it = self.bind(
             ispin(0, 20000, s.robust_iterations, 50),
             lambda: setattr(s, "robust_iterations", self.robust_it.value()))
-        self.form_cap.addRow("Стеля швидкості", self.cap)
+        self.form_cap.addRow("Speed cap", self.cap)
         _b = explain(self.cap, "velocity_cap")
         if _b: self.form_cap.addRow(_b)
-        self.form_cap.addRow("Стійких ітерацій", self.robust_it)
+        self.form_cap.addRow("Robust iterations", self.robust_it)
         _b = explain(self.robust_it, "robust_iterations")
         if _b: self.form_cap.addRow(_b)
         self.v.addLayout(self.form_cap)
         self.v.addWidget(hint(
-            "«Стійких ітерацій» — це двоетапний запуск: стільки перших "
-            "ітерацій рахуються стійко, далі розрахунок ПРОДОВЖУЄТЬСЯ з "
-            "отриманого поля звичайними схемами другого порядку. Так виходить "
-            "і стабільний старт, і точний результат за один прохід. Нуль "
-            "вимикає другий етап.", "robust_iterations", title="Стійкі ітерації: двоетапний запуск"))
+            tr("“Robust iterations” is a two-stage run: this many first "
+            "iterations run robustly, then the run CONTINUES from the "
+            "resulting field with normal second-order schemes. So you "
+            "get both a stable start and an accurate result in one pass. "
+            "Zero turns off the second stage."), "robust_iterations", title="Robust iterations: two-stage run"))
         self.lbl_cap = QtWidgets.QLabel("")
         self.lbl_cap.setStyleSheet("color:#777; font-size:11px;")
         self.v.addWidget(self.lbl_cap)
@@ -3654,14 +3671,15 @@ class SolverPanel(Panel):
                                  lambda: setattr(s, "relaxation_u", self.relax_u.value()))
         self.relax_p = self.bind(dspin(0.05, 1.0, s.relaxation_p, 0.05, 2),
                                  lambda: setattr(s, "relaxation_p", self.relax_p.value()))
-        self.form3.addRow("Релаксація U", self.relax_u)
-        self.form3.addRow("Релаксація p", self.relax_p)
+        self.form3.addRow("Relaxation U", self.relax_u)
+        self.form3.addRow("Relaxation p", self.relax_p)
         self.v.addLayout(self.form3)
         self._consistent_changed(s.consistent)
         self.v.addWidget(hint(
-            "З SIMPLEC тиск не релаксують окремо, а решту можна тримати на "
-            "0.9 — це помітно швидше за класичний SIMPLE.",
-            title="Релаксація з SIMPLEC"))
+            tr("With SIMPLEC, pressure is not relaxed separately, and the "
+            "rest can stay at 0.9 — this is noticeably faster than "
+            "classic SIMPLE."),
+            title="Relaxation with SIMPLEC"))
 
         self.v.addStretch(1)
 
@@ -3737,11 +3755,10 @@ class SolverPanel(Panel):
         notes = self.cfg.guard_unsteady()
         worst = ("bad" if any(l == "bad" for l, _ in notes)
                  else "warn" if notes else "ok")
-        head = (tr("Кроків за часом: {n_time_steps}, "
-                "часових зрізів: {n_write_dirs}, "
-                "проліт домену {flow_through_time:.4g} с "
-                "({v:.1f} "
-                "прольотів за прогін).", n_time_steps=fc.fmt_count(s.n_time_steps), n_write_dirs=fc.fmt_count(s.n_write_dirs), flow_through_time=self.cfg.flow_through_time, v=s.end_time / max(self.cfg.flow_through_time, 1e-12)))
+        head = (tr("Time steps: {n_time_steps}, time directories: "
+                   "{n_write_dirs}, domain flow-through "
+                   "{flow_through_time:.4g} s ({v:.1f} flow-throughs per "
+                   "run).", n_time_steps=fc.fmt_count(s.n_time_steps), n_write_dirs=fc.fmt_count(s.n_write_dirs), flow_through_time=self.cfg.flow_through_time, v=s.end_time / max(self.cfg.flow_through_time, 1e-12)))
         text = head + ("<br><br>" + "<br>".join(t for _, t in notes)
                        if notes else "")
         colour = {"bad": "#e05252", "warn": "#d6a419", "ok": "#7c8894"}[worst]
@@ -3769,17 +3786,17 @@ class SolverPanel(Panel):
         cap = self.cfg.flow.u_inf * s.velocity_cap_factor
         if s.robust_start:
             self.lbl_cap.setText(
-                tr("Увесь прогін стійкий. limitVelocity зріже швидкість вище "
-                "{cap:.4g} м/с.", cap=cap))
+                tr("The whole run is robust. limitVelocity clips the "
+                   "speed above {cap:.4g} m/s.", cap=cap))
         elif s.two_stage:
             self.lbl_cap.setText(
-                tr("Етап 1: ітерації 1–{robust_iterations}, upwind, "
-                "SIMPLE 0.3/0.7, стеля {cap:.4g} м/с.\n"
-                "Етап 2: ітерації {v}–{n_iterations}, "
-                "linearUpwind, SIMPLEC {relaxation_u}, стеля знята.", robust_iterations=s.robust_iterations, cap=cap, v=s.robust_iterations + 1, n_iterations=s.n_iterations, relaxation_u=s.relaxation_u))
+                tr("Stage 1: iterations 1–{robust_iterations}, upwind, "
+                   "SIMPLE 0.3/0.7, cap {cap:.4g} m/s.\nStage 2: "
+                   "iterations {v}–{n_iterations}, linearUpwind, SIMPLEC "
+                   "{relaxation_u}, cap removed.", robust_iterations=s.robust_iterations, cap=cap, v=s.robust_iterations + 1, n_iterations=s.n_iterations, relaxation_u=s.relaxation_u))
         else:
             self.lbl_cap.setText(
-                "Двоетапність вимкнена — увесь прогін другим порядком.")
+                "Two-stage mode is off — the whole run uses second order.")
 
     def set_resources(self, cores: int, ram_gb: float, threads: int = 0,
                       where: str = ""):
@@ -3795,21 +3812,22 @@ class SolverPanel(Panel):
         # Стеля — по ПОТОКАХ: заборонити те, що фізично можливо, не наша
         # справа. Але радимо по ядрах, і кажемо чому.
         self.procs.setMaximum(max(1, threads))
-        place = tr("на {where}: ", where=where) if where else "Доступно: "
-        mem = (tr("{ram_gb:.1f} ГБ памʼяті", ram_gb=ram_gb) if ram_gb > 0
-               else "памʼять ще невідома")
+        place = tr("on {where}: ", where=where) if where else tr("Available: ")
+        mem = (tr("{ram_gb:.1f} GB of memory", ram_gb=ram_gb) if ram_gb > 0
+               else tr("memory not known yet"))
         if threads > cores:
             self.lbl_res.setText(
-                tr("{place}{cores} фізичних ядер ({threads} потоків із "
-                   "гіпертредингом), {mem}.{chr}Ставте не більше "
-                   "{cores}. Два потоки одного ядра ділять кеш і "
-                   "памʼять, а розвʼязувач упирається саме в них — тож "
-                   "{threads} процесів дадуть те саме або повільніше, "
-                   "зате вдвічі більше обміну між підобластями.", place=place, cores=cores, threads=threads, mem=mem, chr=chr(10)))
+                tr("{place}{cores} physical cores ({threads} threads "
+                   "with hyper-threading), {mem}.{chr}Set no more than "
+                   "{cores}. Two threads of one core share cache and "
+                   "memory, and these are exactly what limit the solver "
+                   "— so {threads} processes give the same speed or "
+                   "slower, but twice as much exchange between "
+                   "subdomains.", place=place, cores=cores, threads=threads, mem=mem, chr=chr(10)))
         else:
             self.lbl_res.setText(
-                tr("{place}{cores} ядер, {mem}. "
-                "Більше процесів, ніж ядер, користі не дасть.", place=place, cores=cores, mem=mem))
+                tr("{place}{cores} cores, {mem}. More processes than "
+                   "cores give no benefit.", place=place, cores=cores, mem=mem))
 
 
 # --------------------------------------------------------------------------
@@ -3826,15 +3844,16 @@ class AdvisorPanel(Panel):
         super().__init__(cfg, parent)
 
         self.v.insertWidget(0, hint(
-            "Помічник читає габарит і діагностику завантаженої моделі, вашу "
-            "швидкість і доступну памʼять — і рахує з них розмір комірки, "
-            "рівень рефайнменту, кількість шарів і режим розвʼязувача. "
-            "Кожне число з поясненням, звідки воно.", title="Що робить помічник"))
+            tr("The assistant reads the bounding box and the diagnostics of "
+            "the loaded model, your speed and the available memory — and "
+            "from them calculates the cell size, the refinement level, "
+            "the number of layers and the solver mode. Each number comes "
+            "with an explanation of where it comes from."), title="What the assistant does"))
 
         row = QtWidgets.QHBoxLayout()
-        self.btn_calc = QtWidgets.QPushButton("Порахувати")
+        self.btn_calc = QtWidgets.QPushButton("Calculate")
         self.btn_calc.clicked.connect(self.compute_requested)
-        self.btn_apply = QtWidgets.QPushButton("Застосувати все")
+        self.btn_apply = QtWidgets.QPushButton("Apply All")
         self.btn_apply.clicked.connect(self.apply_requested)
         self.btn_apply.setEnabled(False)
         f = self.btn_apply.font()
@@ -3844,11 +3863,11 @@ class AdvisorPanel(Panel):
         row.addWidget(self.btn_apply)
         self.v.insertLayout(1, row)
 
-        self.form.addRow("Цільовий y+", self._yplus_widget())
+        self.form.addRow("Target y+", self._yplus_widget())
 
-        self.v.addWidget(section("Що змінити"))
+        self.v.addWidget(section(tr("What to Change")))
         self.table = QtWidgets.QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Де", "Що", "Було → стане", "Чому"])
+        self.table.setHorizontalHeaderLabels(["Where", "What", "Was → will be", "Why"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(True)
@@ -3860,7 +3879,7 @@ class AdvisorPanel(Panel):
         self.table.setMinimumHeight(230)
         self.v.addWidget(self.table)
 
-        self.v.addWidget(section("Висновки"))
+        self.v.addWidget(section(tr("Conclusions")))
         self.notes = QtWidgets.QTextBrowser()
         self.notes.setMinimumHeight(200)
         self.v.addWidget(self.notes)
@@ -3869,11 +3888,13 @@ class AdvisorPanel(Panel):
     def _yplus_widget(self):
         self.yplus = dspin(0.5, 300.0, 60.0, 5.0, 1)
         self.yplus.setToolTip(
-            "Коли на вкладці «Сітка» увімкнено «Авто» біля y+, помічник бере\n"
-            "y+ за моделлю турбулентності, а це поле не діє.\n"
-            "60 — середина лог-шару, надійний вибір із пристінними функціями.\n"
-            "Не ставте 5..30: це буферний шар, найгірша зона для них.\n"
-            "1 означає розвʼязувати підшар — потрібні десятки шарів і чистий STL.")
+            "When “Auto” next to y+ is on in the “Mesh” tab, the "
+            "assistant takes\ny+ from the turbulence model, and this "
+            "field has no effect.\n60 — the middle of the log layer, a "
+            "safe choice with wall functions.\nDo not set 5..30: this is "
+            "the buffer layer, the worst zone for them.\n1 means "
+            "resolving the sublayer — you need dozens of layers and a "
+            "clean STL.")
         return self.yplus
 
     def show_plan(self, plan):
@@ -3894,9 +3915,10 @@ class AdvisorPanel(Panel):
             colour = LEVEL_COLOR.get(level, "#888")
             html.append(f'<p style="margin:4px 0; color:{colour}">• {text}</p>')
         if not changes:
-            html.insert(0, '<p style="color:#4c9a52"><b>Налаштування вже '
-                           'відповідають розрахунку — міняти нічого.</b></p>')
-        self.notes.setHtml("".join(html))
+            html.insert(0, tr("<p style=\"color:#4c9a52\"><b>The settings "
+                           "already match the calculation — nothing to "
+                           "change.</b></p>"))
+        self.notes.setHtml(fs_i18n.join("", html))
         self.btn_apply.setEnabled(bool(changes))
 
 
@@ -3910,20 +3932,20 @@ class ScanDialog(QtWidgets.QDialog):
 
     def __init__(self, rows: list, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Знайдені машини")
+        self.setWindowTitle("Found machines")
         self._rows = rows
         v = QtWidgets.QVBoxLayout(self)
         n_ready = sum(1 for _m, _w, ready, known in rows if ready and not known)
         v.addWidget(WrapLabel(
-            tr("Знайдено машин із відкритим ssh: {n_rows}. Нових готових: "
-            "{n_ready}. Позначте, які додати.", n_rows=len(rows), n_ready=n_ready)))
+            tr("Machines with open ssh found: {n_rows}. New and ready: "
+               "{n_ready}. Mark which ones to add.", n_rows=len(rows), n_ready=n_ready)))
         self.lst = QtWidgets.QListWidget()
         for m, why, ready, known in rows:
             title = f"{m.name} — {m.addr}" if m.name else m.addr
             mark = "✓" if ready else "!"
             text = f"{mark} {title}: {why}"
             if known:
-                text += " (уже в списку)"
+                text += tr(" (already in the list)")
             it = QtWidgets.QListWidgetItem(text)
             if known:
                 it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEnabled)
@@ -3936,9 +3958,9 @@ class ScanDialog(QtWidgets.QDialog):
         self.lst.setMinimumWidth(560)
         v.addWidget(self.lst)
         bb = QtWidgets.QDialogButtonBox()
-        self.btn_add = bb.addButton("Додати вибрані",
+        self.btn_add = bb.addButton(tr("Add Selected"),
                                     QtWidgets.QDialogButtonBox.AcceptRole)
-        bb.addButton("Скасувати", QtWidgets.QDialogButtonBox.RejectRole)
+        bb.addButton(tr("Cancel"), QtWidgets.QDialogButtonBox.RejectRole)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
@@ -3972,10 +3994,10 @@ class RunPanel(Panel):
     def __init__(self, cfg, parent=None):
         super().__init__(cfg, parent)
 
-        self.v.insertWidget(0, section("Бекенд OpenFOAM"))
+        self.v.insertWidget(0, section(tr("OpenFOAM Backend")))
         row = QtWidgets.QHBoxLayout()
         self.cmb_backend = QtWidgets.QComboBox()
-        self.btn_detect = QtWidgets.QPushButton("Пошук")
+        self.btn_detect = QtWidgets.QPushButton("Search")
         self.btn_detect.clicked.connect(self.detect_requested)
         row.addWidget(self.cmb_backend, 1)
         row.addWidget(self.btn_detect)
@@ -3986,21 +4008,22 @@ class RunPanel(Panel):
         self.lbl_backend.setStyleSheet("font-size:11px; color:#555;")
         self.v.addWidget(self.lbl_backend)
 
-        self.box_install = QtWidgets.QGroupBox("OpenFOAM не знайдено")
+        self.box_install = QtWidgets.QGroupBox("OpenFOAM not found")
         bi = QtWidgets.QVBoxLayout(self.box_install)
         bi.addWidget(hint(
-            "У WSL уже є Ubuntu — лишилося поставити сам OpenFOAM. Кнопка "
-            "відкриє консоль WSL і виконає команду; apt запитає пароль sudo, "
-            "тому крок інтерактивний.", fold=False))
+            tr("WSL already has Ubuntu — only OpenFOAM itself is left to "
+            "install. The button opens a WSL console and runs the "
+            "command; apt asks for the sudo password, so this step is "
+            "interactive."), fold=False))
         self.txt_install = QtWidgets.QPlainTextEdit()
         self.txt_install.setReadOnly(True)
         self.txt_install.setMaximumHeight(70)
         self.txt_install.setStyleSheet("font-family: Consolas, monospace; font-size:11px;")
         bi.addWidget(self.txt_install)
         brow = QtWidgets.QHBoxLayout()
-        self.btn_install = QtWidgets.QPushButton("Встановити у WSL")
+        self.btn_install = QtWidgets.QPushButton("Install in WSL")
         self.btn_install.clicked.connect(self.install_requested)
-        self.btn_copy = QtWidgets.QPushButton("Копіювати команду")
+        self.btn_copy = QtWidgets.QPushButton("Copy Command")
         self.btn_copy.clicked.connect(self._copy_install)
         brow.addWidget(self.btn_install)
         brow.addWidget(self.btn_copy)
@@ -4008,7 +4031,7 @@ class RunPanel(Panel):
         self.v.addWidget(self.box_install)
         self.box_install.setVisible(False)
 
-        self.v.addWidget(section("Каталог кейсу"))
+        self.v.addWidget(section(tr("Case Folder")))
         self.ed_dir = QtWidgets.QLineEdit()
         self.ed_name = QtWidgets.QLineEdit(cfg.name)
         self.ed_name.textChanged.connect(
@@ -4016,42 +4039,43 @@ class RunPanel(Panel):
         # Що піде в імʼя теки, видно одразу після вводу: «11:15» стає
         # «11_15» у самому полі, а не мовчки десь на диску.
         self.ed_name.editingFinished.connect(self._tidy_name)
-        self.ed_name.setToolTip("Це імʼя теки кейсу: літери, цифри, «_», «.» "
-                                "і «-». Решта (двокрапка, пробіл, лапки…) "
-                                "заміниться на «_».")
+        self.ed_name.setToolTip("This is the case folder name: letters, "
+                                "digits, “_”, “.” and “-”. All other "
+                                "characters (colon, space, quotes…) "
+                                "become “_”.")
         f2 = QtWidgets.QFormLayout()
-        f2.addRow("Каталог", self.ed_dir)
-        f2.addRow("Назва", self.ed_name)
+        f2.addRow("Folder", self.ed_dir)
+        f2.addRow("Name", self.ed_name)
         self.v.addLayout(f2)
 
         srow = QtWidgets.QHBoxLayout()
-        srow.addWidget(QtWidgets.QLabel("Сервер"))
+        srow.addWidget(QtWidgets.QLabel("Server"))
         self.ed_server = QtWidgets.QLineEdit()
-        self.ed_server.setPlaceholderText("імʼя з ~/.ssh/config або user@host")
+        self.ed_server.setPlaceholderText("name from ~/.ssh/config or user@host")
         self.ed_server.setClearButtonEnabled(True)
         srow.addWidget(self.ed_server, 1)
-        self.btn_server = QtWidgets.QPushButton("Перевірити")
+        self.btn_server = QtWidgets.QPushButton("Check")
         srow.addWidget(self.btn_server)
         self.v.addLayout(srow)
         self.v.addWidget(hint(
-            "Порожнє поле — рахуємо тут. Вписали адресу й натиснули "
-            "«Перевірити» — сервер стає ще одним пунктом у списку бекендів "
-            "вище, і рахується там, якщо його вибрати. Потрібен ssh без "
-            "пароля (ключ) і встановлений OpenFOAM на тому боці; версію "
-            "програма покаже сама.", "server", title="Рахувати на сервері"))
+            tr("Empty field — we run here. Enter an address and click "
+            "“Check” — the server becomes one more item in the backend "
+            "list above, and the run goes there if you select it. You "
+            "need ssh without a password (a key) and OpenFOAM installed "
+            "on that side; the program shows the version itself."), "server", title="Run on a server"))
 
         self.chk_native = QtWidgets.QCheckBox(
-            "Рахувати в рідній ФС WSL (значно швидше)")
+            "Run in the native WSL file system (much faster)")
         self.chk_native.setChecked(True)
         self.v.addWidget(self.chk_native)
         self.v.addWidget(hint(
-            "Диск Windows видно у WSL через 9p, і файлові операції там у рази "
-            "повільніші. Кейс копіюється в ~/openfoam-studio, а результати "
-            "повертаються назад після прогону.", title="Чому кейс копіюється в WSL"))
+            tr("WSL sees the Windows disk through 9p, and file operations "
+            "there are many times slower. The case is copied to "
+            "~/openfoam-studio, and the results come back after the run."), title="Why the case is copied into WSL"))
 
         # ЕКСПЕРИМЕНТАЛЬНО: один прогін на кількох машинах (rust/foamdist).
         self.box_dist = QtWidgets.QGroupBox(
-            "Розподілити між машинами (експериментально)")
+            "Distribute across machines (experimental)")
         self.box_dist.setCheckable(True)
         self.box_dist.setChecked(False)
         dl = QtWidgets.QFormLayout(self.box_dist)
@@ -4064,59 +4088,62 @@ class RunPanel(Panel):
         self.lst_dist = QtWidgets.QListWidget()
         self.lst_dist.setMaximumHeight(140)
         self.lst_dist.setToolTip(
-            "Машини прогону. Галочка — брати в прогін. Серед них має бути сам "
-            "сервер (його адреса в локальній мережі): там лежить кейс і "
-            "рахується процес 0.")
-        self.btn_m_add = QtWidgets.QPushButton("+ Додати машину")
-        self.btn_m_del = QtWidgets.QPushButton("− Прибрати")
+            "Run machines. Checkbox — use in the run. The list must "
+            "include the server itself (its address in the local "
+            "network): the case is there and process 0 runs there.")
+        self.btn_m_add = QtWidgets.QPushButton("+ Add Machine")
+        self.btn_m_del = QtWidgets.QPushButton("− Remove")
         mrow = QtWidgets.QHBoxLayout()
         # ЗНАЙТИ МАШИНИ: сервер сам обходить свою мережу і ~/.ssh/config,
         # а вписувати адреси руками лишається для того, чого він не бачить.
-        self.btn_dist_scan = QtWidgets.QPushButton("Знайти машини…")
+        self.btn_dist_scan = QtWidgets.QPushButton("Find Machines…")
         self.btn_dist_scan.setToolTip(
-            "Сервер перебирає свою локальну мережу й хости зі свого "
-            "~/.ssh/config, шукає машини з відкритим ssh і перевіряє, чи "
-            "пускає ключ і чи є образ OpenFOAM. Знайдені можна додати "
-            "галочками. Займає кілька секунд.")
+            "The server scans its local network and the hosts from its "
+            "~/.ssh/config, looks for machines with open ssh and checks "
+            "if the key works and if there is an OpenFOAM image. You can "
+            "add the found machines with checkboxes. Takes a few seconds.")
         mrow.addWidget(self.btn_m_add)
         mrow.addWidget(self.btn_m_del)
         mrow.addWidget(self.btn_dist_scan)
         mrow.addStretch(1)
-        self.box_m = QtWidgets.QGroupBox("Вибрана машина")
+        self.box_m = QtWidgets.QGroupBox("Selected machine")
         ml = QtWidgets.QFormLayout(self.box_m)
-        self.chk_m_on = QtWidgets.QCheckBox("Брати в прогін")
+        self.chk_m_on = QtWidgets.QCheckBox("Use in the run")
         self.ed_m_name = QtWidgets.QLineEdit()
-        self.ed_m_name.setPlaceholderText("напр. node1 — сама підставиться "
-                                          "після «Перевірити»")
+        self.ed_m_name.setPlaceholderText("e.g. node1 — filled in "
+                                          "automatically after “Check”")
         self.ed_m_addr = QtWidgets.QLineEdit()
         self.ed_m_addr.setPlaceholderText("10.0.0.21")
         self.sp_m_procs = QtWidgets.QSpinBox()
         self.sp_m_procs.setRange(1, 256)
-        self.sp_m_procs.setToolTip("Не більше фізичних ядер машини.")
+        self.sp_m_procs.setToolTip("Not more than the physical cores of the machine.")
         self.ed_m_user = QtWidgets.QLineEdit()
-        self.ed_m_user.setPlaceholderText("типовий (нижче)")
+        self.ed_m_user.setPlaceholderText("default (below)")
         self.ed_m_key = QtWidgets.QLineEdit()
-        self.ed_m_key.setPlaceholderText("типовий (нижче)")
+        self.ed_m_key.setPlaceholderText("default (below)")
         self.ed_m_key.setToolTip(
-            "Шлях до ключа НА СЕРВЕРІ, яким він заходить саме на цю машину. "
-            "Для самого сервера не потрібен.")
+            "Path to the key ON THE SERVER that it uses to log in to "
+            "this specific machine. Not needed for the server itself.")
         ml.addRow(self.chk_m_on)
-        ml.addRow("Назва", self.ed_m_name)
-        ml.addRow("Адреса (IP)", self.ed_m_addr)
-        ml.addRow("Процеси", self.sp_m_procs)
-        ml.addRow("Користувач", self.ed_m_user)
-        ml.addRow("Ключ на сервері", self.ed_m_key)
+        ml.addRow("Name", self.ed_m_name)
+        ml.addRow("Address (IP)", self.ed_m_addr)
+        ml.addRow("Processes", self.sp_m_procs)
+        ml.addRow("User", self.ed_m_user)
+        ml.addRow("Key on server", self.ed_m_key)
         self.ed_dist_key = QtWidgets.QLineEdit("~/.ssh/id_ed25519")
-        self.ed_dist_key.setToolTip("Ключ НА СЕРВЕРІ для машин, у яких свій "
-                                    "не вказано.")
+        self.ed_dist_key.setToolTip("Key ON THE SERVER for machines that "
+                                    "have no key of their own.")
         self.ed_dist_user = QtWidgets.QLineEdit()
-        self.ed_dist_user.setToolTip("Користувач для машин, у яких свій не "
-                                     "вказано.")
+        self.ed_dist_user.setPlaceholderText("as on the server")
+        self.ed_dist_user.setToolTip("User for machines that have no "
+                                     "user of their own. Empty — the "
+                                     "user of the server login.")
         self.ed_dist_net = QtWidgets.QLineEdit()
-        self.ed_dist_net.setPlaceholderText("авто — з адрес машин (/24)")
+        self.ed_dist_net.setPlaceholderText("auto — from machine addresses (/24)")
         self.ed_dist_net.setToolTip(
-            "Мережа, якою процеси обмінюються даними (MPI), напр. "
-            "10.0.0.0/24; кілька — через кому. Порожньо — з адрес машин.")
+            "Network that the processes use to exchange data (MPI), e.g. "
+            "10.0.0.0/24; several — separated by commas. Empty — from "
+            "machine addresses.")
         self.lst_dist.currentRowChanged.connect(self._m_load)
         self.lst_dist.itemChanged.connect(self._m_item_checked)
         self.btn_m_add.clicked.connect(self._m_add)
@@ -4125,21 +4152,22 @@ class RunPanel(Panel):
             ed.editingFinished.connect(self._m_save)
         self.sp_m_procs.valueChanged.connect(lambda _v: self._m_save())
         self.chk_m_on.toggled.connect(lambda _v: self._m_save())
-        self.btn_dist_probe = QtWidgets.QPushButton("Перевірити машини")
-        self.chk_dist_rebench = QtWidgets.QCheckBox("Переміряти швидкість")
+        self.btn_dist_probe = QtWidgets.QPushButton("Check Machines")
+        self.chk_dist_rebench = QtWidgets.QCheckBox("Measure speed again")
         self.chk_dist_rebench.setToolTip(
-            "Швидкість кожної машини міряється коротким бенчмарком і "
-            "памʼятається на сервері (повтор — коли змінився процесор, минуло "
-            "30 днів або минулий замір був під навантаженням). З галочкою — "
-            "переміряти всі машини наступною перевіркою.")
+            "The speed of each machine is measured with a short "
+            "benchmark and stored on the server (it is measured again "
+            "when the processor changed, 30 days passed, or the last "
+            "measurement was under load). With the checkbox — measure "
+            "all machines again at the next check.")
         self.lbl_dist = WrapLabel("")
         self.lbl_dist.hide_when_empty = True
         dl.addRow(self.lst_dist)
         dl.addRow(mrow)
         dl.addRow(self.box_m)
-        dl.addRow("Типовий ключ", self.ed_dist_key)
-        dl.addRow("Типовий користувач", self.ed_dist_user)
-        dl.addRow("Мережа MPI", self.ed_dist_net)
+        dl.addRow("Default key", self.ed_dist_key)
+        dl.addRow("Default user", self.ed_dist_user)
+        dl.addRow("MPI network", self.ed_dist_net)
         prow = QtWidgets.QHBoxLayout()
         prow.addWidget(self.btn_dist_probe)
         prow.addWidget(self.chk_dist_rebench)
@@ -4147,15 +4175,17 @@ class RunPanel(Panel):
         dl.addRow(prow)
         dl.addRow(self.lbl_dist)
         dl.addRow(hint(
-            "Сітку будує сервер, як завжди, — одразу на стільки шматків, "
-            "скільки разом процесів. Розвʼязувач іде на всіх машинах: кожна "
-            "отримує лише свої шматки, наприкінці вони повертаються на "
-            "сервер. Усі процеси — в однаковому контейнері OpenFOAM "
-            "(opencfd/openfoam-run:2512). Шматки — за швидкістю: кожна "
-            "машина один раз проходить короткий бенчмарк (памʼятається на "
-            "сервері), а зайнята зараз отримує менше. Виміряно: 3 машини по "
-            "4 ядра — утричі швидше за одну. Лише для «Запустити на сервері».",
-            "dist", title="Як прогін ділиться між машинами"))
+            tr("The server builds the mesh, as always — directly into as "
+            "many pieces as there are processes in total. The solver "
+            "runs on all machines: each gets only its own pieces, and at "
+            "the end they come back to the server. All processes run in "
+            "the same OpenFOAM container (opencfd/openfoam-run:2512). "
+            "Pieces are split by speed: each machine runs a short "
+            "benchmark once (stored on the server), and a machine that "
+            "is busy now gets less. Measured: 3 machines with 4 cores "
+            "each — three times faster than one. Only for “Run on "
+            "Server”."),
+            "dist", title="How a run is split across machines"))
         self.v.addWidget(self.box_dist)
         self._m_load(-1)
 
@@ -4164,15 +4194,16 @@ class RunPanel(Panel):
         # на іншу кількість процесів. Галочка — будувати однаково (і
         # зберегти нову); знімається після запуску.
         self.chk_remesh = QtWidgets.QCheckBox(
-            "Перебудувати сітку, навіть якщо є збережена")
+            "Rebuild the mesh, even if a saved one exists")
         self.chk_remesh.setToolTip(
-            "Без галочки: якщо геометрія й налаштування сітки ті самі, що в "
-            "одному з минулих прогонів, сітку не будують, а беруть готову й "
-            "лише ріжуть на потрібну кількість процесів. Галочка — збудувати "
-            "заново (і зберегти нову). Знімається після запуску.")
+            "Without the checkbox: if the geometry and the mesh settings "
+            "are the same as in one of the previous runs, the mesh is "
+            "not built; the ready one is used and only cut into the "
+            "necessary number of processes. Checkbox — build again (and "
+            "save the new one). Cleared after the run starts.")
         self.v.addWidget(self.chk_remesh)
 
-        self.v.addWidget(section("Дії"))
+        self.v.addWidget(section(tr("Actions")))
 
         # СЕРІЯ КУТІВ ДЛЯ НЕЙТРАЛЬНОЇ ТОЧКИ.
         #
@@ -4183,15 +4214,17 @@ class RunPanel(Panel):
         # рахують увесь список одним заходом, а наприкінці відкривають
         # порівняння з нейтральною точкою.
         self.chk_series = QtWidgets.QCheckBox(
-            "Серія кутів атаки → нейтральна точка")
+            "Angle of attack series → neutral point")
         self.chk_series.setToolTip(
-            "Запустити прогони один за одним, по одному на кожен кут, і "
-            "наприкінці порахувати нейтральну точку й де ставити центр ваги.")
+            "Run the runs one after another, one for each angle, and at "
+            "the end calculate the neutral point and where to put the "
+            "center of gravity.")
         self.ed_angles = QtWidgets.QLineEdit(lib.DEFAULT_SERIES)
-        self.ed_angles.setPlaceholderText("напр. 0, 3, 6")
+        self.ed_angles.setPlaceholderText("e.g. 0, 3, 6")
         self.ed_angles.setToolTip(
-            "Кути атаки в градусах через кому чи пробіл. Із крапкою з комою "
-            "кома читається як десяткова: «0; 2,5; 5».")
+            "Angles of attack in degrees, separated by commas or spaces. "
+            "With semicolons, the comma is read as a decimal separator: "
+            "“0; 2,5; 5”.")
         self.ed_angles.setEnabled(False)
         self.lbl_series = WrapLabel("")
         self.lbl_series.hide_when_empty = True
@@ -4203,43 +4236,44 @@ class RunPanel(Panel):
         self.ed_angles.textChanged.connect(self.update_series_label)
         self.ed_name.textChanged.connect(self.update_series_label)
         arow = QtWidgets.QHBoxLayout()
-        arow.addWidget(QtWidgets.QLabel("Кути, °"))
+        arow.addWidget(QtWidgets.QLabel("Angles, °"))
         arow.addWidget(self.ed_angles, 1)
         self.v.addWidget(self.chk_series)
         self.v.addLayout(arow)
         self.v.addWidget(self.lbl_series)
         self.v.addWidget(hint(
-            "Кожен кут — окремий кейс із кутом у назві (назва_aoa3). Сітка, "
-            "розвʼязувач і решта налаштувань у всіх однакові — інакше "
-            "похідна порівнювала б різні постановки. Беріть кути в лінійній "
-            "ділянці, до зриву: нейтральна точка — це нахил моменту, а на "
-            "відриві стаціонарний розвʼязувач не сходиться. «Стоп» зупиняє "
-            "всю серію.", title="Серія кутів: як це працює"))
+            tr("Each angle is a separate case with the angle in the name "
+            "(name_aoa3). The mesh, the solver and all other settings "
+            "are the same in all of them — otherwise the derivative "
+            "would compare different setups. Use angles in the linear "
+            "range, before stall: the neutral point is the slope of the "
+            "moment, and in separated flow the steady solver does not "
+            "converge. “Stop” stops the whole series."), title="Angle series: how it works"))
 
         grid = QtWidgets.QGridLayout()
-        self.btn_create = QtWidgets.QPushButton("Створити кейс")
-        self.btn_run = QtWidgets.QPushButton("▶  Запустити")
-        self.btn_stop = QtWidgets.QPushButton("■  Стоп")
-        self.btn_open = QtWidgets.QPushButton("Відкрити каталог")
+        self.btn_create = QtWidgets.QPushButton("Create Case")
+        self.btn_run = QtWidgets.QPushButton("▶  Run")
+        self.btn_stop = QtWidgets.QPushButton("■  Stop")
+        self.btn_open = QtWidgets.QPushButton("Open Folder")
         self.btn_create.clicked.connect(self.create_requested)
         self.btn_run.clicked.connect(self.run_requested)
         self.btn_stop.clicked.connect(self.stop_requested)
         self.btn_open.clicked.connect(self.open_dir_requested)
         self.btn_stop.setEnabled(False)
         self.btn_stop.setToolTip(
-            "Обірвати одразу. Пораховане після останнього запланованого "
-            "зрізу пропаде, а зріз у паралельному прогоні лишиться "
-            "незібраним у processor*/.")
+            "Abort immediately. What was calculated after the last "
+            "scheduled time step is lost, and in a parallel run the time "
+            "step stays not reconstructed in processor*/.")
         # МʼЯКА ЗУПИНКА. «Стоп» убиває, і OpenFOAM при цьому нічого не
         # дописує: на нестаціонарі це година рахунку в нікуди. Ця кнопка
         # просить розвʼязувач дописати поточний момент, а прогін — зібрати
         # його й перевірити, що він справді є.
-        self.btn_soft_stop = QtWidgets.QPushButton("■  Стоп зі зрізом")
+        self.btn_soft_stop = QtWidgets.QPushButton("■  Stop with Time Step")
         self.btn_soft_stop.setToolTip(
-            "Розвʼязувач допише поточний момент (до одного кроку) і "
-            "зупиниться. Далі зріз буде зібрано (reconstructPar) і "
-            "перевірено — його можна відкрити в «Результатах». Працює, "
-            "лише поки розвʼязувач рахує, а не будує сітку.")
+            "The solver finishes the current moment (up to one step) and "
+            "stops. Then the time step is reconstructed (reconstructPar) "
+            "and checked — you can open it in “Results”. Works only "
+            "while the solver runs, not while it builds the mesh.")
         self.btn_soft_stop.clicked.connect(self.soft_stop_requested)
         self.btn_soft_stop.setEnabled(False)
         f = self.btn_run.font()
@@ -4255,7 +4289,7 @@ class RunPanel(Panel):
         #
         # Ця кнопка робить усі кроки сама: перевіряє сервер, вибирає його
         # бекендом і запускає. Помилитися нема де.
-        self.btn_run_server = QtWidgets.QPushButton("▶  Запустити на сервері")
+        self.btn_run_server = QtWidgets.QPushButton("▶  Run on Server")
         self.btn_run_server.setFont(f)
         self.btn_run_server.clicked.connect(self.run_server_requested)
 
@@ -4266,11 +4300,11 @@ class RunPanel(Panel):
         # повернутися до нього: журнал лився в те вікно, якого вже немає.
         # Ця кнопка питає сервер, що там діється, і дає підхопити будь-який
         # прогін — хоч той, що його пустили вчора з іншого ноута.
-        self.btn_attach = QtWidgets.QPushButton("⇄  Підключитися до прогону")
+        self.btn_attach = QtWidgets.QPushButton("⇄  Connect to Run")
         self.btn_attach.setToolTip(
-            "Показати прогони, що є на сервері, і підхопити журнал того, "
-            "який виберете. Працює й для прогону, пущеного іншою "
-            "програмою чи з іншого компʼютера.")
+            "Show the runs that are on the server, and pick up the log "
+            "of the one you select. Works also for a run started by a "
+            "different program or from a different computer.")
         self.btn_attach.clicked.connect(self.attach_requested)
         grid.addWidget(self.btn_create, 0, 0)
         grid.addWidget(self.btn_open, 0, 1)
@@ -4281,17 +4315,17 @@ class RunPanel(Panel):
         grid.addWidget(self.btn_attach, 4, 0, 1, 2)
         self.v.addLayout(grid)
         self.v.addWidget(hint(
-            tr("Кнопка сама перевірить сервер, вибере його бекендом і "
-               "запустить. Звичайне «Запустити» рахує там, що вибрано в "
-               "списку бекендів угорі, — а це найчастіше цей "
-               "комп'ютер.{chr}{chr}Прогін на сервері не залежить від "
-               "цього вікна: його можна закрити, а потім повернутися "
-               "кнопкою «Підключитися».", chr=chr(10)),
-            "server", title="Що робить «Запустити на сервері»"))
+            tr("The button checks the server itself, selects it as the "
+               "backend and starts the run. The normal “Run” runs where "
+               "the backend list at the top points — and most often that "
+               "is this computer.{chr}{chr}A run on the server does not "
+               "depend on this window: you can close it and come back "
+               "later with the “Connect” button.", chr=chr(10)),
+            "server", title="What “Run on server” does"))
 
         self.progress = QtWidgets.QProgressBar()
         self.progress.setTextVisible(True)
-        self.progress.setFormat("готовий")
+        self.progress.setFormat(tr("ready"))
         self.v.addWidget(self.progress)
 
         # Окремий індикатор «чи можна вимикати ноут» для прогону на сервері.
@@ -4309,7 +4343,7 @@ class RunPanel(Panel):
 
         # Зʼявляється після прогону, у якому шари наросли не всюди: порада
         # без кнопки означає, що людина мусить перекладати її в поля руками.
-        self.btn_fix_layers = QtWidgets.QPushButton("Полагодити шари")
+        self.btn_fix_layers = QtWidgets.QPushButton("Repair Layers")
         self.btn_fix_layers.clicked.connect(self.fix_layers_requested)
         self.btn_fix_layers.setVisible(False)
         self.v.addWidget(self.btn_fix_layers)
@@ -4320,22 +4354,23 @@ class RunPanel(Panel):
         show = bool(diagnosis is not None and diagnosis.fixable
                     and diagnosis.level in ("warn", "bad"))
         if show:
-            self.btn_fix_layers.setToolTip("\n".join(
-                f"{t.what}: {t.current} → {t.suggested} — {t.reason}"
-                for t in diagnosis.tips))
+            # "+" keeps the keys of the parts (a live language change).
+            self.btn_fix_layers.setToolTip(fs_i18n.join("\n", [
+                t.what + ": " + t.current + " → " + t.suggested + " — "
+                + t.reason for t in diagnosis.tips]))
         self.btn_fix_layers.setVisible(show)
 
     def _copy_install(self):
         QtWidgets.QApplication.clipboard().setText(self.txt_install.toPlainText())
-        self.lbl_status.setText("Команду скопійовано в буфер обміну.")
+        self.lbl_status.setText("Command copied to the clipboard.")
 
     def set_backends(self, backends, install_script=""):
         self.cmb_backend.clear()
         for b in backends:
-            mark = "" if b.ready else tr("  (не готовий)")
+            mark = "" if b.ready else tr("  (not ready)")
             self.cmb_backend.addItem(f"{b.label}{mark}", b)
         if not backends:
-            self.cmb_backend.addItem("нічого не знайдено", None)
+            self.cmb_backend.addItem("nothing found", None)
         self.txt_install.setPlainText(install_script)
         self.update_backend_label()
 
@@ -4355,7 +4390,7 @@ class RunPanel(Panel):
     def update_backend_label(self):
         b = self.current_backend()
         if b is None:
-            self.lbl_backend.setText("Бекенд не вибрано.")
+            self.lbl_backend.setText("No backend selected.")
             self.box_install.setVisible(True)
             self._name_run_button(None)
             return
@@ -4374,14 +4409,14 @@ class RunPanel(Panel):
         сервером — це години, і помітити її постфактум важко.
         """
         if b is None:
-            self.btn_run.setText("▶  Запустити")
-            self.btn_run.setToolTip("Спершу знайдіть OpenFOAM кнопкою «Пошук».")
+            self.btn_run.setText("▶  Run")
+            self.btn_run.setToolTip("First find OpenFOAM with the “Search” button.")
             return
         where = b.host if b.kind == "ssh" and b.host else b.label
-        self.btn_run.setText(tr("▶  Запустити: {where}", where=where))
+        self.btn_run.setText(tr("▶  Run: {where}", where=where))
         self.btn_run.setToolTip(
-            tr("Рахувати на «{label}» — це те, що вибрано в списку "
-            "бекендів угорі.", label=b.label))
+            tr("Run on “{label}” — this is what is selected in the "
+               "backend list at the top.", label=b.label))
 
     def series_angles(self) -> tuple[list[float], str]:
         """Кути серії з поля: (кути, чому не так — або "")."""
@@ -4405,24 +4440,30 @@ class RunPanel(Panel):
         angles, why = self.series_angles()
         if why:
             self.lbl_series.setStyleSheet("font-size:11px; color:#c0392b;")
-            self.lbl_series.setText(tr("Серію не запустити: {why}.", why=why))
+            self.lbl_series.setText(tr("Cannot start the series: {why}.", why=why))
             return
         base = self.cfg.name or "case"
         notes = lib.series_notes(angles)
         self.lbl_series.setStyleSheet(
             "font-size:11px; color:%s;" % ("#b9770e" if notes else "#555"))
         self.lbl_series.setText(
-            tr("{runs_word} один за одним: {join}. Кейси {base} … "
-               "{base2}.{join2}", runs_word=lib.runs_word(len(angles)), join=", ".join(f"{a:g}°" for a in angles), base=lib.series_case_name(base, angles[0]), base2=lib.series_case_name(base, angles[-1]), join2="".join(tr(" Увага: {n}.", n=n) for n in notes)))
+            tr("{runs_word} one after another: {join}. Cases {base} … "
+               "{base2}.{join2}", runs_word=lib.runs_word(len(angles)), join=", ".join(f"{a:g}°" for a in angles), base=lib.series_case_name(base, angles[0]), base2=lib.series_case_name(base, angles[-1]), join2="".join(tr(" Warning: {n}.", n=n) for n in notes)))
 
     # стан → (текст, колір тла, колір тексту)
+    # state: (text in the panel, background, colour, short text for the
+    # status bar). The short text is its own entry, not a part cut from the
+    # long one: the long one is translated as a whole (T24).
     LAPTOP_STATES = {
-        "upload": ("⏳  Вивантажую кейс на сервер — НЕ вимикайте ноут",
-                   "#5c3b00", "#ffd27a"),
-        "free": ("✔  Сервер рахує сам — ноут МОЖНА вимикати. Потім: "
-                 "«Підключитися до прогону»", "#123d1f", "#7ee787"),
-        "fetch": ("⬇  Повертаю результати на ноут — НЕ вимикайте ноут",
-                  "#5c3b00", "#ffd27a"),
+        "upload": ("⏳  Uploading the case to the server — do NOT turn off the laptop",
+                   "#5c3b00", "#ffd27a",
+                   "⏳  Uploading the case to the server — do NOT turn off the laptop"),
+        "free": ("✔  The server runs on its own — you CAN turn off the "
+                 "laptop. Then: “Connect to Run”", "#123d1f", "#7ee787",
+                 "✔  The server runs on its own — you CAN turn off the laptop"),
+        "fetch": ("⬇  Getting the results back to the laptop — do NOT turn off the laptop",
+                  "#5c3b00", "#ffd27a",
+                  "⬇  Getting the results back to the laptop — do NOT turn off the laptop"),
     }
 
     def set_laptop_state(self, state: str) -> None:
@@ -4432,7 +4473,7 @@ class RunPanel(Panel):
             self.lbl_laptop.setVisible(False)
             self.lbl_laptop.setProperty("state", "")
             return
-        text, bg, fg = got
+        text, bg, fg, _short = got
         self.lbl_laptop.setText(text)
         self.lbl_laptop.setProperty("state", state)
         self.lbl_laptop.setStyleSheet(
@@ -4479,10 +4520,10 @@ class RunPanel(Panel):
         g = self._probe.get(m.addr)
         mark = "" if g is None else ("✓ " if g.get("ok") else "✗ ")
         who = f" · {m.user}" if m.user else ""
-        own = " · свій ключ" if m.key else ""
+        own = tr(" · own key") if m.key else ""
         ram = ("" if m.ram_gb <= 0 else
-               tr(" · {ram_gb:.1f} ГБ", ram_gb=m.ram_gb) if m.ram_gb < 10 else tr(" · {ram_gb:.0f} ГБ", ram_gb=m.ram_gb))
-        return (f"{mark}{m.name or tr('(без назви)')} — {m.addr or '?'} × "
+               tr(" · {ram_gb:.1f} GB", ram_gb=m.ram_gb) if m.ram_gb < 10 else tr(" · {ram_gb:.0f} GB", ram_gb=m.ram_gb))
+        return (f"{mark}{m.name or tr('(no name)')} — {m.addr or '?'} × "
                 f"{m.procs}{who}{own}{ram}")
 
     def _m_refresh(self) -> None:
@@ -4625,8 +4666,8 @@ class LibraryPanel(QtWidgets.QWidget):
     машини чи дорахували через `Allrun` у консолі.
     """
 
-    COLUMNS = ("Назва", "Змінено", "Стан", "Прогін", "Комірок", "Ітерацій",
-               "Cd", "Cl", "U, м/с", "α°", "Модель", "Розмір")
+    COLUMNS = ("Name", "Modified", "Status", tr("Run", ctx="column"), "Cells", "Iterations",
+               "Cd", "Cl", "U, m/s", "α°", "Model", "Size")
 
     open_requested = QtCore.Signal(str)
     paraview_requested = QtCore.Signal(str)
@@ -4647,15 +4688,15 @@ class LibraryPanel(QtWidgets.QWidget):
         bar = QtWidgets.QHBoxLayout()
         self.ed_root = QtWidgets.QLineEdit(self.root)
         self.ed_root.setReadOnly(True)
-        self.btn_browse = QtWidgets.QPushButton("Огляд…")
-        self.btn_refresh = QtWidgets.QPushButton("Оновити")
+        self.btn_browse = QtWidgets.QPushButton("Browse…")
+        self.btn_refresh = QtWidgets.QPushButton("Refresh")
         self.ed_filter = QtWidgets.QLineEdit()
-        self.ed_filter.setPlaceholderText("фільтр за назвою, моделлю, приміткою")
+        self.ed_filter.setPlaceholderText("filter by name, model, note")
         self.ed_filter.setClearButtonEnabled(True)
         self.btn_browse.clicked.connect(self._browse)
         self.btn_refresh.clicked.connect(self.refresh)
         self.ed_filter.textChanged.connect(lambda _: self._apply_filter())
-        bar.addWidget(QtWidgets.QLabel("Каталог"))
+        bar.addWidget(QtWidgets.QLabel("Folder"))
         bar.addWidget(self.ed_root, 2)
         bar.addWidget(self.btn_browse)
         bar.addWidget(self.btn_refresh)
@@ -4685,13 +4726,13 @@ class LibraryPanel(QtWidgets.QWidget):
         nl = QtWidgets.QVBoxLayout(notes_box)
         nl.setContentsMargins(0, 0, 0, 0)
         nl.setSpacing(3)
-        nl.addWidget(section("Примітка до кейсу"))
+        nl.addWidget(section(tr("Case Note")))
         self.ed_notes = QtWidgets.QPlainTextEdit()
         self.ed_notes.setPlaceholderText(
-            "Що саме перевірялося цим прогоном і що з нього вийшло.\n"
-            "Зберігається в studio.json поряд із кейсом.")
+            "What exactly this run tested and what came out of "
+            "it.\nStored in studio.json next to the case.")
         self.ed_notes.setMinimumHeight(90)
-        self.btn_notes = QtWidgets.QPushButton("Зберегти примітку")
+        self.btn_notes = QtWidgets.QPushButton("Save Note")
         self.btn_notes.clicked.connect(self._save_notes)
         nl.addWidget(self.ed_notes, 1)
         nl.addWidget(self.btn_notes)
@@ -4710,19 +4751,18 @@ class LibraryPanel(QtWidgets.QWidget):
         lay.addWidget(split, 1)
 
         row = QtWidgets.QHBoxLayout()
-        self.btn_open = QtWidgets.QPushButton("Відкрити")
+        self.btn_open = QtWidgets.QPushButton("Open")
         self.btn_open.setToolTip(
-            "Перенести налаштування кейсу в усі вкладки, завантажити його STL "
-            "і результати")
+            "Move the case settings into all tabs, load its STL and results")
         f = self.btn_open.font()
         f.setBold(True)
         self.btn_open.setFont(f)
-        self.btn_compare = QtWidgets.QPushButton("Порівняти вибрані")
-        self.btn_para = QtWidgets.QPushButton("У ParaView")
-        self.btn_dir = QtWidgets.QPushButton("Каталог")
-        self.btn_rename = QtWidgets.QPushButton("Перейменувати…")
-        self.btn_slim = QtWidgets.QPushButton("Звільнити місце…")
-        self.btn_delete = QtWidgets.QPushButton("Видалити…")
+        self.btn_compare = QtWidgets.QPushButton("Compare Selected")
+        self.btn_para = QtWidgets.QPushButton("In ParaView")
+        self.btn_dir = QtWidgets.QPushButton("Folder")
+        self.btn_rename = QtWidgets.QPushButton("Rename…")
+        self.btn_slim = QtWidgets.QPushButton("Free Up Space…")
+        self.btn_delete = QtWidgets.QPushButton("Delete…")
         self.btn_open.clicked.connect(self._open)
         self.btn_compare.clicked.connect(self._compare)
         self.btn_para.clicked.connect(self._paraview)
@@ -4811,8 +4851,8 @@ class LibraryPanel(QtWidgets.QWidget):
             self.select(keep)
         self.lbl_status.setText(
             "" if self.cases else
-            tr("У каталозі {root} кейсів немає. Створіть кейс на вкладці "
-            "«Запуск» — він зʼявиться тут.", root=self.root))
+            tr("There are no cases in {root}. Create a case on the “Run” "
+               "tab — it will show up here.", root=self.root))
         self._selection_changed()
 
     def _apply_filter(self):
@@ -4872,7 +4912,7 @@ class LibraryPanel(QtWidgets.QWidget):
         self.btn_notes.setEnabled(info is not None)
         self.ed_notes.setEnabled(info is not None)
         if info is None:
-            self.details.setHtml("<p style='color:#777'>Кейс не вибрано.</p>")
+            self.details.setHtml(tr("<p style='color:#777'>No case selected.</p>"))
             self._notes_path = ""
             self._notes_text = ""
             self.ed_notes.setPlainText("")
@@ -4902,13 +4942,13 @@ class LibraryPanel(QtWidgets.QWidget):
             if c.path == path:
                 c.notes = text
         self._notes_text = text
-        self.lbl_status.setText("Примітку збережено.")
+        self.lbl_status.setText("Note saved.")
 
     # --- дії -------------------------------------------------------------
 
     def _browse(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Каталог із кейсами", self.root)
+            self, tr("Folder with cases"), self.root)
         if path:
             self.set_root(path)
             self.refresh()
@@ -4940,38 +4980,38 @@ class LibraryPanel(QtWidgets.QWidget):
         try:
             lib.set_notes(info.path, text)
         except OSError as exc:
-            QtWidgets.QMessageBox.warning(self, "Не вдалося записати", str(exc))
+            QtWidgets.QMessageBox.warning(self, tr("Could not write"), str(exc))
             return
         info.notes = text
         self._notes_text = text
-        self.lbl_status.setText(tr("Примітку збережено в {MANIFEST}.", MANIFEST=lib.MANIFEST))
+        self.lbl_status.setText(tr("Note saved in {MANIFEST}.", MANIFEST=lib.MANIFEST))
 
     def _rename(self):
         info = self.current()
         if info is None:
             return
         name, ok = QtWidgets.QInputDialog.getText(
-            self, "Перейменувати кейс", "Нова назва каталогу:", text=info.name)
+            self, tr("Rename Case"), tr("New folder name:"), text=info.name)
         name = (name or "").strip()
         if not ok or not name or name == info.name:
             return
         if any(ch in name for ch in '\\/:*?"<>|'):
             QtWidgets.QMessageBox.warning(
-                self, "Недопустима назва",
-                "У назві каталогу не можна вживати \\ / : * ? \" < > |")
+                self, tr("Invalid name"),
+                tr("A folder name cannot contain \\ / : * ? \" < > |"))
             return
         target = os.path.join(os.path.dirname(info.path), name)
         if os.path.exists(target):
             QtWidgets.QMessageBox.warning(
-                self, "Уже існує", tr("Каталог «{name}» у цьому каталозі вже є.", name=name))
+                self, tr("Already exists"), tr("A folder “{name}” already exists in this folder.", name=name))
             return
         try:
             os.rename(info.path, target)
         except OSError as exc:
             QtWidgets.QMessageBox.critical(
-                self, "Не вдалося перейменувати",
-                tr("{exc}\n\nЯкщо кейс відкритий у ParaView або в консолі "
-                "WSL — закрийте його і спробуйте ще раз.", exc=exc))
+                self, tr("Could not rename"),
+                tr("{exc}\n\nIf the case is open in ParaView or in a WSL "
+                   "console, close it and try again.", exc=exc))
             return
         self.changed_on_disk.emit(info.path)
         self.refresh()
@@ -4985,20 +5025,21 @@ class LibraryPanel(QtWidgets.QWidget):
         parts = lib.reclaimable(info.path)
         if not parts:
             QtWidgets.QMessageBox.information(
-                self, "Нічого прибирати",
-                tr("У кейсі «{name}» немає ні каталогів processor*, ні "
-                "проміжних часових зрізів.", name=info.name))
+                self, tr("Nothing to remove"),
+                tr("Case “{name}” has no processor* folders and no "
+                   "intermediate time directories.", name=info.name))
             return
         total = sum(size for _, size in parts)
         listing = "\n".join(f"    {name}    {lib.fmt_size(size)}"
                             for name, size in parts)
         ans = QtWidgets.QMessageBox.question(
-            self, "Звільнити місце",
-            tr("З кейсу «{name}» буде видалено:\n\n{listing}\n\n"
-            "Усього {total} із {size}.\n\n"
-            "Результат лишається: останній часовий зріз, postProcessing, "
-            "логи й налаштування не чіпаються. Але продовжити цей прогін з "
-            "місця зупинки вже не вийде — тільки перезапустити.\n\nВидалити?", name=info.name, listing=listing, total=lib.fmt_size(total), size=lib.fmt_size(info.size)),
+            self, tr("Free Up Space"),
+            tr("From the case “{name}” this will be "
+               "deleted:\n\n{listing}\n\nTotal {total} of {size}.\n\nThe "
+               "result stays: the last time directory, postProcessing, "
+               "logs and settings are not touched. But you cannot "
+               "continue this run from where it stopped — only restart "
+               "it.\n\nDelete?", name=info.name, listing=listing, total=lib.fmt_size(total), size=lib.fmt_size(info.size)),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No)
         if ans != QtWidgets.QMessageBox.Yes:
@@ -5007,31 +5048,30 @@ class LibraryPanel(QtWidgets.QWidget):
         self.changed_on_disk.emit(info.path)
         self.refresh()
         self.select(info.path)
-        self.lbl_status.setText(tr("Звільнено {freed}.", freed=lib.fmt_size(freed)))
+        self.lbl_status.setText(tr("Freed {freed}.", freed=lib.fmt_size(freed)))
 
     def _delete(self):
         info = self.current()
         if info is None:
             return
         ans = QtWidgets.QMessageBox.question(
-            self, "Видалити кейс",
-            tr("Видалити каталог цілком?\n\n{path}\n\n"
-            "{size}, "
-            "{v}. "
-            "Кошик Windows це не проходить — відновити не вийде.", path=info.path, size=lib.fmt_size(info.size), v='є результати' if info.times else 'результатів немає'),
+            self, tr("Delete Case"),
+            tr("Delete the whole folder?\n\n{path}\n\n{size}, {v}. This does "
+               "not go to the Windows Recycle Bin — you cannot restore "
+               "it.", path=info.path, size=lib.fmt_size(info.size), v='has results' if info.times else 'no results'),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No)
         if ans != QtWidgets.QMessageBox.Yes:
             return
         if not lib.delete_case(info.path):
             QtWidgets.QMessageBox.critical(
-                self, "Не вдалося видалити",
-                tr("Каталог {path} лишився на місці. Можливо, його файли "
-                "тримає ParaView або консоль WSL.", path=info.path))
+                self, tr("Could not delete"),
+                tr("Folder {path} is still in place. ParaView or a WSL "
+                   "console may be holding its files.", path=info.path))
             return
         self.changed_on_disk.emit(info.path)
         self.refresh()
-        self.lbl_status.setText(tr("Кейс «{name}» видалено.", name=info.name))
+        self.lbl_status.setText(tr("Case “{name}” deleted.", name=info.name))
 
     def _compare(self):
         chosen = self.selected()
@@ -5050,7 +5090,7 @@ def _fmt_coeff(pair) -> str:
         return "—"
     mean = pair[0]
     if not math.isfinite(mean) or abs(mean) > 1e3:
-        return "розійшлося"
+        return tr("diverged")
     return f"{mean:+.5f}"
 
 
@@ -5066,74 +5106,74 @@ def _details_html(info) -> str:
                     f'<code>{value}</code></p>')
 
     head(info.name)
-    line("каталог", info.path)
-    line("змінено", lib.fmt_time(info.modified))
+    line(tr("folder"), info.path)
+    line(tr("modified"), lib.fmt_time(info.modified))
     if info.created:
-        line("створено", info.created)
-    line("на диску", lib.fmt_size(info.size))
+        line(tr("created"), info.created)
+    line(tr("on disk"), lib.fmt_size(info.size))
     if info.stl_source:
-        line("з файлу", info.stl_source)
+        line(tr("from file"), info.stl_source)
 
     if info.has_cfg:
         cfg = lib.cfg_from_dict(info.cfg)
         f, d, m, s = cfg.flow, cfg.domain, cfg.mesh, cfg.solver
-        head("Потік")
-        line("швидкість", tr("{u_inf:.4g} м/с", u_inf=f.u_inf))
-        line("кути", tr("атаки {aoa_deg:g}°, ковзання {aos_deg:g}°", aoa_deg=f.aoa_deg, aos_deg=f.aos_deg))
+        head("Flow")
+        line(tr("speed"), tr("{u_inf:.4g} m/s", u_inf=f.u_inf))
+        line(tr("angles"), tr("attack {aoa_deg:g}°, sideslip {aos_deg:g}°", aoa_deg=f.aoa_deg, aos_deg=f.aos_deg))
         line("Re", f"{phys.reynolds(f.u_inf, f.l_ref, f.nu):.4g}")
-        line("модель", tr("{turbulence}, дальнє поле {farfield_mode}", turbulence=f.turbulence, farfield_mode=f.farfield_mode))
-        line("опорні", tr("Aref {a_ref:.5g} м², Lref {l_ref:.5g} м", a_ref=f.a_ref, l_ref=f.l_ref))
-        line("середовище", tr("nu {nu:.4g} м²/с, rho {rho:g} кг/м³", nu=f.nu, rho=f.rho))
-        head("Сітка")
-        line("домен", tr("{0:.4g} × {1:.4g} × {2:.4g} м", *cfg.domain_size))
-        line("фон", tr("{base_cells_along_x} комірок уздовж X, "
-                    "комірка {base_cell}", base_cells_along_x=d.base_cells_along_x, base_cell=phys.fmt_len(cfg.base_cell)))
-        line("рівні", tr("поверхня {surface_level_min}–{surface_level_max}, "
-                      "кромки {feature_level}, "
-                      "комірка {surface_cell}", surface_level_min=m.surface_level_min, surface_level_max=m.surface_level_max, feature_level=m.feature_level, surface_cell=phys.fmt_len(cfg.surface_cell)))
-        line("шари", tr("{n_layers} × {expansion:g}, покриття "
-                     "{u_inf:.2f}", n_layers=m.n_layers, expansion=m.expansion, u_inf=cfg.layer_stack.covers_bl(f.u_inf, f.l_ref, f.nu))
-                     if m.add_layers else "немає")
-        line("коробка", tr("рівень {level}", level=m.boxes[0].level) if m.boxes else "немає")
-        head("Розвʼязувач")
-        line("ітерацій", tr("{n_iterations}, поріг {residual_tol:g}", n_iterations=s.n_iterations, residual_tol=s.residual_tol))
-        line("процесів", f"{s.n_procs} ({s.decompose_method})")
-        line("стійкий старт",
-             tr("перші {robust_iterations} ітерацій", robust_iterations=s.robust_iterations) if s.two_stage
-             else ("увесь прогін" if s.robust_start else "вимкнено"))
+        line(tr("model"), tr("{turbulence}, far field {farfield_mode}", turbulence=f.turbulence, farfield_mode=f.farfield_mode))
+        line(tr("reference"), tr("Aref {a_ref:.5g} m², Lref {l_ref:.5g} m", a_ref=f.a_ref, l_ref=f.l_ref))
+        line(tr("medium"), tr("nu {nu:.4g} m²/s, rho {rho:g} kg/m³", nu=f.nu, rho=f.rho))
+        head("Mesh")
+        line(tr("domain"), tr("{0:.4g} × {1:.4g} × {2:.4g} m", *cfg.domain_size))
+        line(tr("background"), tr("{base_cells_along_x} cells along X, cell {base_cell}", base_cells_along_x=d.base_cells_along_x, base_cell=phys.fmt_len(cfg.base_cell)))
+        line(tr("levels"), tr("surface "
+                              "{surface_level_min}–{surface_level_max}, "
+                              "edges {feature_level}, cell {surface_cell}", surface_level_min=m.surface_level_min, surface_level_max=m.surface_level_max, feature_level=m.feature_level, surface_cell=phys.fmt_len(cfg.surface_cell)))
+        line(tr("layers"), tr("{n_layers} × {expansion:g}, coverage {u_inf:.2f}", n_layers=m.n_layers, expansion=m.expansion, u_inf=cfg.layer_stack.covers_bl(f.u_inf, f.l_ref, f.nu))
+                     if m.add_layers else "none")
+        line(tr("box"), tr("level {level}", level=m.boxes[0].level) if m.boxes else "none")
+        head("Solver")
+        line(tr("iterations"), tr("{n_iterations}, tolerance {residual_tol:g}", n_iterations=s.n_iterations, residual_tol=s.residual_tol))
+        line(tr("processes"), f"{s.n_procs} ({s.decompose_method})")
+        line(tr("robust start"),
+             tr("first {robust_iterations} iterations", robust_iterations=s.robust_iterations) if s.two_stage
+             else (tr("whole run") if s.robust_start else tr("off")))
     else:
         rows.append(
-            tr("<p style=\"margin:8px 0; color:{LEVEL_COLOR}\">"
-            "Файла <code>{MANIFEST}</code> у кейсі немає: його створено "
-            "до появи бібліотеки або скопійовано без маніфесту. Налаштування "
-            "відновити не вийде — у <code>system/</code> лежать уже готові "
-            "словники. Результати, логи й ParaView доступні.</p>", LEVEL_COLOR=LEVEL_COLOR["warn"], MANIFEST=lib.MANIFEST))
+            tr("<p style=\"margin:8px 0; color:{LEVEL_COLOR}\">The case "
+               "has no <code>{MANIFEST}</code> file: it was created "
+               "before the library existed, or it was copied without the "
+               "manifest. The settings cannot be restored — "
+               "<code>system/</code> holds only the finished "
+               "dictionaries. Results, logs and ParaView are "
+               "available.</p>", LEVEL_COLOR=LEVEL_COLOR["warn"], MANIFEST=lib.MANIFEST))
 
-    head("Результат")
+    head(tr("Result"))
     facts = info.logs
-    line("стан", info.state + (tr(", прогін {run_status}", run_status=info.run_status)
+    line(tr("status"), info.state + (tr(", run {run_status}", run_status=info.run_status)
                                if info.run_status else ""))
     if facts.cells:
-        line("комірок", phys.fmt_cells(facts.cells))
+        line(tr("cells"), phys.fmt_cells(facts.cells))
     if facts.mesh_failed >= 0:
-        line("checkMesh", "без зауважень" if facts.mesh_failed == 0
-             else tr("{mesh_failed} перевірок не пройдено", mesh_failed=facts.mesh_failed))
+        line("checkMesh", tr("no issues") if facts.mesh_failed == 0
+             else tr("{mesh_failed} checks failed", mesh_failed=facts.mesh_failed))
     if info.layers >= 0:
-        line("шари", tr("наросли на {v:.0f}% граней{v2}", v=info.layers * 100, v2="" if info.layers >= 0.7 else " — замало"))
+        line(tr("layers"), tr("grown on {v:.0f}% of faces{v2}", v=info.layers * 100, v2="" if info.layers >= 0.7 else " — too few"))
     label, value = info.progress_label
     if value != "—":
-        line(label, value + (tr(", {seconds} рахунку", seconds=lib.fmt_seconds(info.seconds))
+        line(label, value + (tr(", {seconds} of run time", seconds=lib.fmt_seconds(info.seconds))
                              if info.seconds else ""))
     if info.times:
-        line("часові зрізи", ", ".join("%g" % t for t in info.times[-6:]))
+        line(tr("time directories"), ", ".join("%g" % t for t in info.times[-6:]))
     if info.stale_times:
         rows.append(
-            tr("<p style=\"margin:6px 0; color:{LEVEL_COLOR}\">Зрізи "
-               "<code>{join}</code> не відповідають сітці кейсу: це поля "
-               "попередніх прогонів, у них інша кількість комірок. "
-               "ParaView на них видає «cells/points do not match», а "
-               "читач результатів їх не показує. «Звільнити місце» їх "
-               "прибере.</p>", LEVEL_COLOR=LEVEL_COLOR["warn"], join=", ".join("%g" % t for t in info.stale_times)))
+            tr("<p style=\"margin:6px 0; color:{LEVEL_COLOR}\">Time "
+               "directories <code>{join}</code> do not match the case "
+               "mesh: they are fields from earlier runs, with a "
+               "different cell count. ParaView shows “cells/points do "
+               "not match” for them, and the results reader does not "
+               "show them. “Free up space” removes them.</p>", LEVEL_COLOR=LEVEL_COLOR["warn"], join=", ".join("%g" % t for t in info.stale_times)))
 
     found = False
     for name in ("Cd", "Cl", "CmPitch"):
@@ -5143,22 +5183,20 @@ def _details_html(info) -> str:
         found = True
         mean, spread = pair
         if not math.isfinite(mean) or abs(mean) > 1e3:
-            line(name, tr("{mean:.4g} — розрахунок розійшовся", mean=mean))
+            line(name, tr("{mean:.4g} — the run diverged", mean=mean))
             continue
         note = ""
         if abs(mean) > 1e-6 and spread > abs(mean) * 0.02:
-            note = "  — ще не зійшлося"
-        line(name, tr("{mean:+.5f}   розкид {spread:.2e}{note}", mean=mean, spread=spread, note=note))
+            note = tr("  — not converged yet")
+        line(name, tr("{mean:+.5f}   spread {spread:.2e}{note}", mean=mean, spread=spread, note=note))
     if not found and info.times:
-        line("коефіцієнти", "у postProcessing не знайдено")
+        line(tr("coefficients"), tr("not found in postProcessing"))
 
     if len(info.runs) > 1:
-        head("Прогони")
+        head(tr("Runs"))
         for run in reversed(info.runs[-5:]):
             line(run.get("finished", "—"),
-                 tr("{v}, "
-                 "{get} ітерацій, "
-                 "{fmt_seconds}", v='ok' if run.get('ok') else 'обірвано', get=run.get('iterations', 0), fmt_seconds=lib.fmt_seconds(run.get('seconds', 0.0))))
+                 tr("{v}, {get} iterations, {fmt_seconds}", v='ok' if run.get('ok') else 'aborted', get=run.get('iterations', 0), fmt_seconds=lib.fmt_seconds(run.get('seconds', 0.0))))
     return "".join(rows)
 
 
@@ -5176,29 +5214,31 @@ class UnitsDialog(QtWidgets.QDialog):
 
     def __init__(self, paths, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Одиниці моделі")
+        self.setWindowTitle("Model Units")
         names = [os.path.basename(str(p)) for p in paths]
-        shown = ", ".join(names[:3]) + (tr(" і ще {v}", v=len(names) - 3)
+        shown = ", ".join(names[:3]) + (tr(" and {v} more", v=len(names) - 3)
                                         if len(names) > 3 else "")
         lay = QtWidgets.QVBoxLayout(self)
-        head = WrapLabel(tr("У яких одиницях креслення <b>{shown}</b>?", shown=html_escape(shown)))
+        head = WrapLabel(tr("In what units is <b>{shown}</b> drawn?", shown=html_escape(shown)))
         head.setWordWrap(True)
         lay.addWidget(head)
         self.cmb = ValueCombo()
         self.cmb.add_values(UNITS)
         self.cmb.setCurrentText(DEFAULT_UNITS)
         form = QtWidgets.QFormLayout()
-        form.addRow("Одиниці", self.cmb)
+        form.addRow("Units", self.cmb)
         lay.addLayout(form)
         lay.addWidget(hint(
-            "STL зберігає лише числа, без одиниць. Помилка тут — це модель у "
-            "тисячу разів більша чи менша, і сітка, сили й число Рейнольдса "
-            "від неї. Не знаєте — «авто»: програма вгадає за габаритом, але "
-            "дрібну деталь у метрах вона прийме за міліметрову.", fold=False))
+            tr("STL stores only numbers, without units. A mistake here "
+            "makes the model a thousand times larger or smaller, and the "
+            "mesh, forces and Reynolds number with it. If you do not "
+            "know, choose “auto”: the program guesses from the overall "
+            "size, but it takes a small part in meters for one in "
+            "millimeters."), fold=False))
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Відкрити")
-        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Скасувати")
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Open")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Cancel")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
@@ -5226,11 +5266,11 @@ class CompareDialog(QtWidgets.QDialog):
 
     def __init__(self, cases: list, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Порівняння кейсів")
+        self.setWindowTitle("Case Comparison")
 
         rows = _compare_rows(cases)
         table = QtWidgets.QTableWidget(len(rows), len(cases) + 1)
-        table.setHorizontalHeaderLabels(["Параметр"] + [c.name for c in cases])
+        table.setHorizontalHeaderLabels([tr("Parameter")] + [c.name for c in cases])
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(True)
@@ -5258,11 +5298,11 @@ class CompareDialog(QtWidgets.QDialog):
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(hint(
-            "Підсвічено рядки, де кейси відрізняються. Порожня клітинка — "
-            "кейс без маніфесту: його налаштування невідомі.", fold=False))
+            tr("Rows where the cases differ are highlighted. An empty cell "
+            "is a case without a manifest: its settings are unknown."), fold=False))
         lay.addWidget(table, 1)
         lay.addWidget(self._stability_box(cases))
-        btn = QtWidgets.QPushButton("Закрити")
+        btn = QtWidgets.QPushButton("Close")
         btn.clicked.connect(self.accept)
         strip = QtWidgets.QHBoxLayout()
         strip.addStretch(1)
@@ -5277,7 +5317,7 @@ class CompareDialog(QtWidgets.QDialog):
         лежать поряд.
         """
         self.stab = st = lib.stability(cases)
-        box = QtWidgets.QGroupBox("Нейтральна точка — від неї ставлять центр ваги")
+        box = QtWidgets.QGroupBox("Neutral point — the center of gravity is placed from it")
         v = QtWidgets.QVBoxLayout(box)
         self.lbl_np = QtWidgets.QLabel(_stability_html(st))
         self.lbl_np.setTextFormat(QtCore.Qt.RichText)
@@ -5287,17 +5327,18 @@ class CompareDialog(QtWidgets.QDialog):
         self.lbl_margin = None
         if st.point is not None:
             row = QtWidgets.QHBoxLayout()
-            where = "від носа" if st.nose_x is not None else "x у системі кейсу"
-            row.addWidget(QtWidgets.QLabel(tr("Ваш центр ваги, {where}:", where=where)))
+            where = tr("from the nose") if st.nose_x is not None else tr("x in the case coordinates")
+            row.addWidget(QtWidgets.QLabel(tr("Your center of gravity, {where}:", where=where)))
             # «Не задано» — найменше значення поля: порожнього стану в
             # QDoubleSpinBox нема, а підставляти за замовчуванням якесь число
             # значило б видати його за ваш центр ваги.
             self.spin_cg = dspin(-1e5, 1e5, -1e5, step=5.0, decimals=1,
-                                 suffix=" мм")
-            self.spin_cg.setSpecialValueText("не задано")
+                                 suffix=" mm")
+            self.spin_cg.setSpecialValueText("not set")
             self.spin_cg.setToolTip(
-                "Відстань від найпередньої точки тіла вздовж потоку. Для "
-                "стійкості центр ваги має лежати ПЕРЕД нейтральною точкою.")
+                "Distance from the foremost point of the body along the "
+                "flow. For stability, the center of gravity must be "
+                "AHEAD of the neutral point.")
             self.spin_cg.valueChanged.connect(self._cg_changed)
             row.addWidget(self.spin_cg)
             self.lbl_margin = QtWidgets.QLabel("")
@@ -5316,24 +5357,24 @@ class CompareDialog(QtWidgets.QDialog):
         m = st.margin(x_cg)
         text, colour = _margin_verdict(m)
         self.lbl_margin.setText(
-            tr("<span style=\"color:{colour}\"><b>запас стійкості {v:+.1f}% "
-            "Lref</b> — {text}</span>", colour=colour, v=m * 100, text=text))
+            tr("<span style=\"color:{colour}\"><b>static margin {v:+.1f}% "
+               "Lref</b> — {text}</span>", colour=colour, v=m * 100, text=text))
 
 
 def _margin_verdict(margin: float) -> tuple[str, str]:
     """Слово про запас стійкості й колір, яким його писати."""
     if margin < 0:
-        return ("НЕстійкий: центр ваги позаду нейтральної точки, "
-                "збурення наростатиме", LEVEL_COLOR["bad"])
+        return (tr("UNstable: the center of gravity is behind the neutral "
+                "point, disturbances will grow"), LEVEL_COLOR["bad"])
     if margin < lib.MARGIN_LOW:
-        return (tr("ледь стійкий, запасу замало (норма {lo}–{hi}%)",
+        return (tr("barely stable, margin too small (normal {lo}–{hi}%)",
                    lo=round(lib.MARGIN_LOW * 100),
                    hi=round(lib.MARGIN_HIGH * 100)),
                 LEVEL_COLOR["warn"])
     if margin <= lib.MARGIN_HIGH:
-        return ("стійкий, у нормі", LEVEL_COLOR["ok"])
-    return ("дуже стійкий: центр ваги далеко попереду, стабілізатор "
-            "утримуватиме кут з великим зусиллям", LEVEL_COLOR["warn"])
+        return (tr("stable, normal"), LEVEL_COLOR["ok"])
+    return (tr("very stable: the center of gravity is far forward, the "
+            "stabilizer will hold the angle with a lot of force"), LEVEL_COLOR["warn"])
 
 
 def _stability_html(st) -> str:
@@ -5345,36 +5386,38 @@ def _stability_html(st) -> str:
     notes = f"<ul style='margin:2px 0'>{notes}</ul>" if notes else ""
     if st.point is None:
         return (
-            tr("<p>Нейтральну точку поки не порахувати: {problem}.</p><p "
-               "style=\"color:#777\">Як її отримати: прорахуйте ТОЙ САМИЙ "
-               "літак на кількох кутах атаки (наприклад 2°, 5° і 8°), "
-               "змінюючи лише кут. Виділіть ці кейси у «Збережених» і "
-               "натисніть «Порівняти вибрані».</p>{notes}", problem=html_escape(st.problem), notes=notes))
+            tr("<p>The neutral point cannot be calculated yet: "
+               "{problem}.</p><p style=\"color:#777\">How to get it: "
+               "calculate THE SAME aircraft at several angles of attack "
+               "(for example 2°, 5° and 8°), and change only the angle. "
+               "Select these cases in “Saved” and click “Compare "
+               "Selected”.</p>{notes}", problem=html_escape(st.problem), notes=notes))
     p = st.point
     angles = ", ".join(f"{a:g}°" for a in p.angles)
     names = html_escape(", ".join(st.names))
-    where = tr("x = <b>{x:+.4f} м</b> у системі кейсу", x=p.x)
+    where = tr("x = <b>{x:+.4f} m</b> in the case coordinate system", x=p.x)
     if st.nose_x is not None and st.length:
         d = p.x - st.nose_x
-        where += (tr("; <b>від носа {v:.0f} мм</b> "
-                  "({v2:.1f}% довжини тіла)", v=d * 1000, v2=d / st.length * 100))
+        where += (tr("; <b>{v:.0f} mm from the nose</b> ({v2:.1f}% of "
+                     "the body length)", v=d * 1000, v2=d / st.length * 100))
     pairs = ""
     if len(p.angles) > 2 and p.pairs:
-        pairs = (tr("<br>За сусідніми парами кутів: від {pairs:+.4f} до "
-                 "{pairs2:+.4f} м — так видно, чи залежність лінійна.", pairs=min(p.pairs), pairs2=max(p.pairs)))
+        pairs = (tr("<br>From neighboring pairs of angles: from "
+                    "{pairs:+.4f} to {pairs2:+.4f} m — this shows if the "
+                    "relation is linear.", pairs=min(p.pairs), pairs2=max(p.pairs)))
     lo, hi = st.cg_range()
     if st.nose_x is not None:
-        span = (tr("від <b>{v:.0f}</b> до "
-                "<b>{v2:.0f} мм від носа</b>", v=(lo - st.nose_x) * 1000, v2=(hi - st.nose_x) * 1000))
+        span = (tr("from <b>{v:.0f}</b> to <b>{v2:.0f} mm from the nose</b>", v=(lo - st.nose_x) * 1000, v2=(hi - st.nose_x) * 1000))
     else:
-        span = tr("x від <b>{lo:+.4f}</b> до <b>{hi:+.4f} м</b>", lo=lo, hi=hi)
+        span = tr("x from <b>{lo:+.4f}</b> to <b>{hi:+.4f} m</b>", lo=lo, hi=hi)
     return (
-        tr("<p><b>Нейтральна точка</b> за кутами {angles} (кейси: "
-           "{names}):<br>{where}.<br>dCn/dα = {cn_alpha:+.5f} на градус, "
-           "dCm/dα = {cm_alpha:+.5f} на градус — відносно центру "
-           "моментів x = {x_cofr:+.3f} м.{pairs}</p><p><b>Центр ваги</b> "
-           "ставте ПЕРЕД нею (ближче до носа) із запасом "
-           "{round}–{round2}% Lref (Lref = {l_ref:.4g} м): "
+        tr("<p><b>Neutral point</b> from the angles {angles} (cases: "
+           "{names}):<br>{where}.<br>dCn/dα = {cn_alpha:+.5f} per "
+           "degree, dCm/dα = {cm_alpha:+.5f} per degree — relative to "
+           "the moment center x = {x_cofr:+.3f} "
+           "m.{pairs}</p><p><b>Center of gravity</b>: put it IN FRONT of "
+           "the neutral point (closer to the nose) with a margin of "
+           "{round}–{round2}% Lref (Lref = {l_ref:.4g} m): "
            "{span}.</p>{notes}", angles=angles, names=names, where=where, cn_alpha=p.cn_alpha, cm_alpha=p.cm_alpha, x_cofr=st.x_cofr, pairs=pairs, round=round(lib.MARGIN_LOW * 100), round2=round(lib.MARGIN_HIGH * 100), l_ref=st.l_ref, span=span, notes=notes))
 
 
@@ -5395,7 +5438,7 @@ def _compare_rows(cases: list) -> list[tuple[str, list[str]]]:
         for info, _ in prepared:
             pair = info.coeff(name)
             out.append("—" if pair is None else "%.2e" % pair[1])
-        return (tr("розкид {name}", name=name), out)
+        return (tr("{name} spread", name=name), out)
 
     def yplus(cfg):
         if not cfg.mesh.add_layers:
@@ -5404,47 +5447,47 @@ def _compare_rows(cases: list) -> list[tuple[str, list[str]]]:
         return "%.1f" % cfg.layer_stack.yplus(f.u_inf, f.l_ref, f.nu)
 
     return [
-        ("стан", [info.state for info, _ in prepared]),
-        ("прогін", [info.run_status or "—" for info, _ in prepared]),
-        ("комірок", [phys.fmt_cells(info.cells) if info.cells else "—"
+        (tr("status"), [info.state for info, _ in prepared]),
+        (tr("run"), [info.run_status or "—" for info, _ in prepared]),
+        (tr("cells"), [phys.fmt_cells(info.cells) if info.cells else "—"
                      for info, _ in prepared]),
         # Підпис однин на стовпець, а постановка в кейсів може бути різна,
         # тому пишемо нейтрально: «пройдено» однаково читається і про
         # ітерації стаціонару, і про секунди нестаціонару.
-        ("пройдено", [info.progress_label[1] for info, _ in prepared]),
-        ("час рахунку", [lib.fmt_seconds(info.seconds)
+        (tr("completed"), [info.progress_label[1] for info, _ in prepared]),
+        (tr("run time"), [lib.fmt_seconds(info.seconds)
                          for info, _ in prepared]),
         coeff("Cd"),
         spread("Cd"),
         coeff("Cl"),
         spread("Cl"),
         coeff("CmPitch"),
-        row("швидкість, м/с", lambda c: "%.4g" % c.flow.u_inf),
-        row("кут атаки", lambda c: "%g°" % c.flow.aoa_deg),
-        row("кут ковзання", lambda c: "%g°" % c.flow.aos_deg),
+        row(tr("speed, m/s"), lambda c: "%.4g" % c.flow.u_inf),
+        row(tr("angle of attack"), lambda c: "%g°" % c.flow.aoa_deg),
+        row(tr("sideslip angle"), lambda c: "%g°" % c.flow.aos_deg),
         row("Re", lambda c: "%.4g" % phys.reynolds(
             c.flow.u_inf, c.flow.l_ref, c.flow.nu)),
-        row("модель турбулентності", lambda c: c.flow.turbulence),
-        row("дальнє поле", lambda c: c.flow.farfield_mode),
-        row("Aref, м²", lambda c: "%.5g" % c.flow.a_ref),
-        row("Lref, м", lambda c: "%.5g" % c.flow.l_ref),
-        row("домен: перед/за/бік", lambda c: "%g / %g / %g" % (
+        row(tr("turbulence model"), lambda c: c.flow.turbulence),
+        row(tr("far field"), lambda c: c.flow.farfield_mode),
+        row(tr("Aref, m²"), lambda c: "%.5g" % c.flow.a_ref),
+        row(tr("Lref, m"), lambda c: "%.5g" % c.flow.l_ref),
+        row(tr("domain: front/rear/side"), lambda c: "%g / %g / %g" % (
             c.domain.upstream, c.domain.downstream, c.domain.side)),
-        row("комірок уздовж X", lambda c: c.domain.base_cells_along_x),
-        row("фонова комірка", lambda c: phys.fmt_len(c.base_cell)),
-        row("рівні поверхні", lambda c: "%d–%d" % (
+        row(tr("cells along X"), lambda c: c.domain.base_cells_along_x),
+        row(tr("background cell"), lambda c: phys.fmt_len(c.base_cell)),
+        row(tr("surface levels"), lambda c: "%d–%d" % (
             c.mesh.surface_level_min, c.mesh.surface_level_max)),
-        row("рівень кромок", lambda c: c.mesh.feature_level),
-        row("комірка на поверхні", lambda c: phys.fmt_len(c.surface_cell)),
-        row("шарів", lambda c: ("%d × %g" % (c.mesh.n_layers, c.mesh.expansion)
-                                if c.mesh.add_layers else "немає")),
-        row("y+ (оцінка)", yplus),
-        row("ітерацій задано", lambda c: c.solver.n_iterations),
-        row("поріг збіжності", lambda c: "%g" % c.solver.residual_tol),
-        row("процесів", lambda c: c.solver.n_procs),
-        row("стійких ітерацій", lambda c: (
+        row(tr("edge level"), lambda c: c.mesh.feature_level),
+        row(tr("cell on surface"), lambda c: phys.fmt_len(c.surface_cell)),
+        row(tr("layers", ctx="count"), lambda c: ("%d × %g" % (c.mesh.n_layers, c.mesh.expansion)
+                                if c.mesh.add_layers else "none")),
+        row("y+ (estimate)", yplus),
+        row(tr("iterations set"), lambda c: c.solver.n_iterations),
+        row(tr("convergence threshold"), lambda c: "%g" % c.solver.residual_tol),
+        row(tr("processes"), lambda c: c.solver.n_procs),
+        row(tr("robust iterations"), lambda c: (
             c.solver.robust_iterations if c.solver.two_stage else "—")),
-        ("примітка", [info.notes.replace("\n", " ")[:120]
+        (tr("note"), [info.notes.replace("\n", " ")[:120]
                       for info, _ in prepared]),
     ]
 
@@ -5609,17 +5652,18 @@ class TransmitterPanel(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(self)
 
         v.addWidget(hint(
-            "Стіки задають ПОЗИЦІЮ, в якій рахуватиметься кейс: поверхні "
-            "відхиляються на свої кути, і саме така геометрія йде в сітку. "
-            "Це не політ — розрахунок стаціонарний, літак у ньому завмер.",
-            title="Що задають стіки"))
+            tr("The sticks set the POSITION in which the case is computed: "
+            "the surfaces deflect to their angles, and this geometry "
+            "goes into the mesh. This is not flight — the run is steady, "
+            "and the aircraft is frozen in it."),
+            title="What the sticks set"))
 
         sticks = QtWidgets.QHBoxLayout()
         self.left = StickPad(x_range=(-1.0, 1.0), y_range=(0.0, 1.0),
                              x_spring=True, y_spring=False,
-                             labels=("курс", "газ"))
+                             labels=("yaw", "throttle"))
         self.right = StickPad(x_range=(-1.0, 1.0), y_range=(-1.0, 1.0),
-                              labels=("крен", "тангаж"))
+                              labels=("roll", "pitch"))
         # Стіки показують типові значення каналів (газ типово повний).
         self.left.set_values(self.values["yaw"], self.values["throttle"])
         self.right.set_values(self.values["roll"], self.values["pitch"])
@@ -5655,9 +5699,9 @@ class TransmitterPanel(QtWidgets.QWidget):
         v.addWidget(self.lbl)
 
         row = QtWidgets.QHBoxLayout()
-        b = QtWidgets.QPushButton("Все в нейтраль")
-        b.setToolTip("Повернути всі канали в типове положення: газ на "
-                     "повний, керма прямо")
+        b = QtWidgets.QPushButton("All to Neutral")
+        b.setToolTip("Return all channels to the default position: full "
+                     "throttle, control surfaces centered")
         b.clicked.connect(self.to_neutral)
         row.addWidget(b)
         row.addStretch(1)
@@ -5714,8 +5758,8 @@ class TransmitterPanel(QtWidgets.QWidget):
     def _show(self):
         parts = []
         for key, label, _, _, _, _ in fc.RC_CHANNELS:
-            parts.append(f"{tr(label)} {self.values[key]:+.2f}")
-        self.lbl.setText("   ".join(parts))
+            parts.append(tr(label) + f" {self.values[key]:+.2f}")
+        self.lbl.setText(fs_i18n.join("   ", parts))
 
     def show_mapping(self, lines):
         """Що саме зараз рухається — списком, з кутами.
@@ -5726,7 +5770,7 @@ class TransmitterPanel(QtWidgets.QWidget):
         """
         if not lines:
             self.lbl_map.setText(
-                "Жодної керованої поверхні. Виберіть деталь на вкладці "
-                "«Геометрія», задайте їй канал і завісу.")
+                "No control surfaces. Select a part on the “Geometry” "
+                "tab and give it a channel and a hinge.")
         else:
-            self.lbl_map.setText("\n".join(lines))
+            self.lbl_map.setText(fs_i18n.join("\n", lines))

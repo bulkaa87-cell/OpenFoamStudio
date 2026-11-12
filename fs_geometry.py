@@ -128,8 +128,8 @@ def _require_cells(out: pv.PolyData, name: str, why: str = "") -> pv.PolyData:
     називати його треба збоєм.
     """
     if out is None or out.n_cells == 0:
-        raise ValueError(tr("«{name}» не дав результату — поверхня "
-                            "вийшла порожня.{v}", name=name, v=" " + why if why else ""))
+        raise ValueError(tr("“{name}” gave no result — the surface came "
+                            "out empty.{v}", name=name, v=" " + why if why else ""))
     return out
 
 
@@ -167,9 +167,10 @@ def load_surface(path: str) -> pv.PolyData:
     mesh = drop_stray_cells(mesh.triangulate())
     if int(mesh.GetNumberOfPolys()) == 0:
         raise ValueError(
-            tr("У файлі немає жодного трикутника: {n_points} точок, "
-            "{n_lines} ліній, {n_verts} окремих вершин. Це хмара "
-            "точок або каркас, а не поверхня — обтікати тут нічого.", n_points=mesh.n_points, n_lines=mesh.n_lines, n_verts=mesh.n_verts))
+            tr("The file has no triangles: {n_points} points, {n_lines} "
+               "lines, {n_verts} separate vertices. This is a point "
+               "cloud or a wireframe, not a surface — there is nothing "
+               "for the flow to go around here.", n_points=mesh.n_points, n_lines=mesh.n_lines, n_verts=mesh.n_verts))
     return mesh
 
 
@@ -182,12 +183,12 @@ def guess_scale(mesh: pv.PolyData) -> tuple[float, str]:
     b = mesh.bounds
     span = max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
     if span > 300:
-        return (0.001, tr("габарит {span:.0f} — найімовірніше міліметри", span=span))
+        return (0.001, tr("overall size {span:.0f} — most likely millimeters", span=span))
     if span > 30:
-        return (0.001, tr("габарит {span:.0f} — можливо міліметри", span=span))
+        return (0.001, tr("overall size {span:.0f} — maybe millimeters", span=span))
     if span < 0.002:
-        return (1000.0, tr("габарит {span:.5g} — можливо кілометри або помилка", span=span))
-    return (1.0, tr("габарит {span:.4g} — схоже на метри", span=span))
+        return (1000.0, tr("overall size {span:.5g} — maybe kilometers or an error", span=span))
+    return (1.0, tr("overall size {span:.4g} — looks like meters", span=span))
 
 
 # --------------------------------------------------------------------------
@@ -622,7 +623,7 @@ def problem_spots(mesh: pv.PolyData, diagnosis, limit: int = 10) -> list[dict]:
     spots: list[dict] = []
     for size, centre in hole_report(mesh, limit=limit):
         spots.append({"kind": "holes", "size": size, "centre": centre,
-                      "what": "дірка"})
+                      "what": "hole"})
 
     mask = getattr(diagnosis, "inverted_cells", None)
     if mask is not None:
@@ -646,7 +647,7 @@ def problem_spots(mesh: pv.PolyData, diagnosis, limit: int = 10) -> list[dict]:
             groups.sort(key=lambda g: -g[0])
             for span, centre in groups[:limit]:
                 spots.append({"kind": "flip", "size": span, "centre": centre,
-                              "what": "вивернута частина"})
+                              "what": "flipped part"})
 
     degen = degenerate_points(mesh)
     if degen is not None and degen.n_points:
@@ -654,7 +655,7 @@ def problem_spots(mesh: pv.PolyData, diagnosis, limit: int = 10) -> list[dict]:
         for point in np.asarray(degen.points)[::step][:limit]:
             spots.append({"kind": "degen", "size": 0.0,
                           "centre": tuple(float(v) for v in point),
-                          "what": "вироджений трикутник"})
+                          "what": "degenerate triangle"})
 
     spots.sort(key=lambda spot: -spot["size"])
     return spots
@@ -789,33 +790,34 @@ def _diagnose_rust(mesh, rs, pts, tris) -> Diagnosis:
 def _add_notes(d: Diagnosis) -> None:
     n = d.notes
     if d.n_triangles == 0:
-        n.append(("bad", "Поверхня порожня."))
+        n.append(("bad", tr("The surface is empty.")))
         return
 
     if d.open_edges == 0:
-        n.append(("ok", "Поверхня замкнена — витоків не буде."))
+        n.append(("ok", tr("The surface is closed — there will be no leaks.")))
     else:
         from fs_physics import fmt_len
         big = fmt_len(d.largest_hole) if d.hole_sizes else "?"
         n.append((
             "bad",
-            tr("{open_edges} відкритих ребер, {n_hole_sizes} дірок. "
-            "Найбільша — {big}. Порівняйте її з розміром комірки на поверхні: "
-            "дрібніші за комірку snappy затягне сам, більші стануть каналом "
-            "усередину тіла.", open_edges=d.open_edges, n_hole_sizes=len(d.hole_sizes), big=big),
+            tr("{open_edges} open edges, {n_hole_sizes} holes. The "
+               "largest — {big}. Compare it with the cell size on the "
+               "surface: snappy closes holes smaller than a cell by "
+               "itself, larger ones become a channel into the body.", open_edges=d.open_edges, n_hole_sizes=len(d.hole_sizes), big=big),
         ))
 
     if d.non_manifold_edges:
         n.append((
             "warn",
-            tr("{non_manifold_edges} non-manifold ребер (ребро ділять >2 "
-            "трикутники) — типова ознака збірки з деталей, не обʼєднаних "
-            "булево. Castellation це стерпить, але surfaceFeatureExtract "
-            "дасть сміттєві кромки: підніміть includedAngle до 170.", non_manifold_edges=d.non_manifold_edges),
+            tr("{non_manifold_edges} non-manifold edges (an edge shared "
+               "by >2 triangles) — a typical sign of an assembly of "
+               "parts not joined by a boolean union. Castellation "
+               "tolerates it, but surfaceFeatureExtract will give junk "
+               "feature edges: raise includedAngle to 170.", non_manifold_edges=d.non_manifold_edges),
         ))
 
     if d.degenerate:
-        n.append(("warn", tr("{degenerate} вироджених трикутників нульової площі.", degenerate=d.degenerate)))
+        n.append(("warn", tr("{degenerate} degenerate triangles with zero area.", degenerate=d.degenerate)))
 
     if d.parts > 1:
         # Для snappyHexMesh це не вада: набір перетинних замкнених оболонок
@@ -823,16 +825,16 @@ def _add_notes(d: Diagnosis) -> None:
         # наскрізних дірок. Погано лише тоді, коли серед частин є сміття.
         n.append((
             "ok" if d.closed else "warn",
-            tr("{parts} незвʼязаних частин. Для snappy це нормально, якщо це "
-            "збірка перетинних деталей; перевірте лише, чи немає серед них "
-            "випадкового сміття.", parts=d.parts),
+            tr("{parts} unconnected parts. For snappy this is normal if "
+               "it is an assembly of intersecting parts; just check that "
+               "there is no random junk among them.", parts=d.parts),
         ))
 
     if d.closed and not d.normals_outward:
         n.append((
             "warn",
-            "Нормалі дивляться всередину. Для castellation це здебільшого "
-            "байдуже, але виправити дешево.",
+            tr("The normals point inward. For castellation this mostly does "
+            "not matter, but it is cheap to fix."),
         ))
 
     # Напрямок потоку з самої геометрії надійно не визначити: у крила
@@ -843,30 +845,32 @@ def _add_notes(d: Diagnosis) -> None:
     if any(d.projected) and sx > max(sy, sz) * 1.05:
         n.append((
             "warn",
-            tr("Найбільший габарит ({sx:.4g} м) лежить уздовж X — там, де в цій "
-            "програмі йде потік. У літака це зазвичай розмах, і він має бути "
-            "по Y: перевірте орієнтацію кнопкою «↻ Z 90°». Для автомобіля, "
-            "корпусу чи ракети все гаразд — там найдовша вісь і є напрямком "
-            "руху.", sx=sx),
+            tr("The largest dimension ({sx:.4g} m) lies along X — where "
+               "the flow goes in this program. For an aircraft this is "
+               "usually the span, and it must be along Y: check the "
+               "orientation with the “↻ Z 90°” button. For a car, hull "
+               "or rocket all is fine — there the longest axis is the "
+               "direction of motion.", sx=sx),
         ))
 
     if d.bad_winding:
         n.append((
             "bad",
-            tr("{bad_winding} ребер, де сусідні трикутники намотані в один "
-            "бік — намотка поверхні неузгоджена. Це ламає обидві перевірки "
-            "«всередині/зовні» у snappy: refinementRegions з mode inside і "
-            "визначення замкнености. Тисніть «Полагодити» (метод meshfix).", bad_winding=d.bad_winding),
+            tr("{bad_winding} edges where neighboring triangles are "
+               "wound the same way — the surface winding is "
+               "inconsistent. This breaks both “inside/outside” checks "
+               "in snappy: refinementRegions with mode inside and the "
+               "closedness check. Click “Repair” (meshfix method).", bad_winding=d.bad_winding),
         ))
 
     if d.inverted_parts:
         n.append((
             "warn" if d.flipped_fraction < 0.25 else "bad",
-            tr("{inverted_parts} із {parts} частин вивернуті навиворіт "
-            "({flipped_faces} граней): усередині себе намотані правильно, "
-            "але нормалями дивляться всередину. У Blender цього не видно — "
-            "його вʼюпорт світить із двох боків. «Полагодити» (метод meshfix) "
-            "розвертає кожну частину назовні.", inverted_parts=d.inverted_parts, parts=d.parts, flipped_faces=d.flipped_faces),
+            tr("{inverted_parts} of {parts} parts are turned inside out "
+               "({flipped_faces} faces): they are wound correctly within "
+               "themselves, but their normals point inward. You cannot "
+               "see this in Blender — its viewport lights both sides. "
+               "“Repair” (meshfix method) turns each part outward.", inverted_parts=d.inverted_parts, parts=d.parts, flipped_faces=d.flipped_faces),
         ))
 
     if d.max_edge > 0 and d.min_edge > 0:
@@ -874,8 +878,8 @@ def _add_notes(d: Diagnosis) -> None:
         if ratio > 1e4:
             n.append((
                 "warn",
-                tr("Розкид довжин ребер {ratio:.0f}x — у сітці є і сливери, "
-                "і величезні грані.", ratio=ratio),
+                tr("Edge length spread {ratio:.0f}x — the mesh has both "
+                   "slivers and huge faces.", ratio=ratio),
             ))
 
 
@@ -921,31 +925,31 @@ def diagnosis_rows(d: Diagnosis) -> list[tuple[str, str, str]]:
 
     sx, sy, sz = d.size
     rows = [
-        ("Трикутників", f"{d.n_triangles:,}".replace(",", " "), "ok"),
-        ("Вершин", f"{d.n_points:,}".replace(",", " "), "ok"),
-        ("Замкнена", "так" if d.closed else "НІ", lvl(not d.closed)),
-        ("Відкритих ребер", str(d.open_edges), lvl(d.open_edges > 0)),
-        ("Дірок / найбільша",
+        (tr("Triangles"), f"{d.n_triangles:,}".replace(",", " "), "ok"),
+        (tr("Vertices"), f"{d.n_points:,}".replace(",", " "), "ok"),
+        (tr("Closed"), tr("yes") if d.closed else tr("NO"), lvl(not d.closed)),
+        (tr("Open edges"), str(d.open_edges), lvl(d.open_edges > 0)),
+        (tr("Holes / largest"),
          f"{len(d.hole_sizes)} / {fmt_len(d.largest_hole)}" if d.hole_sizes else "—",
          lvl(bool(d.hole_sizes))),
-        ("Non-manifold ребер", str(d.non_manifold_edges),
+        (tr("Non-manifold edges"), str(d.non_manifold_edges),
          lvl(False, d.non_manifold_edges > 0)),
-        ("Вироджених", str(d.degenerate), lvl(False, d.degenerate > 0)),
-        ("Частин", str(d.parts), lvl(False, d.parts > 1)),
-        ("Нормалі назовні", "так" if d.normals_outward else "ні",
+        (tr("Degenerate", ctx="count"), str(d.degenerate), lvl(False, d.degenerate > 0)),
+        (tr("Parts"), str(d.parts), lvl(False, d.parts > 1)),
+        (tr("Normals outward"), tr("yes") if d.normals_outward else tr("no"),
          lvl(False, not d.normals_outward)),
-        ("Вивернутих частин",
-         tr("{inverted_parts} / {parts} ({flipped_faces} граней)", inverted_parts=d.inverted_parts, parts=d.parts, flipped_faces=d.flipped_faces)
+        (tr("Flipped parts"),
+         tr("{inverted_parts} / {parts} ({flipped_faces} faces)", inverted_parts=d.inverted_parts, parts=d.parts, flipped_faces=d.flipped_faces)
          if d.inverted_parts else "0",
          lvl(d.flipped_fraction > 0.25, d.inverted_parts > 0)),
-        ("Неузгоджених ребер", str(d.bad_winding), lvl(d.bad_winding > 0)),
-        ("Площа поверхні", tr("{area:.6g} м²", area=d.area), "ok"),
-        ("Силует спереду (мідель)", tr("{frontal:.5g} м²", frontal=d.frontal),
+        (tr("Inconsistent edges"), str(d.bad_winding), lvl(d.bad_winding > 0)),
+        (tr("Surface area"), tr("{area:.6g} m²", area=d.area), "ok"),
+        (tr("Front silhouette (frontal area)"), tr("{frontal:.5g} m²", frontal=d.frontal),
          lvl(False, d.streamwise_axis != 0)),
-        ("Силует згори (планформа)", tr("{planform:.5g} м²", planform=d.planform), "ok"),
-        ("Обʼєм", tr("{volume:.6g} м³", volume=d.volume) if d.closed else "— (не замкнена)", "ok"),
-        ("Габарит", tr("{sx:.4g} × {sy:.4g} × {sz:.4g} м", sx=sx, sy=sy, sz=sz), "ok"),
-        ("Ребро min / медіана / max",
+        (tr("Top silhouette (planform)"), tr("{planform:.5g} m²", planform=d.planform), "ok"),
+        (tr("Volume"), tr("{volume:.6g} m³", volume=d.volume) if d.closed else tr("— (not closed)"), "ok"),
+        (tr("Overall size"), tr("{sx:.4g} × {sy:.4g} × {sz:.4g} m", sx=sx, sy=sy, sz=sz), "ok"),
+        (tr("Edge min / median / max"),
          f"{fmt_len(d.min_edge)} / {fmt_len(d.median_edge)} / {fmt_len(d.max_edge)}",
          "ok"),
     ]
@@ -1073,9 +1077,9 @@ def weld(mesh: pv.PolyData, tolerance_m: float,
                      point_merging=True, lines_to_points=True,
                      polys_to_lines=True)
     return _require_cells(
-        drop_stray_cells(out.triangulate()), "Зшити вершини",
-        tr("Допуск {v:.3g} мм зліпив усю модель в одну точку — "
-        "візьміть менший.", v=tolerance_m * 1000))
+        drop_stray_cells(out.triangulate()), tr("Weld vertices"),
+        tr("Tolerance {v:.3g} mm merged the whole model into one point — "
+           "use a smaller one.", v=tolerance_m * 1000))
 
 
 def clean_surface(mesh: pv.PolyData, tolerance: float = 1e-8) -> pv.PolyData:
@@ -1098,7 +1102,7 @@ def fill_holes(mesh: pv.PolyData, max_size: float) -> pv.PolyData:
     """
     out = mesh.fill_holes(max_size)
     out = drop_stray_cells(out.clean(tolerance=1e-9).triangulate())
-    return orient_normals(_require_cells(out, "Закрити дірки"))
+    return orient_normals(_require_cells(out, tr("Close holes")))
 
 
 def orient_parts_outward(mesh: pv.PolyData) -> pv.PolyData:
@@ -1252,8 +1256,8 @@ def decimate(mesh: pv.PolyData, target_triangles: int) -> pv.PolyData:
     return _require_cells(
         drop_stray_cells(
             mesh.decimate(ratio, volume_preservation=True).triangulate()),
-        "Проріднити",
-        "Спробуйте лишити більше трикутників.")
+        tr("Decimate"),
+        tr("Try to keep more triangles."))
 
 
 def subdivide(mesh: pv.PolyData, levels: int = 1) -> pv.PolyData:
@@ -1268,13 +1272,14 @@ def subdivide(mesh: pv.PolyData, levels: int = 1) -> pv.PolyData:
     bad = _count_edges(mesh, non_manifold_edges=True)
     if bad:
         raise ValueError(
-            tr("Згустити не вийде: у сітці {bad} non-manifold ребер, а "
-            "vtkLinearSubdivisionFilter такого не бере — він повертає "
-            "порожню поверхню. Спершу «Полагодити» (meshfix або alpha wrap).", bad=bad))
+            tr("Cannot subdivide: the mesh has {bad} non-manifold edges, "
+               "and vtkLinearSubdivisionFilter does not accept that — it "
+               "returns an empty surface. First use “Repair” (meshfix or "
+               "alpha wrap).", bad=bad))
     return _require_cells(
         drop_stray_cells(
             mesh.subdivide(levels, subfilter="linear").triangulate()),
-        "Згустити")
+        "Subdivide")
 
 
 def repair_chain(mesh: pv.PolyData,
@@ -1511,13 +1516,13 @@ def voxel_wrap(mesh: pv.PolyData, voxel: float, closing: int = 0,
     сітки.
     """
     if mesh.n_cells == 0:
-        raise ValueError("Поверхня порожня.")
+        raise ValueError(tr("The surface is empty."))
     smallest, _ = voxel_limits(mesh, limit)
     if voxel < smallest:
         raise ValueError(
-            tr("Воксель {voxel:.6g} завеликий для памʼяті: при ньому сітка "
-            "перевищить {v:.0f} млн вузлів. Найдрібніший "
-            "допустимий — {smallest:.6g}.", voxel=voxel, v=limit / 1e6, smallest=smallest))
+            tr("Voxel {voxel:.6g} needs too much memory: with it the "
+               "grid will exceed {v:.0f} M nodes. The finest allowed is "
+               "{smallest:.6g}.", voxel=voxel, v=limit / 1e6, smallest=smallest))
 
     origin, dims = _voxel_grid(mesh, voxel)
     material = _parity_fill(mesh, origin, dims, voxel)
@@ -1547,9 +1552,9 @@ def voxel_wrap(mesh: pv.PolyData, voxel: float, closing: int = 0,
 
     if not solid.any():
         raise ValueError(
-            "Обгортати нічого: у моделі немає замкненого обʼєму завтовшки "
-            "хоча б у воксель. Так буває з плоскою поверхнею й з моделлю, "
-            "дрібнішою за сам воксель — візьміть дрібніший.")
+            tr("Nothing to wrap: the model has no closed volume at least "
+            "one voxel thick. This happens with a flat surface and with "
+            "a model smaller than the voxel itself — use a smaller one."))
 
     field = _wrap_image(solid, origin, dims, voxel, sigma=sigma)
     surf = field.contour([0.5], scalars=field.point_data.keys()[0],
@@ -1557,8 +1562,8 @@ def voxel_wrap(mesh: pv.PolyData, voxel: float, closing: int = 0,
     surf = drop_stray_cells(surf.triangulate())
     if surf.n_cells == 0:
         raise ValueError(
-            "Після обгортання не лишилося поверхні — воксель більший за саму "
-            "модель. Візьміть дрібніший.")
+            tr("No surface is left after wrapping — the voxel is larger "
+            "than the model itself. Use a smaller one."))
     if smooth > 0:
         # Тейбін, а не лаплас: лаплас стягує тіло до точки, а цей тримає
         # обʼєм, і крило не худне з кожним проходом. Десяти проходів досить,
@@ -1781,16 +1786,12 @@ class TrimReport:
         if self.refused:
             return [self.refused]
         return [
-            tr("зрізано {cut_faces} граней із "
-            "{v} "
-            "({v2:.1f}% площі)", cut_faces=self.cut_faces, v=self.cut_faces + self.kept_faces, v2=self.cut_share * 100),
-            tr("площа {v:.1f} -> {v2:.1f} см²", v=self.area_before * 1e4, v2=self.area_after * 1e4),
-            tr("найтонше місце було {v:.2f} мм "
-            "при порозі {v2:.2f} мм", v=self.thinnest * 1000, v2=self.limit * 1000),
-            tr("латок {patched} граней", patched=self.patched),
-            tr("герметичність: {v}"
-            " -> {v2}", v='була' if self.watertight_before else 'НЕ була', v2='є' if self.watertight_after else 'НЕМАЄ'),
-            tr("решта поверхні зсунулася на {v:.0f} мкм", v=self.moved * 1e6),
+            tr("cut {cut_faces} faces of {v} ({v2:.1f}% of the area)", cut_faces=self.cut_faces, v=self.cut_faces + self.kept_faces, v2=self.cut_share * 100),
+            tr("area {v:.1f} -> {v2:.1f} cm²", v=self.area_before * 1e4, v2=self.area_after * 1e4),
+            tr("the thinnest spot was {v:.2f} mm at a threshold of {v2:.2f} mm", v=self.thinnest * 1000, v2=self.limit * 1000),
+            tr("patched {patched} faces", patched=self.patched),
+            tr("watertight: {v} -> {v2}", v='was' if self.watertight_before else 'was NOT', v2='is' if self.watertight_after else 'is NOT'),
+            tr("the rest of the surface moved by {v:.0f} µm", v=self.moved * 1e6),
         ]
 
 
@@ -1821,7 +1822,7 @@ def bevel_thin(mesh: pv.PolyData, limit: float, width: float = 0.0,
     """
     rep = TrimReport(limit=limit)
     if mesh.n_cells == 0 or limit <= 0:
-        rep.refused = "нема чого різати"
+        rep.refused = tr("nothing to cut")
         return mesh, rep
 
     area = np.asarray(
@@ -1835,8 +1836,8 @@ def bevel_thin(mesh: pv.PolyData, limit: float, width: float = 0.0,
     thin = thickness_below(mesh, limit)
     mask = np.isfinite(thin)
     if not mask.any():
-        rep.refused = (tr("тонших за {v:.2f} мм місць немає — "
-                       "геометрія вже придатна для такої комірки", v=limit * 1000))
+        rep.refused = (tr("there are no spots thinner than {v:.2f} mm — "
+                          "the geometry already fits this cell", v=limit * 1000))
         rep.kept_faces = mesh.n_cells
         rep.area_after = rep.area_before
         rep.watertight_after = rep.watertight_before
@@ -1858,9 +1859,9 @@ def bevel_thin(mesh: pv.PolyData, limit: float, width: float = 0.0,
             mask = near
             if not mask.any():
                 rep.refused = (
-                    tr("смуга завширшки {v:.2f} мм нічого не "
-                    "захопила: тонке тут не межує з товстим, тобто це не "
-                    "кромка. Фаска такому не зарадить.", v=width * 1000))
+                    tr("a band {v:.2f} mm wide caught nothing: the thin "
+                       "areas here do not border thick ones, so this is "
+                       "not an edge. A chamfer will not help here.", v=width * 1000))
                 return mesh, rep
 
     # ЗАПОБІЖНИК — ПЕРЕД ЗГЛАДЖУВАННЯМ, і порядок тут не косметика.
@@ -1873,18 +1874,19 @@ def bevel_thin(mesh: pv.PolyData, limit: float, width: float = 0.0,
     rep.cut_area = float(area[mask].sum())
     if rep.cut_share > max_share:
         rep.refused = (
-            tr("під зріз підпадає {v:.0f}% площі — це не "
-            "кромка, це вся деталь. Різати означало б прибрати її саму: "
-            "тут потрібна дрібніша комірка або інша модель. Спробуйте "
-            "меншу ширину фаски.", v=rep.cut_share * 100))
+            tr("{v:.0f}% of the area falls under the cut — this is not "
+               "an edge, this is the whole part. Cutting would mean "
+               "removing the part itself: this needs a finer cell or a "
+               "different model. Try a smaller chamfer width.", v=rep.cut_share * 100))
         return mesh, rep
 
     # Межу вибору згладжуємо ПЕРЕД різанням: інакше зріз іде по зубцях і
     # лишає сходи замість фаски.
     mask = smooth_mask(mesh, mask, rounds=2)
     if not mask.any():
-        rep.refused = ("після згладжування межі різати нічого не лишилося — "
-                       "тонке тут розсіяне цятками, а не смугою")
+        rep.refused = (tr("after smoothing the boundary, nothing is left to "
+                       "cut — the thin areas here are scattered in "
+                       "spots, not in a band"))
         return mesh, rep
     rep.cut_area = float(area[mask].sum())
 
@@ -2014,7 +2016,7 @@ def leak_advice(d: Diagnosis, surface_cell: float) -> tuple[str, str]:
     if not d.hole_sizes:
         return ("ok", "")
     if surface_cell <= 0:
-        return ("warn", "Невідомий розмір комірки.")
+        return ("warn", tr("Unknown cell size."))
 
     biggest = d.largest_hole
     ratio = biggest / surface_cell
@@ -2022,18 +2024,18 @@ def leak_advice(d: Diagnosis, surface_cell: float) -> tuple[str, str]:
 
     if ratio > 1.0:
         return ("bad", (
-            tr("Протече: найбільша дірка {biggest} — це {ratio:.1f} "
-            "комірки ({n_big} дірок більші за комірку). Закрийте дірки або "
-            "візьміть грубішу комірку на поверхні.", biggest=fmt_len(biggest), ratio=ratio, n_big=n_big)
+            tr("It will leak: the largest hole {biggest} is {ratio:.1f} "
+               "cells ({n_big} holes are larger than a cell). Close the "
+               "holes or use a coarser cell on the surface.", biggest=fmt_len(biggest), ratio=ratio, n_big=n_big)
         ))
     if ratio > 0.5:
         return ("warn", (
-            tr("На межі: найбільша дірка {biggest} ≈ {ratio:.2f} "
-            "комірки. Витримає зараз, але зламається після згущення сітки.", biggest=fmt_len(biggest), ratio=ratio)
+            tr("Borderline: the largest hole {biggest} ≈ {ratio:.2f} "
+               "cells. It holds now, but it will break after the mesh is "
+               "refined.", biggest=fmt_len(biggest), ratio=ratio)
         ))
     return ("ok", (
-        tr("Найбільша дірка {biggest} — {ratio:.2f} комірки, "
-        "snappy її затягне.", biggest=fmt_len(biggest), ratio=ratio)
+        tr("Largest hole {biggest} — {ratio:.2f} cells, snappy will close it.", biggest=fmt_len(biggest), ratio=ratio)
     ))
 
 
@@ -2054,20 +2056,21 @@ def tesselation_advice(d: Diagnosis, surface_cell: float) -> tuple[str, str]:
     ratio = edge / surface_cell
     if ratio > 2.0:
         return ("bad", (
-            tr("Трикутники грубші за комірку ({ratio:.1f}x). Snap сяде на фасетки, "
-            "пограншар не наросте. Згустіть STL або візьміть більшу комірку.", ratio=ratio)
+            tr("Triangles are coarser than the cell ({ratio:.1f}x). Snap "
+               "will sit on the facets, the boundary layer will not "
+               "grow. Refine the STL or use a larger cell.", ratio=ratio)
         ))
     if ratio > 1.0:
         return ("warn", (
-            tr("Коротке ребро ≈ {ratio:.1f} комірки. Гострі місця будуть "
-            "ступінчастими.", ratio=ratio)
+            tr("Short edge ≈ {ratio:.1f} cells. Sharp spots will be stepped.", ratio=ratio)
         ))
     if ratio < 0.05:
         return ("warn", (
-            tr("Тесселяція вдесятеро дрібніша за комірку ({ratio:.3f}). "
-            "Це лише сповільнить пошук — можна проріднити.", ratio=ratio)
+            tr("The tessellation is ten times finer than the cell "
+               "({ratio:.3f}). It will only slow down the search — you "
+               "can decimate it.", ratio=ratio)
         ))
-    return ("ok", tr("Коротке ребро ≈ {ratio:.2f} комірки — добре.", ratio=ratio))
+    return ("ok", tr("Short edge ≈ {ratio:.2f} cells — good.", ratio=ratio))
 
 
 # --------------------------------------------------------------------------
@@ -2135,8 +2138,9 @@ def make_propeller(diameter: float, blades: int = 2, pitch: float = 0.10,
     key = str(hand).strip().lower()
     if key not in ("cw", "ccw"):
         raise ValueError(
-            tr("рука гвинта має бути 'cw' або 'ccw', а не {hand!r}: "
-            "'cw' тягне вперед на додатних обертах, 'ccw' — на відʼємних", hand=hand))
+            tr("the propeller hand must be 'cw' or 'ccw', not {hand!r}: "
+               "'cw' pulls forward at positive rpm, 'ccw' — at negative "
+               "rpm", hand=hand))
     hand_sign = -1.0 if key == "ccw" else 1.0
 
     def chord_at(x: float) -> float:

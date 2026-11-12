@@ -28,6 +28,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 import fs_panels as panels
 from fs_i18n import tr
+import fs_i18n
+
+# The Qt text setters translate and keep the key of each text, also in a
+# widget that is made before the main window (T28).
+fs_i18n.install()
 
 # Поля, що діють на сітку (словники сітки або triSurface).
 #   "*"          — усі поля вкладки;
@@ -202,11 +207,10 @@ class ProjectMesh:
 
     def label(self) -> str:
         if self.active:
-            return (tr("Сітка з проєкту: {v:.2f} млн комірок, "
-                    "зафіксована", v=self.cells / 1e6)).replace(".", ",")
+            return (tr("Mesh from the project: {v:.2f} M cells, locked", v=self.cells / 1e6)).replace(".", ",")
         if self.released:
-            return ("Сітку з проєкту не використовую: налаштування сітки "
-                    "змінено, прогін збудує нову")
+            return (tr("Not using the mesh from the project: the mesh "
+                    "settings changed, the run will build a new mesh"))
         return ""
 
 
@@ -260,8 +264,8 @@ class MeshLock(QtCore.QObject):
             tip = w.toolTip()
             if not tip.startswith("🔒"):     # not locked yet (any language)
                 w.setProperty("mesh_tip", tip)
-                w.setToolTip(tr("🔒 Змінює сітку з проєкту — клік спитає, "
-                                "чи перебудувати її.{v}", v="\n\n" + tip if tip else ""))
+                w.setToolTip(tr("🔒 Changes the mesh from the project — a "
+                                "click asks whether to rebuild it.{v}", v="\n\n" + tip if tip else ""))
             self._dimmed.append(w)
 
     def unlock(self) -> None:

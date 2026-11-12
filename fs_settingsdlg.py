@@ -8,7 +8,7 @@ Sections: Загальне, Машини, 3D, Сітка. Buttons: OK / Скас
 are stored only after OK or «Застосувати»).
 
 User-visible texts go through fs_i18n.tr(); the English texts are in
-i18n/en/fs_settingsdlg.json.
+i18n/uk/fs_settingsdlg.json.
 """
 
 from __future__ import annotations
@@ -23,14 +23,18 @@ import fs_settings as fset
 import fs_i18n
 from fs_i18n import tr
 
+# The Qt text setters translate and keep the key of each text, also in a
+# widget that is made before the main window (T28).
+fs_i18n.install()
+
 
 LANG_TITLES = tuple(fs_i18n.LANGUAGES.items())   # own names: no tr
 VIEW3D_TITLES = (
-    ("auto", "Автоматично (рекомендовано)"),
+    ("auto", "Automatic (recommended)"),
     ("gpu", "GPU (foamview)"),
-    ("soft", "Програмний GPU (WARP, llvmpipe) — повільніше"),
+    ("soft", "Software GPU (WARP, llvmpipe): slower"),
     ("vtk", "VTK (OpenGL)"),
-    ("cpu", "CPU без GPU — повільно"),
+    ("cpu", "CPU without GPU: slow"),
 )
 
 
@@ -40,12 +44,12 @@ class SettingsDialog(QtWidgets.QDialog):
 
     graphics_checked = QtCore.Signal(str)
 
-    SECTIONS = ("Загальне", "Машини", "3D", "Сітка")
+    SECTIONS = ("General", "Machines", "3D", "Mesh")
 
     def __init__(self, parent=None, default_cases: str = "",
                  default_projects: str = "", backends=None, level_text=None):
         super().__init__(parent)
-        self.setWindowTitle(tr("Налаштування"))
+        self.setWindowTitle(tr("Settings"))
         self.setObjectName("SettingsDialog")
         self._default_cases = default_cases
         self._default_projects = default_projects
@@ -75,12 +79,12 @@ class SettingsDialog(QtWidgets.QDialog):
             | QtWidgets.QDialogButtonBox.Apply
             | QtWidgets.QDialogButtonBox.RestoreDefaults)
         bb.button(QtWidgets.QDialogButtonBox.Ok).setText(tr("OK"))
-        bb.button(QtWidgets.QDialogButtonBox.Cancel).setText(tr("Скасувати"))
-        bb.button(QtWidgets.QDialogButtonBox.Apply).setText(tr("Застосувати"))
+        bb.button(QtWidgets.QDialogButtonBox.Cancel).setText(tr("Cancel"))
+        bb.button(QtWidgets.QDialogButtonBox.Apply).setText(tr("Apply"))
         rd = bb.button(QtWidgets.QDialogButtonBox.RestoreDefaults)
-        rd.setText(tr("Скинути до типових"))
-        rd.setToolTip(tr("Заповнити всі поля типовими значеннями. Вони діють "
-                         "лише після «OK» або «Застосувати»"))
+        rd.setText(tr("Restore defaults"))
+        rd.setToolTip(tr("Fill all fields with the default values. They "
+                         "take effect only after «OK» or «Apply»"))
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         bb.button(QtWidgets.QDialogButtonBox.Apply).clicked.connect(self.apply)
@@ -93,7 +97,7 @@ class SettingsDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         lay.addLayout(top, 1)
         self.lbl_where = QtWidgets.QLabel(
-            tr("Файл налаштувань: {path}", path=fset.path()))
+            tr("Settings file: {path}", path=fset.path()))
         self.lbl_where.setStyleSheet("color:#777;")
         self.lbl_where.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.lbl_where.setWordWrap(True)
@@ -117,7 +121,7 @@ class SettingsDialog(QtWidgets.QDialog):
         h = QtWidgets.QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(edit, 1)
-        btn = QtWidgets.QPushButton(tr("Огляд…"))
+        btn = QtWidgets.QPushButton(tr("Browse…"))
 
         def pick():
             start = edit.text().strip() or edit.placeholderText()
@@ -134,56 +138,79 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cmb_lang = QtWidgets.QComboBox()
         for key, title in LANG_TITLES:
             self.cmb_lang.addItem(title, key)
-        f.addRow(tr("Мова інтерфейсу"), self.cmb_lang)
-        f.addRow("", self._hint(tr("Нова мова діє після перезапуску програми.")))
+        f.addRow(tr("Interface language"), self.cmb_lang)
+        f.addRow("", self._hint(tr("The new language takes effect at "
+                                   "once, after «OK» or «Apply».")))
+        env = os.environ.get("FS_LANG", "").strip()
+        self.lbl_lang_env = self._hint(
+            tr("The environment variable FS_LANG={value} has priority over this field.",
+               value=env))
+        self.lbl_lang_env.setStyleSheet("color:#a05a00;")
+        self.lbl_lang_env.setVisible(bool(env))
+        f.addRow("", self.lbl_lang_env)
 
-        self.chk_rookie = QtWidgets.QCheckBox(tr("Режим новачка"))
-        self.chk_rookie.setToolTip(tr("Пояснення до кожного налаштування: що це, "
-                                      "на що впливає і що буде, якщо перегнути. "
-                                      "Те саме, що «Довідка → Режим новачка» (F2)"))
+        self.chk_rookie = QtWidgets.QCheckBox(tr("Beginner mode"))
+        self.chk_rookie.setToolTip(tr("An explanation for each setting: "
+                                      "what it is, what it changes and "
+                                      "what occurs if you go too far. "
+                                      "The same as «Help → Beginner "
+                                      "mode» (F2)"))
         f.addRow(self.chk_rookie)
-        self.chk_session = QtWidgets.QCheckBox(tr("Відновлювати останню сесію"))
-        self.chk_session.setToolTip(tr("Після запуску повертати налаштування, "
-                                       "геометрію і кейс, з якими закрили програму"))
+        self.chk_session = QtWidgets.QCheckBox(tr("Restore the last session"))
+        self.chk_session.setToolTip(tr("At start, restore the settings, "
+                                       "the geometry and the case that "
+                                       "were open when you closed the "
+                                       "program"))
         f.addRow(self.chk_session)
 
         self.ed_cases = QtWidgets.QLineEdit()
         self.ed_cases.setPlaceholderText(self._default_cases)
-        f.addRow(tr("Тека кейсів"), self._dir_row(self.ed_cases, tr("Тека кейсів")))
-        f.addRow("", self._hint(tr("Тут OpenFOAM створює кейси. Те саме поле "
-                                   "«Каталог» є на вкладці «Запуск». Порожнє "
-                                   "поле — тека cases біля програми.")))
+        f.addRow(tr("Cases folder"), self._dir_row(self.ed_cases, tr("Cases folder")))
+        f.addRow("", self._hint(tr("OpenFOAM makes the cases in this "
+                                   "folder. The same field «Folder» is "
+                                   "on the «Run» tab. An empty field: "
+                                   "the folder cases next to the program.")))
         self.ed_projects = QtWidgets.QLineEdit()
         self.ed_projects.setPlaceholderText(self._default_projects)
-        f.addRow(tr("Тека проєктів"),
-                 self._dir_row(self.ed_projects, tr("Тека проєктів")))
-        f.addRow("", self._hint(tr("Куди проєкти лягають за замовчуванням: сюди "
-                                   "пише автозбереження перед прогоном.")))
+        f.addRow(tr("Projects folder"),
+                 self._dir_row(self.ed_projects, tr("Projects folder")))
+        f.addRow("", self._hint(tr("The default folder for projects. The "
+                                   "automatic save before a run writes "
+                                   "here.")))
         return w
 
     def _page_machines(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         f = QtWidgets.QFormLayout(w)
         self.ed_ssh = QtWidgets.QLineEdit()
-        self.ed_ssh.setPlaceholderText(tr("користувач@сервер (порожньо — без сервера)"))
-        f.addRow(tr("Сервер (SSH)"), self.ed_ssh)
-        self.chk_check = QtWidgets.QCheckBox(tr("Перевіряти машини під час запуску"))
+        self.ed_ssh.setPlaceholderText(tr("user@server (empty: no server)"))
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.ed_ssh, 1)
+        self.btn_wizard = QtWidgets.QPushButton(tr("Set up a server…"))
+        self.btn_wizard.setToolTip(tr("The wizard: Tailscale, SSH key, "
+                                      "login test, OpenFOAM check"))
+        self.btn_wizard.clicked.connect(self.server_wizard)
+        row.addWidget(self.btn_wizard)
+        f.addRow(tr("Server (SSH)"), row)
+        self.chk_check = QtWidgets.QCheckBox(tr("Find the machines at start"))
         f.addRow(self.chk_check)
-        f.addRow("", self._hint(tr("Вимкнено — програма не шукає OpenFOAM (WSL, "
-                                   "blueCFD, Docker, сервер) на старті, і вікно "
-                                   "відкривається швидше. Тоді натисніть "
-                                   "«Пошук» на вкладці «Запуск».")))
+        f.addRow("", self._hint(tr("When off, the program does not look "
+                                   "for OpenFOAM (WSL, blueCFD, Docker, "
+                                   "server) at start, and the window "
+                                   "opens faster. Then click «Search» on "
+                                   "the «Run» tab.")))
 
-        box = QtWidgets.QGroupBox(tr("Розподіл між машинами (експериментально)"))
+        box = QtWidgets.QGroupBox(tr("Distribute between machines (experimental)"))
         g = QtWidgets.QFormLayout(box)
         self.ed_dist_user = QtWidgets.QLineEdit()
-        g.addRow(tr("Користувач"), self.ed_dist_user)
+        g.addRow(tr("User"), self.ed_dist_user)
         self.ed_dist_key = QtWidgets.QLineEdit()
-        g.addRow(tr("Ключ SSH"), self.ed_dist_key)
+        g.addRow(tr("SSH key"), self.ed_dist_key)
         self.ed_dist_net = QtWidgets.QLineEdit()
-        g.addRow(tr("Мережа"), self.ed_dist_net)
-        g.addRow("", self._hint(tr("Список машин і «Розподілити» — на вкладці "
-                                   "«Запуск».")))
+        g.addRow(tr("Network"), self.ed_dist_net)
+        g.addRow("", self._hint(tr("The list of machines and "
+                                   "«Distribute» are on the «Run» tab.")))
         f.addRow(box)
 
         self.lst_found = QtWidgets.QListWidget()
@@ -195,9 +222,9 @@ class SettingsDialog(QtWidgets.QDialog):
                 rows = list(self._backends())
             except Exception:                              # noqa: BLE001
                 rows = []
-        for row in rows or [tr("Ще нічого не знайдено.")]:
+        for row in rows or [tr("Nothing found yet.")]:
             self.lst_found.addItem(row)
-        f.addRow(tr("Знайдені машини"), self.lst_found)
+        f.addRow(tr("Found machines"), self.lst_found)
         return w
 
     def _page_3d(self) -> QtWidgets.QWidget:
@@ -209,13 +236,14 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cmb_3d.setMinimumContentsLength(18)
         for key, title in VIEW3D_TITLES:
             self.cmb_3d.addItem(tr(title), key)
-        f.addRow(tr("Хто малює «3D»"), self.cmb_3d)
-        f.addRow("", self._hint(tr("Діє після перезапуску програми. "
-                                   "«Автоматично» перебирає: GPU → програмний "
-                                   "GPU → VTK → CPU, і бере перший, що малює.")))
+        f.addRow(tr("Renderer of «3D»"), self.cmb_3d)
+        f.addRow("", self._hint(tr("Takes effect after you restart the "
+                                   "program. «Automatic» tries GPU → "
+                                   "software GPU → VTK → CPU and uses "
+                                   "the first one that draws.")))
         env = os.environ.get("FS_3D", "").strip()
         self.lbl_env = self._hint(
-            tr("Змінна оточення FS_3D={value} має перевагу над цим полем.",
+            tr("The environment variable FS_3D={value} has priority over this field.",
                value=env))
         self.lbl_env.setStyleSheet("color:#a05a00;")
         self.lbl_env.setVisible(bool(env))
@@ -230,11 +258,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self.lbl_level = QtWidgets.QLabel(now or "—")
         self.lbl_level.setWordWrap(True)
         self.lbl_level.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        f.addRow(tr("Зараз малює"), self.lbl_level)
-        self.btn_check = QtWidgets.QPushButton(tr("Перевірити графіку"))
-        self.btn_check.setToolTip(tr("Знову перепробувати всі адаптери (~1 с на "
-                                     "кожен) і запамʼятати, хто малює. Відкриті "
-                                     "вікна 3D не змінюються до перезапуску"))
+        f.addRow(tr("Draws now"), self.lbl_level)
+        self.btn_check = QtWidgets.QPushButton(tr("Check the graphics"))
+        self.btn_check.setToolTip(tr("Try all adapters again (~1 s each) "
+                                     "and remember which one draws. Open "
+                                     "3D views do not change until a "
+                                     "restart"))
         self.btn_check.clicked.connect(self.check_graphics)
         self.lbl_check = QtWidgets.QLabel("")
         self.lbl_check.setWordWrap(True)
@@ -246,18 +275,20 @@ class SettingsDialog(QtWidgets.QDialog):
         w = QtWidgets.QWidget()
         f = QtWidgets.QFormLayout(w)
         self.chk_fetch = QtWidgets.QCheckBox(
-            tr("Після прогону забирати сітку з сервера на цей компʼютер"))
+            tr("After a run, copy the mesh from the server to this computer"))
         f.addRow(self.chk_fetch)
-        f.addRow("", self._hint(tr("Сітка — сотні МБ; на повільному каналі це "
-                                   "хвилини. Вимкнено — сітку забирає лише "
-                                   "«Зберегти проєкт із сіткою…».")))
+        f.addRow("", self._hint(tr("A mesh is hundreds of MB; on a slow "
+                                   "connection this takes minutes. When "
+                                   "off, only «Save project with mesh…» "
+                                   "copies the mesh.")))
         self.spn_keep = QtWidgets.QSpinBox()
         lo, hi = fset.LIMITS["mesh_keep"]
         self.spn_keep.setRange(lo, hi)
         self.spn_keep.setMaximumWidth(90)
-        f.addRow(tr("Скільки сіток тримати на сервері"), self.spn_keep)
-        f.addRow("", self._hint(tr("Після кожного прогону сервер лишає стільки "
-                                   "останніх сіток, старші видаляє.")))
+        f.addRow(tr("Meshes to keep on the server"), self.spn_keep)
+        f.addRow("", self._hint(tr("After each run, the server keeps "
+                                   "this number of the latest meshes and "
+                                   "deletes the older ones.")))
         return w
 
     # --- values ------------------------------------------------------------
@@ -310,6 +341,13 @@ class SettingsDialog(QtWidgets.QDialog):
         self.apply()
         super().accept()
 
+    def server_wizard(self) -> None:
+        """«Set up a server…»: the wizard puts the new name in the field."""
+        import fs_serverwiz
+        alias = fs_serverwiz.run_wizard(self)
+        if alias:
+            self.ed_ssh.setText(alias)
+
     # --- «Перевірити графіку» ----------------------------------------------
 
     def check_graphics(self) -> None:
@@ -317,13 +355,13 @@ class SettingsDialog(QtWidgets.QDialog):
             return
         self._checking = True
         self.btn_check.setEnabled(False)
-        self.lbl_check.setText(tr("Перевіряю… (до пів хвилини на адаптер)"))
+        self.lbl_check.setText(tr("Checking… (up to half a minute for each adapter)"))
 
         def job():
             try:
                 import fs_view3d
                 lv = fs_view3d.check_graphics()
-                text = lv.text() + (f"\n{lv.note}" if lv.note else "")
+                text = lv.text() + (f"\n{lv.note_text()}" if lv.note else "")
             except Exception as exc:                       # noqa: BLE001
                 text = f"{type(exc).__name__}: {exc}"
             try:
@@ -335,7 +373,7 @@ class SettingsDialog(QtWidgets.QDialog):
     def _graphics_done(self, text: str) -> None:
         self._checking = False
         self.btn_check.setEnabled(True)
-        self.lbl_check.setText(tr("Автоматичний вибір: {result}", result=text))
+        self.lbl_check.setText(tr("Automatic choice: {result}", result=text))
 
 
 def default_projects_dir(cases: Path) -> str:

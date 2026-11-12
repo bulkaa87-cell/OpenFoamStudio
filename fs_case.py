@@ -202,14 +202,14 @@ class BodyPatch:
 
 # Ролі частин тіла: ключ, підпис у вікні, коротке пояснення.
 PART_ROLES = (
-    ("body", "тіло", "нерухома частина: фюзеляж, крило, пілон"),
-    ("rotor", "гвинт", "навколо неї стане обертова зона (MRF)"),
-    ("motion", "рухома частина", "саме вона коливається, решта стоїть"),
-    ("intake", "повітрозабірник",
-     "кришка отвору: тут двигун забирає повітря з потоку"),
-    ("nozzle", "сопло", "кришка зрізу сопла: звідси виходить струмінь"),
-    ("disk", "гвинт-диск",
-     "гвинт без лопатей: тяга й закрутка задаються числами"),
+    ("body", "body", "fixed part: fuselage, wing, pylon"),
+    ("rotor", "propeller", "a rotating zone (MRF) will be placed around it"),
+    ("motion", "moving part", "only this part oscillates, the rest stays still"),
+    ("intake", "intake",
+     "cap of an opening: here the engine takes air from the flow"),
+    ("nozzle", "nozzle", "cap of the nozzle exit: the jet comes out from here"),
+    ("disk", "actuator disk",
+     "a propeller without blades: thrust and swirl are set by numbers"),
 )
 ROLE_KEYS = tuple(k for k, _, _ in PART_ROLES)
 
@@ -220,8 +220,8 @@ DISK_ROLE = "disk"
 
 # Профілі тяги по радіусу гвинта-диска.
 DISK_PROFILES = (
-    ("realistic", "реалістичний", "нуль на коку й на кінці, максимум ближче до кінця"),
-    ("uniform", "рівномірний", "та сама тяга на кожен квадратний сантиметр"),
+    ("realistic", "realistic", "zero at the spinner and at the tip, maximum closer to the tip"),
+    ("uniform", "uniform", "the same thrust on each square centimeter"),
 )
 DISK_PROFILE_KEYS = tuple(k for k, _, _ in DISK_PROFILES)
 # Скільки комірок має лягати на діаметр диска, щоб тяга лягла диском, а
@@ -291,15 +291,15 @@ PORT_ROLES = ("intake", "nozzle")
 # Види двигунів. Різниця лише в струмені: EDF дає холодний, турбіна —
 # гарячий, і гарячий легший, тож за тієї самої тяги він виходить швидше.
 ENGINE_KINDS = (
-    ("edf", "імпелер (EDF)", "холодний струмінь"),
-    ("turbojet", "турбореактивний", "гарячий струмінь"),
+    ("edf", "impeller (EDF)", "cold jet"),
+    ("turbojet", "turbojet", "hot jet"),
 )
 ENGINE_KIND_KEYS = tuple(k for k, _, _ in ENGINE_KINDS)
 
 # Що означає введена тяга двигуна (Q31).
 THRUST_MODES = (
-    ("static", "максимальна статична", "з паспорта: стенд, повний газ"),
-    ("flight", "у польоті", "на цій швидкості, повний газ"),
+    ("static", "maximum static", "from the spec sheet: test stand, full throttle"),
+    ("flight", "in flight", "at this speed, full throttle"),
 )
 THRUST_MODE_KEYS = tuple(k for k, _, _ in THRUST_MODES)
 
@@ -536,12 +536,12 @@ def engine_point(e: Engine, flow: "FlowCfg") -> EnginePoint:
 #
 # (ключ, підпис, мінімум, максимум, типове значення, що зазвичай чіпляють)
 RC_CHANNELS = (
-    ("roll", "крен", -1.0, 1.0, 0.0, "елерони"),
-    ("pitch", "тангаж", -1.0, 1.0, 0.0, "руль висоти"),
-    ("yaw", "курс", -1.0, 1.0, 0.0, "руль напрямку"),
-    ("throttle", "газ", 0.0, 1.0, 1.0, "оберти гвинтів"),
-    ("flaps", "закрилки", 0.0, 1.0, 0.0, "механізація"),
-    ("aux", "дод. канал", -1.0, 1.0, 0.0, "що завгодно"),
+    ("roll", "roll", -1.0, 1.0, 0.0, "ailerons"),
+    ("pitch", "pitch", -1.0, 1.0, 0.0, "elevator"),
+    ("yaw", "yaw", -1.0, 1.0, 0.0, "rudder"),
+    ("throttle", "throttle", 0.0, 1.0, 1.0, "propeller rpm"),
+    ("flaps", "flaps", 0.0, 1.0, 0.0, "high-lift devices"),
+    ("aux", "aux channel", -1.0, 1.0, 0.0, "anything"),
 )
 CHANNEL_KEYS = tuple(k for k, *_ in RC_CHANNELS)
 CHANNEL_RANGE = {k: (lo, hi, mid) for k, _, lo, hi, mid, _ in RC_CHANNELS}
@@ -610,25 +610,26 @@ def guard_hinges(items) -> list[tuple[str, str]]:
     for name, h in live:
         if h.channel not in CHANNEL_KEYS:
             out.append(("bad", (
-                tr("«{name}»: каналу «{channel}» немає. Є: "
-                "{CHANNEL_KEYS}.", name=name, channel=h.channel, CHANNEL_KEYS=', '.join(CHANNEL_KEYS)))))
+                tr("“{name}”: there is no channel “{channel}”. "
+                   "Available: {CHANNEL_KEYS}.", name=name, channel=h.channel, CHANNEL_KEYS=', '.join(CHANNEL_KEYS)))))
         if h.axis_length() < 1e-9:
             out.append(("bad", (
-                tr("«{name}»: вісь завіси нульової довжини — повороту не "
-                "буде взагалі, а помилки не буде теж.", name=name))))
+                tr("“{name}”: the hinge axis has zero length — there "
+                   "will be no rotation at all, and no error either.", name=name))))
         if abs(float(h.limit)) < 1e-9:
             out.append(("bad", (
-                tr("«{name}»: межа відхилення нульова, поверхня стоятиме "
-                "нерухомо, хоч канал і призначено.", name=name))))
+                tr("“{name}”: the deflection limit is zero, the surface "
+                   "will stay still, even though a channel is assigned.", name=name))))
         elif abs(float(h.trim)) > abs(float(h.limit)) + 1e-9:
             out.append(("warn", (
-                tr("«{name}»: триму {trim:g}° більше за межу "
-                "{limit:g}° — поверхня впирається в обмежувач уже на "
-                "нейтралі й далі не зрушить.", name=name, trim=h.trim, limit=h.limit))))
+                tr("“{name}”: trim {trim:g}° is greater than the limit "
+                   "{limit:g}° — the surface hits the stop already at "
+                   "neutral and will not move further.", name=name, trim=h.trim, limit=h.limit))))
         if abs(float(h.gain)) < 1e-9:
             out.append(("warn", (
-                tr("«{name}»: хід каналу нульовий — стік рухатиметься, а "
-                "поверхня ні. Якщо так і задумано, приберіть канал.", name=name))))
+                tr("“{name}”: the channel travel is zero — the stick "
+                   "will move, but the surface will not. If this is "
+                   "intended, remove the channel.", name=name))))
 
     # ДВІ ПОВЕРХНІ НА ОДНОМУ КАНАЛІ мають ходити НАЗУСТРІЧ, інакше це не
     # елерони, а закрилки. Найтихіша вада в усьому наборі: модель
@@ -644,9 +645,10 @@ def guard_hinges(items) -> list[tuple[str, str]]:
         if len(signs) == 1:
             names = ", ".join(n for n, _ in group)
             out.append(("warn", (
-                tr("На каналі «{ch}» кілька поверхонь ({names}) ходять В ОДИН "
-                "БІК. Для елеронів потрібен реверс на одній з них — "
-                "інакше вони працюють як закрилки й моменту не дають.", ch=ch, names=names))))
+                tr("On channel “{ch}”, several surfaces ({names}) move "
+                   "IN THE SAME DIRECTION. Ailerons need reverse on one "
+                   "of them — otherwise they work as flaps and give no "
+                   "moment.", ch=ch, names=names))))
     return out
 
 
@@ -684,7 +686,7 @@ def collapse_zone_notes(notes: list[tuple[str, str]],
     for key in order:
         lvl, text, hit = bag[key]
         if len(hit) > 1:
-            text += tr("  Те саме в зонах: {join}.", join=', '.join(hit[1:]))
+            text += tr("  The same in the zones: {join}.", join=', '.join(hit[1:]))
         out.append((lvl, text))
     return out
 
@@ -1931,18 +1933,19 @@ class CaseCfg:
             return out
         if self.solver.steady:
             out.append(("bad", (
-                "Рухома сітка рахується лише за часом: тіло рухається, і "
-                "усталеного стану в цій задачі немає за визначенням. Зніміть "
-                "галочку «Стаціонарна» на вкладці «Розвʼязувач».")))
+                tr("A moving mesh runs only in time: the body moves, and by "
+                "definition this problem has no steady state. Clear the "
+                "“Steady” check box on the “Solver” tab."))))
         if m.frequency_hz <= 0:
-            out.append(("bad", "Частота коливань має бути більшою за нуль."))
+            out.append(("bad", tr("The oscillation frequency must be greater than zero.")))
         if abs(m.amplitude_deg) > 45:
             out.append(("bad", (
-                tr("Амплітуда {amplitude_deg:g}° завелика. На такому куті "
-                "вузли біля тіла перекидаються один через одного, і сітка "
-                "стає недійсною ще до того, як щось порахується.", amplitude_deg=m.amplitude_deg))))
+                tr("Amplitude {amplitude_deg:g}° is too large. At such "
+                   "an angle the nodes near the body fold over each "
+                   "other, and the mesh becomes invalid before anything "
+                   "is calculated.", amplitude_deg=m.amplitude_deg))))
         if all(abs(v) < 1e-12 for v in m.axis):
-            out.append(("bad", "Вісь повороту нульова."))
+            out.append(("bad", tr("The rotation axis is zero.")))
         # НАЙВАЖЛИВІШЕ ТУТ. Стінка за один крок не має пройти більше, ніж
         # товщина комірки біля неї. Інакше вузли перекидаються через сусідні,
         # комірка вивертається — і розрахунок гине не поступово, а миттєво.
@@ -1974,20 +1977,22 @@ class CaseCfg:
             # турбулентності отримує вироджений обʼєм.
             if near > 0 and travel > near * 0.25:
                 out.append(("bad", (
-                    tr("За один крок стінка проходить {travel} при "
-                    "комірці біля неї {near} — це "
-                    "{v:.0f}% її товщини. Комірка "
-                    "вивернеться, і розрахунок загине на першому ж кроці, не "
-                    "поступово, а миттєво: у перевірці при 84% k вилетіло до "
-                    "1e+73 за один крок. Зменште крок за часом, частоту або "
-                    "амплітуду; або зніміть призматичні шари, якщо тертя тут "
-                    "не вирішує — без них комірка біля стінки втричі товща.", travel=phys.fmt_len(travel), near=phys.fmt_len(near), v=travel / near * 100))))
+                    tr("In one step the wall moves {travel} with the "
+                       "cell next to it {near} — that is {v:.0f}% of its "
+                       "thickness. The cell will turn inside out, and "
+                       "the run will die on the very first step, not "
+                       "gradually but instantly: in a test at 84% k blew "
+                       "up to 1e+73 in one step. Reduce the time step, "
+                       "frequency or amplitude; or remove the prism "
+                       "layers if friction does not matter here — "
+                       "without them the cell at the wall is three times "
+                       "thicker.", travel=phys.fmt_len(travel), near=phys.fmt_len(near), v=travel / near * 100))))
             elif near > 0 and travel > near * 0.1:
                 out.append(("warn", (
-                    tr("За крок стінка проходить {travel} при "
-                    "комірці {near} — {v:.0f}% "
-                    "її товщини. Порахується, але якість комірок біля стінки "
-                    "просяде, а з нею й тертя.", travel=phys.fmt_len(travel), near=phys.fmt_len(near), v=travel / near * 100))))
+                    tr("In one step the wall moves {travel} with a cell "
+                       "of {near} — {v:.0f}% of its thickness. It will "
+                       "run, but the cell quality at the wall will drop, "
+                       "and the friction with it.", travel=phys.fmt_len(travel), near=phys.fmt_len(near), v=travel / near * 100))))
         # Найтихіше з усього: крок за часом, надто великий для коливання.
         # Прогін піде, нічого не впаде, а коливання просто не буде видно —
         # солвер перестрибне через нього.
@@ -1995,18 +2000,20 @@ class CaseCfg:
             per_period = m.period / self.solver.time_step
             if per_period < 100:
                 out.append(("warn", (
-                    tr("На один період коливання припадає {per_period:.0f} "
-                    "кроків за часом. Це мало: форма коливання зімнеться, а "
-                    "амплітуда сили вийде заниженою. Треба хоча б сотню, "
-                    "краще кілька сотень. Зменште крок або частоту.", per_period=per_period))))
+                    tr("One oscillation period gets {per_period:.0f} "
+                       "time steps. That is too few: the oscillation "
+                       "shape will be distorted, and the force amplitude "
+                       "will come out too low. You need at least a "
+                       "hundred, better several hundred. Reduce the step "
+                       "or the frequency.", per_period=per_period))))
         if not self.solver.steady and m.period > 0 and self.solver.end_time > 0:
             periods = self.solver.end_time / m.period
             if periods < 3:
                 out.append(("warn", (
-                    tr("Прогін накриває {periods:.1f} періоду коливання. "
-                    "Перший період завжди йде на перехідний процес від "
-                    "нерухомого старту, тому з нього нічого взяти не можна. "
-                    "Беріть хоча б три-чотири.", periods=periods))))
+                    tr("The run covers {periods:.1f} oscillation "
+                       "periods. The first period always goes to the "
+                       "transient from the standing start, so you can "
+                       "take nothing from it. Use at least three or four.", periods=periods))))
         return out
 
     def guard_regime(self) -> list[tuple[str, str]]:
@@ -2020,25 +2027,29 @@ class CaseCfg:
             return out
         if self.solver.steady:
             out.append(("bad", (
-                "Надзвуковий режим рахується лише за часом. Схема явна, крок "
-                "обмежений числом Куранта, і «усталений стан» тут набирається "
-                "інтегруванням, а не ітераціями. Зніміть галочку "
-                "«Стаціонарна» на вкладці «Розвʼязувач».")))
+                tr("Supersonic mode runs only in time. The scheme is "
+                "explicit, the time step is limited by the Courant "
+                "number, and the “steady state” here builds up through "
+                "time integration, not through iterations. Clear the "
+                "“Steady” check box on the “Solver” tab."))))
         if self.solver.max_courant > MAX_COURANT_CENTRAL:
             out.append(("bad", (
-                tr("Число Куранта {max_courant:g} для явної схеми "
-                "завелике. PIMPLE тримає й пʼять, бо за крок робить кілька "
-                "зовнішніх ітерацій; rhoCentralFoam так не вміє — нове "
-                "значення рахується з того, що вже є, і Курант більший за "
-                "одиницю означає, що збурення за крок перестрибує комірку. "
-                "Поставте {MAX_COURANT_CENTRAL:g} або менше.", max_courant=self.solver.max_courant, MAX_COURANT_CENTRAL=MAX_COURANT_CENTRAL))))
+                tr("Courant number {max_courant:g} is too large for an "
+                   "explicit scheme. PIMPLE can hold even five, because "
+                   "it does several outer iterations per step; "
+                   "rhoCentralFoam cannot do this — the new value is "
+                   "calculated from what is already there, and a Courant "
+                   "number larger than one means that a disturbance "
+                   "jumps over a cell in one step. Set "
+                   "{MAX_COURANT_CENTRAL:g} or less.", max_courant=self.solver.max_courant, MAX_COURANT_CENTRAL=MAX_COURANT_CENTRAL))))
         m = self.flow.mach
         if 0 < m < 0.8:
             out.append(("warn", (
-                tr("Число Маха {m:.2f} — це ще не надзвук. rhoCentralFoam тут "
-                "працюватиме, але крок за часом у нього на порядки менший "
-                "за PIMPLE, тобто те саме ви порахуєте набагато довше. До "
-                "M = 0.8 краще звичайний стисливий режим.", m=m))))
+                tr("Mach number {m:.2f} is not supersonic yet. "
+                   "rhoCentralFoam will work here, but its time step is "
+                   "orders of magnitude smaller than with PIMPLE, so the "
+                   "same calculation will take much longer. Up to M = "
+                   "0.8 the normal compressible mode is better.", m=m))))
         # Часу має вистачити, щоб потік ЗАПОВНИВ домен. На надзвуку
         # початкове поле нерухоме (див. field_U): інакше база за тілом
         # спорожняється за мікросекунди й розрахунок гине. Платою за це є
@@ -2050,24 +2061,26 @@ class CaseCfg:
             fill = length / u
             if self.solver.end_time < fill * 1.5:
                 out.append(("warn", (
-                    tr("Кінцевий час {end_time:.3g} с замалий: щоб "
-                    "потік пройшов домен ({length:.2f} м) при {u:.0f} м/с, "
-                    "треба {fill:.3g} с, а на усталення — щонайменше "
-                    "півтора цього. Надзвуковий прогін починається з "
-                    "НЕРУХОМОГО поля, тож спершу домен заповнюється, і все, "
-                    "що ви зміряєте раніше, — це пускова хвиля, а не "
-                    "відповідь.", end_time=self.solver.end_time, length=length, u=u, fill=fill))))
+                    tr("The end time {end_time:.3g} s is too small: for "
+                       "the flow to cross the domain ({length:.2f} m) at "
+                       "{u:.0f} m/s, it takes {fill:.3g} s, and settling "
+                       "needs at least one and a half times that. A "
+                       "supersonic run starts from a STILL field, so the "
+                       "domain fills first, and everything you measure "
+                       "before that is the startup wave, not the answer.", end_time=self.solver.end_time, length=length, u=u, fill=fill))))
         if self.flow.farfield_mode != "supersonic":
             out.append(("warn", (
-                tr("Умови на межах тут ставить сам режим, а не вибір "
-                "«{farfield_mode}»: на вході фіксується все, з "
-                "боків нульовий градієнт, а на виході тиск тримає межа, що "
-                "НЕ ВІДБИВАЄ. Вільний потік на стрибку ущільнення видає "
-                "стан, якого не буває, і прогін гине з арифметичною "
-                "помилкою; а просто нульовий градієнт на тиску годиться "
-                "лише поки витікання надзвукове — за тупим тілом слід "
-                "дозвуковий, і тоді рівень тиску нічим не закріплений і "
-                "повзе вгору, аж поки опір не стане відʼємним.", farfield_mode=self.flow.farfield_mode))))
+                tr("Here the boundary conditions are set by the mode "
+                   "itself, not by the choice “{farfield_mode}”: at the "
+                   "inlet everything is fixed, on the sides a zero "
+                   "gradient, and at the outlet the pressure is held by "
+                   "a NON-REFLECTING boundary. A freestream condition at "
+                   "a shock gives a state that cannot exist, and the run "
+                   "dies with an arithmetic error; and a plain zero "
+                   "gradient on pressure is good only while the outflow "
+                   "is supersonic — behind a blunt body the wake is "
+                   "subsonic, and then nothing fixes the pressure level "
+                   "and it creeps up until the drag becomes negative.", farfield_mode=self.flow.farfield_mode))))
         return out
 
     def guard_unsteady(self) -> list[tuple[str, str]]:
@@ -2084,20 +2097,20 @@ class CaseCfg:
         out: list[tuple[str, str]] = []
 
         if s.end_time <= 0 or s.time_step <= 0:
-            out.append(("bad", "Час і крок мають бути додатні."))
+            out.append(("bad", tr("Time and time step must be positive.")))
             return out
 
         steps = s.n_time_steps
         if steps > MAX_TIME_STEPS:
             out.append(("bad",
-                        tr("Виходить {steps} кроків за часом "
-                        "({end_time:g} с кроком {time_step:g} с) — "
-                        "більше за межу {MAX_TIME_STEPS}. Це тижні "
-                        "рахунку. Збільшіть крок або скоротіть час.", steps=fmt_count(steps), end_time=s.end_time, time_step=s.time_step, MAX_TIME_STEPS=fmt_count(MAX_TIME_STEPS))))
+                        tr("This gives {steps} time steps ({end_time:g} "
+                           "s with a step of {time_step:g} s) — more "
+                           "than the limit {MAX_TIME_STEPS}. That is "
+                           "weeks of computing. Increase the step or "
+                           "shorten the time.", steps=fmt_count(steps), end_time=s.end_time, time_step=s.time_step, MAX_TIME_STEPS=fmt_count(MAX_TIME_STEPS))))
         elif steps > MAX_TIME_STEPS / 10:
             out.append(("warn",
-                        tr("{steps} кроків за часом — прогін буде дуже "
-                        "довгий.", steps=fmt_count(steps))))
+                        tr("{steps} time steps — the run will be very long.", steps=fmt_count(steps))))
 
         # СТИСЛИВИЙ НЕСТАЦІОНАРНИЙ: стеля Куранта — 2, а не довідкові 3–10.
         # Виміряно 2026-09-22 на filled_holes1 (rhoPimpleFoam, 1.4 млн
@@ -2108,49 +2121,51 @@ class CaseCfg:
         if (self.flow.compressible and not self.flow.supersonic
                 and s.max_courant > COMPRESSIBLE_MAX_CO):
             out.append(("warn", (
-                tr("maxCo {max_courant:g} для стисливого нестаціонарного "
-                "забагато: на наших вимірах такий кейс рахує чисто на 2 і "
-                "гине на ~4 — спершу обрізання температури в усе більшій "
-                "частині сітки, тоді арифметична помилка. Поставте ≤ "
-                "{COMPRESSIBLE_MAX_CO:g}.", max_courant=s.max_courant, COMPRESSIBLE_MAX_CO=COMPRESSIBLE_MAX_CO))))
+                tr("maxCo {max_courant:g} is too much for compressible "
+                   "transient: in our measurements such a case runs "
+                   "cleanly at 2 and dies at ~4 — first temperature "
+                   "clipping in a growing part of the mesh, then an "
+                   "arithmetic error. Set ≤ {COMPRESSIBLE_MAX_CO:g}.", max_courant=s.max_courant, COMPRESSIBLE_MAX_CO=COMPRESSIBLE_MAX_CO))))
 
         dirs = s.n_write_dirs
         if dirs > MAX_WRITE_DIRS:
             out.append(("bad",
-                        tr("Часових зрізів вийде {dirs} — більше за межу "
-                        "{MAX_WRITE_DIRS}. Кожен зріз це тека з усіма "
-                        "полями; стільки їх забʼє диск. Збільшіть інтервал "
-                        "запису.", dirs=fmt_count(dirs), MAX_WRITE_DIRS=fmt_count(MAX_WRITE_DIRS))))
+                        tr("There will be {dirs} time directories — more "
+                           "than the limit {MAX_WRITE_DIRS}. Each time "
+                           "directory is a folder with all the fields; "
+                           "this many will fill the disk. Increase the "
+                           "write interval.", dirs=fmt_count(dirs), MAX_WRITE_DIRS=fmt_count(MAX_WRITE_DIRS))))
         elif dirs < 2:
             out.append(("warn",
-                        "За весь прогін буде менше двох часових зрізів — "
-                        "дивитися на результат не буде чого. Зменшіть "
-                        "інтервал запису."))
+                        tr("The whole run will have fewer than two time "
+                        "directories — there will be nothing to look at "
+                        "in the result. Decrease the write interval.")))
 
         if s.max_courant > MAX_COURANT:
             out.append(("bad",
-                        tr("Куранта {max_courant:g} — забагато. Вище "
-                        "{MAX_COURANT:g} PIMPLE зриває розрахунок. Типове "
-                        "значення 3-10.", max_courant=s.max_courant, MAX_COURANT=MAX_COURANT)))
+                        tr("Courant {max_courant:g} is too much. Above "
+                           "{MAX_COURANT:g}, PIMPLE makes the "
+                           "calculation diverge. The typical value is "
+                           "3-10.", max_courant=s.max_courant, MAX_COURANT=MAX_COURANT)))
         elif s.max_courant > 1.0 and s.n_outer_correctors < 2:
             out.append(("warn",
-                        tr("Куранта {max_courant:g} при одному зовнішньому "
-                        "проході — це PISO, а він вимагає Куранта менше "
-                        "одиниці. Або зменшіть Куранта, або поставте 2-3 "
-                        "проходи.", max_courant=s.max_courant)))
+                        tr("Courant {max_courant:g} with one outer pass "
+                           "is PISO, and PISO needs Courant below one. "
+                           "Either reduce Courant or set 2-3 passes.", max_courant=s.max_courant)))
 
         flight = self.flow_through_time
         if flight > 0 and s.end_time < flight:
             out.append(("bad",
-                        tr("Кінцевий час {end_time:g} с менший за один "
-                        "проліт домену ({flight:.4g} с): потік не встигне "
-                        "навіть дійти від входу до виходу. Беріть "
-                        "щонайменше {v:.3g} с.", end_time=s.end_time, flight=flight, v=flight * 3)))
+                        tr("End time {end_time:g} s is less than one "
+                           "domain flow-through ({flight:.4g} s): the "
+                           "flow will not even get from the inlet to the "
+                           "outlet. Use at least {v:.3g} s.", end_time=s.end_time, flight=flight, v=flight * 3)))
         elif flight > 0 and s.end_time < flight * 3:
             out.append(("warn",
-                        tr("Кінцевий час {end_time:g} с — це менше трьох "
-                        "прольотів домену ({flight:.4g} с кожен). Слід за "
-                        "тілом не встигне сформуватися.", end_time=s.end_time, flight=flight)))
+                        tr("The end time {end_time:g} s is less than "
+                           "three flow-throughs of the domain "
+                           "({flight:.4g} s each). The wake behind the "
+                           "body will not have time to form.", end_time=s.end_time, flight=flight)))
         return out
 
     @property
@@ -2333,28 +2348,27 @@ class CaseCfg:
         twice = sorted(n for n, k in seen.items() if k > 1)
         if twice:
             out.append(("bad", (
-                tr("Два патчі з однаковим імʼям: {twice}. Перейменуйте "
-                   "моделі або зніміть роздільні патчі.", twice=", ".join(twice)))))
+                tr("Two patches with the same name: {twice}. Rename the "
+                   "models or turn off separate patches.", twice=", ".join(twice)))))
         bad = sorted(b.name for b in self.bodies
                      if b.name != patch_name_from(b.name))
         if bad:
             out.append(("bad", (
-                tr("Імена, непридатні для OpenFOAM: {bad}. Дозволені "
-                   "латиниця, цифри й підкреслення.", bad=", ".join(bad)))))
+                tr("Names not usable in OpenFOAM: {bad}. Allowed: Latin "
+                   "letters, digits and underscores.", bad=", ".join(bad)))))
         reserved = sorted(set(b.name for b in self.bodies)
                           & {"inlet", "outlet", "farfield", "ground"})
         if reserved:
             out.append(("bad", (
-                tr("Ці імена вже зайняті межами домену: {reserved}. "
-                   "Перейменуйте моделі.", reserved=", ".join(reserved)))))
+                tr("These names are already used by domain boundaries: "
+                   "{reserved}. Rename the models.", reserved=", ".join(reserved)))))
 
         # --- РОЛІ. Кожна з цих вад мовчить, і в цьому вся річ. -----------
         bad_role = sorted(b.name for b in self.bodies
                           if b.role not in ROLE_KEYS)
         if bad_role:
             out.append(("bad", (
-                tr("Невідома роль у частин: {bad_role}. "
-                "Є: {ROLE_KEYS}.", bad_role=', '.join(bad_role), ROLE_KEYS=', '.join(ROLE_KEYS)))))
+                tr("Unknown part role: {bad_role}. Available: {ROLE_KEYS}.", bad_role=', '.join(bad_role), ROLE_KEYS=', '.join(ROLE_KEYS)))))
 
         rotors = [b for b in self.bodies if b.role == "rotor"]
         # Роль «гвинт» без зони — найтихіший випадок: частина просто стоїть
@@ -2368,29 +2382,29 @@ class CaseCfg:
         orphans = sorted(b.name for b in rotors if b.name not in zoned)
         if orphans:
             out.append(("bad", (
-                tr("Позначені гвинтами, але обертової зони не мають: "
-                   "{orphans}. Без зони це просто нерухомі поверхні: "
-                   "тяги не буде, а помилки не буде теж. Найчастіша "
-                   "причина — формою це не диск: диск тонкий уздовж осі "
-                   "обертання й КРУГЛИЙ у двох інших напрямках.", orphans=", ".join(orphans)))))
+                tr("Marked as propellers, but have no rotating zone: "
+                   "{orphans}. Without a zone these are just fixed "
+                   "surfaces: there will be no thrust, and no error "
+                   "either. The most common cause — the shape is not a "
+                   "disk: a disk is thin along the rotation axis and "
+                   "ROUND in the other two directions.", orphans=", ".join(orphans)))))
         dead = sorted(b.name for b in rotors if abs(b.rpm) < 1e-9)
         if dead:
             out.append(("warn", (
-                tr("Гвинти з нульовими обертами: {dead}. "
-                "Вони не зроблять нічого.", dead=', '.join(dead)))))
+                tr("Propellers with zero rpm: {dead}. They will do nothing.", dead=', '.join(dead)))))
 
         movers = [b for b in self.bodies if b.role == "motion"]
         if movers and not self.motion.on:
             out.append(("warn", (
-                tr("Частини позначені рухомими ({join}), але коливання "
-                   "вимкнене на вкладці «Розвʼязувач». Вони стоятимуть "
-                   "разом з рештою.", join=", ".join(
+                tr("Parts are marked as moving ({join}), but oscillation "
+                   "is off on the “Solver” tab. They will stay still "
+                   "with the rest.", join=", ".join(
                     b.name for b in movers)))))
         if self.motion.on and self.bodies and not movers:
             out.append(("warn", (
-                "Коливання ввімкнене, але жодна частина не позначена "
-                "рухомою — тому рухається ВСЕ ТІЛО. Якщо мав ходити лише "
-                "елерон, позначте його роллю «рухома частина».")))
+                tr("Oscillation is on, but no part is marked as moving — so "
+                "the WHOLE BODY moves. If only the aileron was meant to "
+                "move, give it the role “moving part”."))))
 
         # Найпідступніше з усього. Тіло, менше за кілька комірок, snappy
         # читає, створює для нього патч — і лишає на ньому НУЛЬ граней. Кейс
@@ -2407,13 +2421,13 @@ class CaseCfg:
                     and b.role != DISK_ROLE]
             if thin:
                 out.append(("warn", (
-                    tr("Ці частини надто дрібні для сітки: {join}. "
-                       "snappyHexMesh може лишити їхні патчі БЕЗ ЖОДНОЇ "
-                       "грані — тоді сили на них вийдуть рівно нулі, і "
-                       "це виглядатиме як «опору немає». Підніміть "
-                       "рівень рефайнменту або приберіть ці моделі зі "
-                       "сцени.", join=", ".join(tr("{n} ({s} при комірці "
-                                "{cell})", n=n, s=phys.fmt_len(s), cell=phys.fmt_len(cell)) for n, s in thin)))))
+                    tr("These parts are too small for the mesh: {join}. "
+                       "snappyHexMesh can leave their patches WITHOUT A "
+                       "SINGLE face — then the forces on them come out "
+                       "exactly zero, and it will look like “there is no "
+                       "drag”. Raise the refinement level or remove "
+                       "these models from the scene.", join=", ".join(tr("{n} ({s} at "
+                                                        "cell {cell})", n=n, s=phys.fmt_len(s), cell=phys.fmt_len(cell)) for n, s in thin)))))
         out.extend(self.guard_engines())
         out.extend(self.guard_disks())
         return out
@@ -2430,35 +2444,37 @@ class CaseCfg:
             return out
         if self.flow.supersonic:
             out.append(("warn", (
-                tr("Гвинти-диски на надзвуку вимкнено: rhoCentralFoam не "
-                   "застосовує джерел, і тяги від них не було б. Диски: "
-                   "{join}.", join=", ".join(d.name for d in self.disks)))))
+                tr("Actuator disks are off in supersonic mode: "
+                   "rhoCentralFoam does not apply sources, and they "
+                   "would give no thrust. Disks: {join}.", join=", ".join(d.name for d in self.disks)))))
             return out
         lo, hi = self.bounds[0::2], self.bounds[1::2]
         for d in self.disks:
             if d.radius <= 0 or d.hub >= d.radius:
                 out.append(("bad", (
-                    tr("Гвинт-диск {name}: кок ({hub}) не "
-                    "менший за радіус ({radius}) — кільця "
-                    "для тяги немає.", name=d.name, hub=phys.fmt_len(d.hub), radius=phys.fmt_len(d.radius)))))
+                    tr("Actuator disk {name}: the hub ({hub}) is not "
+                       "smaller than the radius ({radius}) — there is no "
+                       "ring for thrust.", name=d.name, hub=phys.fmt_len(d.hub), radius=phys.fmt_len(d.radius)))))
                 continue
             if math.sqrt(sum(x * x for x in d.axis)) < 1e-12:
-                out.append(("bad", tr("Гвинт-диск {name}: вісь нульова.", name=d.name)))
+                out.append(("bad", tr("Actuator disk {name}: the axis is zero.", name=d.name)))
                 continue
             if d.profile not in DISK_PROFILE_KEYS:
-                out.append(("bad", tr("Гвинт-диск {name}: невідомий профіль "
-                                   "«{profile}».", name=d.name, profile=d.profile)))
+                out.append(("bad", tr("Actuator disk {name}: unknown "
+                                      "profile “{profile}”.", name=d.name, profile=d.profile)))
             if not all(l < c < h for l, c, h in zip(lo, d.centre, hi)):
                 out.append(("bad", (
-                    tr("Гвинт-диск {name} поза доменом — його сила не "
-                    "потрапить у жодну комірку.", name=d.name))))
+                    tr("Actuator disk {name} is outside the domain — its "
+                       "force will not reach any cell.", name=d.name))))
             if d.thrust <= 0 and d.torque <= 0:
-                out.append(("warn", tr("Гвинт-диск {name}: тяга й момент "
-                                    "нульові — він нічого не зробить.", name=d.name)))
+                out.append(("warn", tr("Actuator disk {name}: thrust and "
+                                       "torque are zero — it will do "
+                                       "nothing.", name=d.name)))
             elif d.from_throttle and d.throttle_factor <= 0:
                 out.append(("warn", (
-                    tr("Гвинт-диск {name}: газ на нулі — тяги немає. "
-                    "Посуньте газ на пульті або зніміть «від газу».", name=d.name))))
+                    tr("Actuator disk {name}: throttle at zero — there "
+                       "is no thrust. Move the throttle on the control "
+                       "panel or clear “from throttle”.", name=d.name))))
             level = (self.disk_level(d) if d.refine
                      else self.mesh.surface_level_max)
             cell = self.base_cell / 2 ** level if self.base_cell > 0 else 0
@@ -2466,20 +2482,20 @@ class CaseCfg:
                 across = 2 * d.radius / cell
                 if across < DISK_CELLS_ACROSS * 0.99:
                     out.append(("warn", (
-                        tr("Гвинт-диск {name}: на діаметр лягає "
-                           "{across:.0f} комірок (треба "
-                           "{DISK_CELLS_ACROSS}). Тяга від цього не "
-                           "зміниться — вона нормована, — але ляже "
-                           "плямою, а не диском.{v}", name=d.name, across=across, DISK_CELLS_ACROSS=DISK_CELLS_ACROSS, v="" if d.refine else
-                           " Увімкніть «згущувати сітку в диску».")
+                        tr("Actuator disk {name}: {across:.0f} cells "
+                           "across the diameter (needs "
+                           "{DISK_CELLS_ACROSS}). The thrust does not "
+                           "change because of this — it is normalized — "
+                           "but it lands as a blot, not a disk.{v}", name=d.name, across=across, DISK_CELLS_ACROSS=DISK_CELLS_ACROSS, v="" if d.refine else
+                           " Turn on “refine mesh in the disk”.")
                         )))
                 ring = d.radius - d.hub
                 if ring < 2 * cell:
                     out.append(("bad", (
-                        tr("Гвинт-диск {name}: кільце від кока до кінця "
-                        "({ring}) вужче за дві комірки "
-                        "({cell}) — у нього може не "
-                        "потрапити жоден центр комірки, і сили не буде.", name=d.name, ring=phys.fmt_len(ring), cell=phys.fmt_len(cell)))))
+                        tr("Actuator disk {name}: the ring from the hub "
+                           "to the tip ({ring}) is narrower than two "
+                           "cells ({cell}) — it may not contain a single "
+                           "cell center, and there will be no force.", name=d.name, ring=phys.fmt_len(ring), cell=phys.fmt_len(cell)))))
             if d.torque > 0 and d.thrust > 0:
                 # Q/(T·R) — безрозмірна «закрутка». Для звичайних гвинтів
                 # 0.05–0.3; на порядок більше — найпевніше, переплутано
@@ -2487,9 +2503,10 @@ class CaseCfg:
                 ratio = d.torque / (d.thrust * d.radius)
                 if ratio > 2.0:
                     out.append(("warn", (
-                        tr("Гвинт-диск {name}: момент завеликий для такої "
-                        "тяги (Q/(T·R) = {ratio:.1f}, звично 0.05–0.3). "
-                        "Перевірте одиниці: Н·м, а не Н·мм.", name=d.name, ratio=ratio))))
+                        tr("Actuator disk {name}: the torque is too "
+                           "large for this thrust (Q/(T·R) = "
+                           "{ratio:.1f}, usually 0.05–0.3). Check the "
+                           "units: N·m, not N·mm.", name=d.name, ratio=ratio))))
         return out
 
     def guard_engines(self) -> list[tuple[str, str]]:
@@ -2508,81 +2525,86 @@ class CaseCfg:
                        if not b.engine or b.engine not in names)
         if loose:
             out.append(("bad", (
-                tr("Кришки без двигуна: {loose}. Кожна кришка "
-                   "повітрозабірника чи сопла має належати двигуну — "
-                   "інакше вона стане плоскою стінкою з нульовою "
-                   "витратою.", loose=", ".join(loose)))))
+                tr("Caps without an engine: {loose}. Each intake or "
+                   "nozzle cap must belong to an engine — otherwise it "
+                   "becomes a flat wall with zero flow rate.", loose=", ".join(loose)))))
         for e in self.engines:
             extra = sorted(b.name for b in ports if b.role == "nozzle"
                            and b.engine == e.name and b.name != e.nozzle)
             if extra:
                 out.append(("bad", (
-                    tr("У двигуна {name} більше одного сопла: {nozzle}, "
-                       "{extra}. Сопло в двигуна одне; для другого "
-                       "струменя заведіть другий двигун.", name=e.name, nozzle=e.nozzle, extra=", ".join(extra)))))
+                    tr("Engine {name} has more than one nozzle: "
+                       "{nozzle}, {extra}. An engine has one nozzle; for "
+                       "a second jet, add a second engine.", name=e.name, nozzle=e.nozzle, extra=", ".join(extra)))))
             if not e.nozzle:
                 out.append(("bad", (
-                    tr("Двигун {name} без сопла: він лише ковтав би "
-                    "повітря. Позначте кришку зрізу роллю «сопло».", name=e.name))))
+                    tr("Engine {name} has no nozzle: it would only "
+                       "swallow air. Give the exit cap the “nozzle” role.", name=e.name))))
             if not e.intakes:
                 out.append(("bad", (
-                    tr("Двигун {name} без повітрозабірника: струмінь брався "
-                    "б нізвідки. Позначте кришку отвору роллю "
-                    "«повітрозабірник».", name=e.name))))
+                    tr("Engine {name} has no intake: the jet would come "
+                       "from nowhere. Give the opening cap the “intake” "
+                       "role.", name=e.name))))
             if e.kind not in ENGINE_KIND_KEYS:
-                out.append(("bad", tr("Двигун {name}: невідомий вид «{kind}».", name=e.name, kind=e.kind)))
+                out.append(("bad", tr("Engine {name}: unknown type “{kind}”.", name=e.name, kind=e.kind)))
             if not (e.nozzle and e.intakes):
                 continue
             if e.nozzle_area <= 0:
                 out.append(("bad", (
-                    tr("Двигун {name}: площа сопла невідома або нуль. Без "
-                    "неї з тяги не порахувати ні витрати, ні швидкості "
-                    "струменя.", name=e.name))))
+                    tr("Engine {name}: the nozzle area is unknown or "
+                       "zero. Without it, neither the mass flow nor the "
+                       "jet speed can be calculated from the thrust.", name=e.name))))
                 continue
             pt = engine_point(e, self.flow)
             if self.portal_mode and math.sqrt(
                     sum(x * x for x in e.nozzle_normal)) < 1e-12:
                 out.append(("bad", (
-                    tr("Двигун {name}: у сопла немає напрямку — нормалі "
-                    "його поверхні взаємно гасяться (замкнена чи "
-                    "вивернута поверхня). Порталу потрібна відкрита "
-                    "поверхня, нормалі якої дивляться в бік струменя.", name=e.name))))
+                    tr("Engine {name}: the nozzle has no direction — the "
+                       "normals of its surface cancel each other (a "
+                       "closed or flipped surface). The portal needs an "
+                       "open surface whose normals point in the "
+                       "direction of the jet.", name=e.name))))
             if e.from_throttle and e.throttle_factor <= 0:
                 out.append(("warn", (
-                    tr("Двигун {name}: газ на нулі — тяги немає, обидві "
-                    "кришки стоять як стінки. Посуньте газ на пульті або "
-                    "зніміть «від газу».", name=e.name))))
+                    tr("Engine {name}: throttle at zero — there is no "
+                       "thrust, both caps act as walls. Move the "
+                       "throttle on the control panel or clear “from "
+                       "throttle”.", name=e.name))))
             if pt.mach_exit > 0.9:
                 out.append(("warn", (
-                    tr("Двигун {name}: на зрізі сопла M = {mach_exit:.2f} "
-                    "({v_exit:.0f} м/с). Таке сопло, найпевніше, "
-                    "заперте, а тут тиск на зрізі вважається атмосферним — "
-                    "для запертого струменя модель не годиться. Більше "
-                    "сопло або менша тяга.", name=e.name, mach_exit=pt.mach_exit, v_exit=pt.v_exit))))
+                    tr("Engine {name}: at the nozzle exit M = "
+                       "{mach_exit:.2f} ({v_exit:.0f} m/s). Such a "
+                       "nozzle is most likely choked, and here the exit "
+                       "pressure is taken as atmospheric — the model "
+                       "does not fit a choked jet. Use a larger nozzle "
+                       "or less thrust.", name=e.name, mach_exit=pt.mach_exit, v_exit=pt.v_exit))))
             for n, m in zip(e.intakes, pt.mach_intakes):
                 if m > 0.6:
                     out.append(("warn", (
-                        tr("Повітрозабірник {n}: швидкість у кришці M = {m:.2f}. "
-                        "Отвір замалий для такої витрати.", n=n, m=m))))
+                        tr("Intake {n}: the speed at the cap is M = "
+                           "{m:.2f}. The opening is too small for this "
+                           "mass flow.", n=n, m=m))))
             if e.hot and not self.flow.compressible:
                 out.append(("warn", (
-                    tr("Двигун {name} — турбіна, а режим нестисливий: "
-                    "струмінь вийде холодним, з густиною набігаючого "
-                    "повітря. Для гарячого струменя потрібен стисливий "
-                    "режим.", name=e.name))))
+                    tr("Engine {name} is a turbine, and the mode is "
+                       "incompressible: the jet will come out cold, with "
+                       "the density of the freestream air. A hot jet "
+                       "needs the compressible mode.", name=e.name))))
             if e.thrust_mode not in THRUST_MODE_KEYS:
-                out.append(("bad", tr("Двигун {name}: невідомо, що означає "
-                                   "тяга («{thrust_mode}»).", name=e.name, thrust_mode=e.thrust_mode)))
+                out.append(("bad", tr("Engine {name}: unknown meaning of "
+                                      "thrust (“{thrust_mode}”).", name=e.name, thrust_mode=e.thrust_mode)))
             if e.direct and pt.thrust < 0:
                 out.append(("warn", (
-                    tr("Двигун {name}: за цих ṁ і Vₑ тяга відʼємна "
-                    "({thrust:.1f} Н) — струмінь повільніший за політ.", name=e.name, thrust=pt.thrust))))
+                    tr("Engine {name}: with this ṁ and Vₑ the thrust is "
+                       "negative ({thrust:.1f} N) — the jet is slower "
+                       "than the flight speed.", name=e.name, thrust=pt.thrust))))
             elif not e.direct and e.v_jet > 0 and pt.mdot_nozzle <= 0 \
                     and e.thrust > 0 and e.gas > 0:
                 out.append(("warn", (
-                    tr("Двигун {name}: вихлоп {v_jet:g} м/с не швидший за "
-                    "політ {u_inf:g} м/с — тяги в польоті з таким "
-                    "струменем не буде.", name=e.name, v_jet=e.v_jet, u_inf=self.flow.u_inf))))
+                    tr("Engine {name}: exhaust {v_jet:g} m/s is not "
+                       "faster than the flight speed {u_inf:g} m/s — "
+                       "with such a jet there will be no thrust in "
+                       "flight.", name=e.name, v_jet=e.v_jet, u_inf=self.flow.u_inf))))
             if (not e.direct and e.v_jet > 0 and not self.portal_mode
                     and pt.area_needed > 0 and e.nozzle_area > 0):
                 ratio = e.nozzle_area / pt.area_needed
@@ -2590,33 +2612,34 @@ class CaseCfg:
                     need = 2.0 * math.sqrt(pt.area_needed / math.pi)
                     have = 2.0 * math.sqrt(e.nozzle_area / math.pi)
                     out.append(("warn", (
-                        tr("Двигун {name}: кришка сопла {v:.0f} мм "
-                        "не пропустить {mdot_nozzle:.3g} кг/с зі "
-                        "швидкістю {v_exit:.0f} м/с — для цього потрібно "
-                        "≈ {v2:.0f} мм. На кришці-патчі швидкість "
-                        "задає її площа, тож струмінь вийде "
-                        "{v3:.0f} "
-                        "м/с. Портали (стисливий режим) від розміру диска "
-                        "не залежать.", name=e.name, v=have * 1000, mdot_nozzle=pt.mdot_nozzle, v_exit=pt.v_exit, v2=need * 1000, v3=pt.mdot_nozzle / (pt.rho_exit * e.nozzle_area)))))
+                        tr("Engine {name}: a nozzle cap of {v:.0f} mm "
+                           "will not pass {mdot_nozzle:.3g} kg/s at "
+                           "{v_exit:.0f} m/s — this needs ≈ {v2:.0f} mm. "
+                           "On a cap patch the speed is set by its area, "
+                           "so the jet will come out at {v3:.0f} m/s. "
+                           "Portals (compressible mode) do not depend on "
+                           "the disk size.", name=e.name, v=have * 1000, mdot_nozzle=pt.mdot_nozzle, v_exit=pt.v_exit, v2=need * 1000, v3=pt.mdot_nozzle / (pt.rho_exit * e.nozzle_area)))))
             if (not e.direct and e.v_jet <= 0 and e.hot
                     and 0 < pt.v_exit < 250.0):
                 need = 2.0 * math.sqrt(
                     pt.mdot_nozzle * pt.v_exit / 450.0 ** 2
                     / max(pt.rho_exit, 1e-9) / math.pi) if pt.v_exit else 0
                 out.append(("warn", (
-                    tr("Двигун {name}: струмінь турбіни вийшов лише "
-                    "{v_exit:.0f} м/с — у мікро-ТРД 400–600. Найпевніше, "
-                    "кришка сопла завелика: витрата береться з її площі. "
-                    "Задайте «швидкість вихлопу» з паспорта або зменшіть "
-                    "сопло (для ~450 м/с за цієї тяги — ≈ {v:.0f} "
-                    "мм).", name=e.name, v_exit=pt.v_exit, v=need * 1000))))
+                    tr("Engine {name}: the turbine jet came out at only "
+                       "{v_exit:.0f} m/s — in a micro turbojet it is "
+                       "400–600. Most likely the nozzle cap is too "
+                       "large: the mass flow comes from its area. Set "
+                       "the “exhaust velocity” from the datasheet or "
+                       "make the nozzle smaller (for ~450 m/s at this "
+                       "thrust — ≈ {v:.0f} mm).", name=e.name, v_exit=pt.v_exit, v=need * 1000))))
             if (not e.direct and e.thrust_mode == "static"
                     and pt.mdot_nozzle > 0 and pt.thrust <= 0):
                 out.append(("warn", (
-                    tr("Двигун {name}: на {u_inf:g} м/с і цьому "
-                    "газі він уже не тягне — струмінь {v_exit:.0f} м/с "
-                    "не швидший за політ, тяга {thrust:.1f} Н. Більше "
-                    "газу або менша швидкість.", name=e.name, u_inf=self.flow.u_inf, v_exit=pt.v_exit, thrust=pt.thrust))))
+                    tr("Engine {name}: at {u_inf:g} m/s and this "
+                       "throttle it no longer pulls — the jet at "
+                       "{v_exit:.0f} m/s is not faster than the flight, "
+                       "thrust {thrust:.1f} N. More throttle or less "
+                       "speed.", name=e.name, u_inf=self.flow.u_inf, v_exit=pt.v_exit, thrust=pt.thrust))))
             for b in ports:
                 if self.engine_of(b.name) is not e or not e.refine:
                     continue
@@ -2632,15 +2655,17 @@ class CaseCfg:
                 across = dh / (self.base_cell / 2 ** lvl)
                 if across < PORT_CELLS_ACROSS * 0.99:
                     out.append(("warn", (
-                        tr("Кришка {name}: на її діаметр лягає лише "
-                        "{across:.0f} комірок (треба {PORT_CELLS_ACROSS}), "
-                        "бо згущення вже на стелі. Струмінь вийде "
-                        "розмазаним, хоч тяга й не зміниться.", name=b.name, across=across, PORT_CELLS_ACROSS=PORT_CELLS_ACROSS))))
+                        tr("Cap {name}: only {across:.0f} cells across "
+                           "its diameter (needs {PORT_CELLS_ACROSS}), "
+                           "because the refinement is already at its "
+                           "maximum. The jet will be smeared, though the "
+                           "thrust will not change.", name=b.name, across=across, PORT_CELLS_ACROSS=PORT_CELLS_ACROSS))))
         if self.engines and self.flow.supersonic:
             out.append(("warn", (
-                "Двигуни в надзвуковому режимі: умови з заданою витратою "
-                "OpenFOAM сам називає ненадійними на трансзвуку. Перевірте "
-                "виміряну силу двигуна в результатах.")))
+                tr("Engines in supersonic mode: OpenFOAM itself calls the "
+                "conditions with a fixed flow rate unreliable in the "
+                "transonic range. Check the measured engine force in the "
+                "results."))))
         return out
 
     def guard_turbulence(self) -> list[tuple[str, str]]:
@@ -2656,21 +2681,22 @@ class CaseCfg:
             return out
         if self.solver.steady:
             out.append(("bad", (
-                tr("{turbulence} — вихрова модель, вона рахує вихори "
-                "за часом. Зі стаціонарним розвʼязувачем вона дасть ту саму "
-                "усереднену картину, що й звичайна RANS, тільки дорожче. "
-                "Зніміть галочку «Стаціонарна» на вкладці «Розвʼязувач».", turbulence=self.flow.turbulence))))
+                tr("{turbulence} is an eddy-resolving model, it "
+                   "calculates eddies in time. With a steady solver it "
+                   "gives the same averaged picture as normal RANS, only "
+                   "at a higher cost. Clear the “Steady” check box on "
+                   "the “Solver” tab.", turbulence=self.flow.turbulence))))
         # Вихори треба чимось розвʼязувати. Комірка, у яку їх поміститься
         # менше десятка на хорду, перетворює LES на дорогий RANS.
         ref = self.flow.l_ref or self.body_length
         cell = self.surface_cell
         if cell > 0 and ref > 0 and ref / cell < 40:
             out.append(("warn", (
-                tr("На опорну довжину {ref} припадає "
-                "{v:.0f} комірок. Вихрова модель на такій сітці "
-                "розвʼяже хіба найбільші вихори, а решту однаково змоделює — "
-                "тобто перетвориться на дорогий RANS. Для LES і DES треба "
-                "хоча б удвічі дрібніше, ніж для RANS.", ref=phys.fmt_len(ref), v=ref / cell))))
+                tr("The reference length {ref} has {v:.0f} cells. An "
+                   "eddy-resolving model on such a mesh will resolve "
+                   "only the largest eddies and will model the rest "
+                   "anyway — so it turns into an expensive RANS. LES and "
+                   "DES need a mesh at least two times finer than RANS.", ref=phys.fmt_len(ref), v=ref / cell))))
         return out
 
     def guard_yplus(self) -> list[tuple[str, str]]:
@@ -2700,16 +2726,18 @@ class CaseCfg:
                 if lv and lv[0][1] > top]
         if not loud:
             return out
-        where = ", ".join(tr("{n} (рівень {l})", n=n, l=l) for n, l in loud)
+        where = ", ".join(tr("{n} (level {l})", n=n, l=l) for n, l in loud)
         out.append(("warn", (
-            tr("Ці зони згущують саму поверхню сильніше за решту тіла: "
-            "{where} проти {top} на поверхні. Призматичні шари ростуть від "
-            "МІСЦЕВОЇ комірки, тому на межі зони стрибне товщина першого "
-            "шару, а з нею й y+. У перевірці на крилі y+ уздовж хорди пішов "
-            "51, 58, 87, 15 замість плавних 52, 38, 28, 25 — і підйомна "
-            "сила на нульовому куті вийшла на 43% меншою. Для піку "
-            "розрідження на носку така сітка годиться, для сил у цілому — "
-            "ні. Або зрівняйте рівень поверхні, або згущуйте лише обʼєм.", where=where, top=top))))
+            tr("These zones refine the surface itself more than the rest "
+               "of the body: {where} vs {top} on the surface. Prism "
+               "layers grow from the LOCAL cell, so at the zone boundary "
+               "the first layer thickness jumps, and y+ with it. In a "
+               "test on a wing, y+ along the chord went 51, 58, 87, 15 "
+               "instead of a smooth 52, 38, 28, 25 — and lift at zero "
+               "angle came out 43% lower. Such a mesh is good for the "
+               "suction peak at the leading edge, but not for the forces "
+               "as a whole. Either make the surface level equal, or "
+               "refine only the volume.", where=where, top=top))))
         return out
 
     def guard_zone_vs_shell(self) -> list[tuple[str, str]]:
@@ -2775,15 +2803,16 @@ class CaseCfg:
         if not weak:
             return out
         where = "; ".join(
-            tr("{n}: рівень {l} на {v:.0f} мм, а оболонка там уже дає "
-            "{h}", n=n, l=l, v=d * 1000, h=h) for n, d, l, h in weak[:3])
+            tr("{n}: level {l} at {v:.0f} mm, but the shell there "
+               "already gives {h}", n=n, l=l, v=d * 1000, h=h) for n, d, l, h in weak[:3])
         out.append(("warn", (
-            tr("Ці сходинки зон згущення не зроблять нічого: {where}. "
-            "snappyHexMesh бере найвищу вимогу, тож слабша просто зникає — "
-            "мовчки, без жодної різниці в сітці. Щоб зона мала сенс, вона "
-            "має просити там, де оболонки вже немає (далі за "
-            "{v:.0f} мм), або рівень вищий за "
-            "тамтешній.", where=where, v=ladder[-1][0] * 1000))))
+            tr("These refinement region steps will do nothing: {where}. "
+               "snappyHexMesh takes the highest requirement, so the "
+               "weaker one simply disappears — silently, with no "
+               "difference in the mesh. For the zone to make sense, it "
+               "must ask for refinement where the shell no longer "
+               "reaches (beyond {v:.0f} mm), or ask for a level higher "
+               "than the level there.", where=where, v=ladder[-1][0] * 1000))))
         return out
 
     def guard_adapt(self) -> list[tuple[str, str]]:
@@ -2797,8 +2826,8 @@ class CaseCfg:
         if not a.on:
             return out
         if a.mode not in ADAPT_MODES:
-            out.append(("bad", tr("Невідомий режим адаптації «{mode}». "
-                               "Є: {ADAPT_MODES}.", mode=a.mode, ADAPT_MODES=', '.join(ADAPT_MODES))))
+            out.append(("bad", tr("Unknown adaptation mode “{mode}”. "
+                                  "Available: {ADAPT_MODES}.", mode=a.mode, ADAPT_MODES=', '.join(ADAPT_MODES))))
             return out
 
         if a.native:
@@ -2806,16 +2835,16 @@ class CaseCfg:
             # вміє взагалі, і прогін упаде без зрозумілого повідомлення.
             if self.solver.steady:
                 out.append(("bad", (
-                    "Рідна адаптація міняє сітку ПІД ЧАС прогону, а "
-                    "стаціонарний розвʼязувач цього не вміє: simpleFoam не "
-                    "працює з динамічною сіткою. Зніміть галочку "
-                    "«Стаціонарна» — або візьміть режим «перебудова», який "
-                    "зі стаціонарним працює.")))
+                    tr("Native adaptation changes the mesh DURING the run, "
+                    "and a steady solver cannot do this: simpleFoam does "
+                    "not work with a dynamic mesh. Clear the “Steady” "
+                    "check box — or use the “rebuild” mode, which works "
+                    "with a steady solver."))))
             if self.motion.on:
                 out.append(("bad", (
-                    "Рідна адаптація й рухома сітка — це два різні "
-                    "dynamicFvMesh, а він у кейсі може бути лише один. "
-                    "Виберіть щось одне.")))
+                    tr("Native adaptation and a moving mesh are two "
+                    "different dynamicFvMesh, and a case can have only "
+                    "one. Choose one of them."))))
             if self.mesh.add_layers and self.solver.max_courant > 2.0:
                 # Шари самі по собі адаптації НЕ заважають — це поміряно:
                 # прогін із трьома призматичними шарами поділив сітку зі
@@ -2829,41 +2858,43 @@ class CaseCfg:
                 # загинув на 47-му кроці: k пішло до 5.7e+73. При одиниці
                 # пройшов повністю.
                 out.append(("warn", (
-                    tr("Число Куранта {max_courant:g} з шарами й "
-                    "рідною адаптацією завелике. Комірка в шарі й так "
-                    "тонка, а після поділу стає вдвічі тоншою — межа "
-                    "стійкості рахується саме з неї. У перевірці при 5 "
-                    "прогін загинув на 47-му кроці (k вилетіло до "
-                    "5.7e+73), а при 1 пройшов повністю. Поставте 1-2 або "
-                    "зніміть шари.", max_courant=self.solver.max_courant))))
+                    tr("Courant number {max_courant:g} is too large with "
+                       "layers and native adaptation. A cell in the "
+                       "layer is already thin, and after splitting it "
+                       "becomes half as thick — the stability limit is "
+                       "computed from exactly that cell. In a test at 5 "
+                       "the run died at step 47 (k blew up to 5.7e+73), "
+                       "and at 1 it ran to the end. Set 1-2 or remove "
+                       "the layers.", max_courant=self.solver.max_courant))))
             if self.solver.max_courant > 0 and a.interval < 5:
                 out.append(("warn", (
-                    tr("Перевіряти сітку кожні {interval} кроків дорого: "
-                    "кожна перевірка це перебудова топології й "
-                    "перерозподіл між процесами. Двадцять-пʼятдесят "
-                    "кроків зазвичай досить.", interval=a.interval))))
+                    tr("Checking the mesh every {interval} steps is "
+                       "expensive: each check is a topology rebuild and "
+                       "a redistribution between processes. Twenty to "
+                       "fifty steps are usually enough.", interval=a.interval))))
         else:
             # Перебудова: два проходи, і дешевий має бути справді дешевим.
             if self.mesh.surface_level_max >= 6 and self.mesh.add_layers:
                 out.append(("warn", (
-                    "Перебудова робить ДВА проходи, і перший потрібен лише "
-                    "щоб дізнатися, де густити. Ставити на нього ту саму "
-                    "дрібну поверхню й шари — платити двічі. Для першого "
-                    "проходу вистачить рівня 3-4 без шарів.")))
+                    tr("The rebuild makes TWO passes, and the first one is "
+                    "only needed to find out where to refine. Putting "
+                    "the same fine surface and layers on it means paying "
+                    "twice. Level 3-4 without layers is enough for the "
+                    "first pass."))))
 
         if not 0.0 < a.fraction < 0.5:
             out.append(("bad", (
-                tr("Частка комірок для згущення {fraction:.0%} поза межами "
-                "здорового глузду. Беріть від 2 до 20 відсотків: менше — "
-                "зона не встигне ні на що вплинути, більше — це вже не "
-                "адаптація, а рівномірне подрібнення.", fraction=a.fraction))))
+                tr("A refinement cell fraction of {fraction:.0%} is "
+                   "outside common sense. Use 2 to 20 percent: less, and "
+                   "the region has no time to affect anything; more, and "
+                   "it is no longer adaptation but uniform refinement.", fraction=a.fraction))))
         if a.max_level > 3:
             out.append(("warn", (
-                tr("Поділ до {max_level} рівнів означає, що комірка може "
-                "стати в {v} разів дрібнішою по кожній осі, "
-                "тобто в {v2} разів меншою за обʼємом. "
-                "Стеля на кількість комірок тут не запобіжник, а остання "
-                "межа: два рівні майже завжди досить.", max_level=a.max_level, v=2 ** a.max_level, v2=8 ** a.max_level))))
+                tr("Splitting up to {max_level} levels means a cell can "
+                   "become {v} times finer along each axis, that is, "
+                   "{v2} times smaller in volume. The cell-count cap "
+                   "here is not a safeguard but the last limit: two "
+                   "levels are almost always enough.", max_level=a.max_level, v=2 ** a.max_level, v2=8 ** a.max_level))))
         return out
 
     def guard_boxes(self) -> list[tuple[str, str]]:
@@ -2883,9 +2914,10 @@ class CaseCfg:
                         if hi - lo <= 0]
             if bad_axis:
                 out.append(("bad", (
-                    tr("Коробка «{name}»: по {bad_axis} верхня "
-                    "межа не більша за нижню. Такої коробки не буває, і "
-                    "snappyHexMesh її просто пропустить.", name=b.name, bad_axis=', '.join(bad_axis)))))
+                    tr("Box “{name}”: on {bad_axis} the upper bound is "
+                       "not greater than the lower one. Such a box "
+                       "cannot exist, and snappyHexMesh will simply skip "
+                       "it.", name=b.name, bad_axis=', '.join(bad_axis)))))
                 continue
 
             # ЧИ НАКРИВАЄ ВОНА ТІЛО. Коробка повз модель — це згущення
@@ -2894,19 +2926,20 @@ class CaseCfg:
                           in zip(b.min, b.max, self.bbox_min, self.bbox_max))
             if not overlap:
                 out.append(("bad", (
-                    tr("Коробка «{name}» не перетинається з тілом узагалі. "
-                    "Згущувати вона буде порожнє повітря: сітка виросте, "
-                    "біля моделі не зміниться нічого, і помилки не буде.", name=b.name))))
+                    tr("Box “{name}” does not intersect the body at all. "
+                       "It will refine empty air: the mesh will grow, "
+                       "nothing will change near the model, and there "
+                       "will be no error.", name=b.name))))
                 continue
 
             inside = all(lo >= d0 - 1e-9 and hi <= d1 + 1e-9
                          for lo, hi, d0, d1 in zip(b.min, b.max, lo_d, hi_d))
             if not inside:
                 out.append(("warn", (
-                    tr("Коробка «{name}» виходить за межі домену. Частина, "
-                    "що назовні, не робить нічого — snappyHexMesh ріже її "
-                    "по межі. Помилки не буде, але й користі з тієї "
-                    "частини теж.", name=b.name))))
+                    tr("Box “{name}” goes outside the domain. The part "
+                       "outside does nothing — snappyHexMesh cuts it at "
+                       "the boundary. There will be no error, but that "
+                       "part gives no benefit either.", name=b.name))))
 
             # ОБСЯГ. Рівень 2 усередині коробки — це у 8 разів більше
             # комірок на той самий обсяг, рівень 3 — у 64. Коробка на пів
@@ -2917,10 +2950,10 @@ class CaseCfg:
             share = b.volume / dom
             if share > 0.25 and b.level >= 2:
                 out.append(("warn", (
-                    tr("Коробка «{name}» займає {v:.0f}% домену "
-                    "при рівні {level}. Це множить комірки в тому обсязі "
-                    "в {v2} разів — порахуйте оцінку сітки, "
-                    "перш ніж запускати.", name=b.name, v=share * 100, level=b.level, v2=2 ** (3 * b.level)))))
+                    tr("Box “{name}” takes {v:.0f}% of the domain at "
+                       "level {level}. This multiplies the cells in that "
+                       "volume by {v2} — compute the mesh estimate "
+                       "before you run.", name=b.name, v=share * 100, level=b.level, v2=2 ** (3 * b.level)))))
         return out
 
     def guard_scale(self) -> list[tuple[str, str]]:
@@ -2945,16 +2978,17 @@ class CaseCfg:
             return out
         if size < 1e-3:
             out.append(("bad", (
-                tr("Тіло завбільшки {v:.0f} мкм — це менше за макове "
-                "зерня. Майже напевно переплутані одиниці: перевірте поле "
-                "«Одиниці STL» на вкладці «Геометрія». Сітка на такому тілі "
-                "порахується, просто не про те.", v=size * 1e6))))
+                tr("The body is {v:.0f} µm in size — smaller than a "
+                   "poppy seed. The units are almost certainly mixed up: "
+                   "check the “STL units” field on the “Geometry” tab. A "
+                   "mesh on such a body will compute, just not the thing "
+                   "you want.", v=size * 1e6))))
         elif size > 1e3:
             out.append(("bad", (
-                tr("Тіло завдовжки {v:.1f} км. Майже напевно "
-                "переплутані одиниці: перевірте поле «Одиниці STL». Домен "
-                "навколо такого тіла вийде в десятки кілометрів, а комірка "
-                "— з будинок.", v=size / 1000))))
+                tr("The body is {v:.1f} km long. The units are almost "
+                   "certainly mixed up: check the “STL units” field. The "
+                   "domain around such a body will be tens of "
+                   "kilometers, and a cell will be the size of a house.", v=size / 1000))))
 
         # КОРОБКА, НАБАГАТО БІЛЬША ЗА ТІЛО, — та сама хвороба з іншого боку:
         # тіло зменшилося, а коробка лишилася в абсолютних координатах.
@@ -2962,10 +2996,10 @@ class CaseCfg:
             span = max(b.max[i] - b.min[i] for i in range(3))
             if span > size * 200:
                 out.append(("warn", (
-                    tr("Коробка «{name}» у {v:.0f} разів більша за "
-                    "тіло. Так буває, коли тіло перемасштабувалося, а "
-                    "коробка лишилася на старих координатах — перевірте "
-                    "одиниці й натисніть «Підставити пораховану».", name=b.name, v=span / size))))
+                    tr("Box “{name}” is {v:.0f} times larger than the "
+                       "body. This happens when the body was rescaled "
+                       "but the box stayed at the old coordinates — "
+                       "check the units and click “Use computed box”.", name=b.name, v=span / size))))
         return out
 
     def guard_resolution(self) -> list[tuple[str, str]]:
@@ -3000,16 +3034,15 @@ class CaseCfg:
         # сітка ЗАВИЩУЄ і Cd, і Cl, а нахил кривої підйомної сили — занижує.
         # Тому кажемо «змінюються», а не «занижуються»: обіцяти напрямок
         # означало б збрехати в половині випадків.
-        how = ("Коефіцієнти будуть неправильні, і помітно"
-               if per_ref < 30 else "Відповідь ще не збіглася за сіткою")
+        how = (tr("The coefficients will be wrong, and noticeably so")
+               if per_ref < 30 else tr("The answer is not yet mesh-converged"))
         out.append(("warn", (
-            tr("На опорну довжину {ref} припадає лише "
-            "{per_ref:.0f} комірок (комірка на поверхні "
-            "{cell}). Для аеродинаміки треба від 60, а для "
-            "збіжної відповіді більше. {how}: у перевірці на крилі перехід "
-            "з 27 комірок на 54 змінив Cd і Cl на 36%, а нахил кривої "
-            "підйомної сили — на 70%. Підніміть рівень рефайнменту "
-            "поверхні або кількість комірок уздовж X.", ref=phys.fmt_len(ref), per_ref=per_ref, cell=phys.fmt_len(cell), how=how))))
+            tr("The reference length {ref} has only {per_ref:.0f} cells "
+               "(surface cell {cell}). Aerodynamics needs 60 or more, "
+               "and a converged answer needs more. {how}: in a test on a "
+               "wing, going from 27 cells to 54 changed Cd and Cl by "
+               "36%, and the lift curve slope by 70%. Raise the surface "
+               "refinement level or the number of cells along X.", ref=phys.fmt_len(ref), per_ref=per_ref, cell=phys.fmt_len(cell), how=how))))
         return out
 
     def local_cell_at(self, point) -> float:
@@ -3042,37 +3075,38 @@ class CaseCfg:
             seen[z.name] = seen.get(z.name, 0) + 1
         twice = sorted(n for n, k in seen.items() if k > 1)
         if twice:
-            out.append(("bad", tr("Дві зони з однаковим імʼям: {twice}.", twice=", ".join(twice))))
+            out.append(("bad", tr("Two zones with the same name: {twice}.", twice=", ".join(twice))))
         bad = sorted(z.name for z in self.porous
                      if z.name != patch_name_from(z.name))
         if bad:
-            out.append(("bad", tr("Імена зон, непридатні для OpenFOAM: "
-                                  "{bad}. Дозволені латиниця, цифри й "
-                                  "підкреслення.", bad=", ".join(bad))))
+            out.append(("bad", tr("Zone names that OpenFOAM cannot use: "
+                                  "{bad}. Only Latin letters, digits and "
+                                  "underscores are allowed.", bad=", ".join(bad))))
 
         lo_d, hi_d = self.bounds[0::2], self.bounds[1::2]
         for z in self.porous:
             if min(z.size) <= 0 or z.dp <= 0 or z.u_ref <= 0:
-                out.append(("bad", tr("Зона {name}: розмір, перепад тиску й "
-                                   "швидкість мають бути додатні.", name=z.name)))
+                out.append(("bad", tr("Zone {name}: the size, pressure "
+                                      "drop and velocity must be "
+                                      "positive.", name=z.name)))
                 continue
             lo, hi = z.bounds
             if any(h <= d0 or l >= d1 for l, h, d0, d1
                    in zip(lo, hi, lo_d, hi_d)):
                 out.append(("bad", (
-                    tr("Зона {name} лежить поза доменом — у неї не потрапить "
-                    "жодна комірка, і опору не буде зовсім.", name=z.name))))
+                    tr("Zone {name} is outside the domain — no cell will "
+                       "fall into it, and there will be no drag at all.", name=z.name))))
                 continue
             # Зона, тонша за комірку, не отримає жодного шару комірок.
             thin = min(z.size)
             local = self.local_cell_at(z.centre)
             if local > 0 and thin < local * 2:
                 out.append(("warn", (
-                    tr("Зона {name} завтовшки {thin} при "
-                    "комірці {local} у цьому місці. У неї може "
-                    "не потрапити жодної комірки, і тоді опору не буде "
-                    "зовсім — без жодної помилки. Зробіть зону товщою або "
-                    "накрийте її коробкою згущення.", name=z.name, thin=phys.fmt_len(thin), local=phys.fmt_len(local)))))
+                    tr("Zone {name} is {thin} thick with a cell of "
+                       "{local} at this place. It may get no cell at "
+                       "all, and then there will be no drag at all — "
+                       "without any error. Make the zone thicker or "
+                       "cover it with a refinement box.", name=z.name, thin=phys.fmt_len(thin), local=phys.fmt_len(local)))))
         return out
 
     @property
@@ -3135,18 +3169,18 @@ class CaseCfg:
         lo_d, hi_d = self.bounds[0::2], self.bounds[1::2]
         for z in self.rotating:
             if z.radius <= 0 or z.length <= 0:
-                out.append(("bad", tr("Зона {name}: радіус і довжина мають "
-                                   "бути додатні.", name=z.name)))
+                out.append(("bad", tr("Zone {name}: the radius and "
+                                      "length must be positive.", name=z.name)))
                 continue
             if z.name != patch_name_from(z.name):
-                out.append(("bad", tr("Імʼя зони «{name}» непридатне для "
-                                   "OpenFOAM: лише латиниця, цифри й "
-                                   "підкреслення.", name=z.name)))
+                out.append(("bad", tr("Zone name “{name}” cannot be used "
+                                      "in OpenFOAM: only Latin letters, "
+                                      "digits and underscores.", name=z.name)))
             if abs(z.rpm) < 1e-9:
                 out.append(("warn", (
-                    tr("Зона {name} обертається з нульовою швидкістю — вона "
-                    "не робить нічого. Заради самої лише зони рахувати не "
-                    "варто.", name=z.name))))
+                    tr("Zone {name} rotates at zero speed — it does "
+                       "nothing. It is not worth running for the zone "
+                       "alone.", name=z.name))))
 
             # Зона має лежати в домені й накривати геометрію.
             p1, p2 = z.ends
@@ -3155,8 +3189,9 @@ class CaseCfg:
             if any(h <= d0 or l >= d1 for l, h, d0, d1
                    in zip(zlo, zhi, lo_d, hi_d)):
                 out.append(("bad", (
-                    tr("Зона {name} лежить поза доменом — у неї не потрапить "
-                    "жодна комірка, і обертатися не буде чому.", name=z.name))))
+                    tr("Zone {name} is outside the domain — no cell will "
+                       "fall into it, and there will be nothing to "
+                       "rotate.", name=z.name))))
                 continue
             # ЧАСТКОВО ЗА МЕЖЕЮ — окрема біда, і перевірка вище її НЕ ЛОВИТЬ:
             # вона питає лише, чи є перетин узагалі.
@@ -3171,11 +3206,12 @@ class CaseCfg:
                      if l < d0 or h > d1]
             if stick:
                 out.append(("bad", (
-                    tr("Зона {name} стирчить за межі домену по "
-                    "{stick}. Домен рахується від ГАБАРИТУ тіла, "
-                    "а в диска габарит уздовж осі набагато менший за "
-                    "діаметр — через це коробка виходить затісною. "
-                    "Збільште відступи домену.", name=z.name, stick=', '.join(stick)))))
+                    tr("Zone {name} sticks out of the domain along "
+                       "{stick}. The domain is computed from the OVERALL "
+                       "SIZE of the body, and for a disk the size along "
+                       "the axis is much smaller than the diameter — so "
+                       "the box comes out too tight. Increase the domain "
+                       "margins.", name=z.name, stick=', '.join(stick)))))
                 continue
 
             # ГОЛОВНЕ. MRF крутить систему відліку, а не створює тягу. Тягу
@@ -3186,10 +3222,12 @@ class CaseCfg:
                                for i, (lo, hi) in enumerate(zip(zlo, zhi)))
             if not touches_body:
                 out.append(("bad", (
-                    tr("Зона {name} не накриває жодної геометрії. MRF не "
-                    "створює тягу сам — її створюють лопаті всередині зони. "
-                    "Порожня зона лише закрутить повітря, і це виглядатиме "
-                    "як «гвинт не тягне», хоча помилки ніде не буде.", name=z.name))))
+                    tr("Zone {name} does not cover any geometry. MRF "
+                       "does not create thrust by itself — the blades "
+                       "inside the zone create it. An empty zone will "
+                       "only swirl the air, and it will look like “the "
+                       "propeller does not pull”, though there will be "
+                       "no error anywhere.", name=z.name))))
 
             # Кінець лопаті легко переганяє звук навіть тоді, коли сам літак
             # летить повільно. Нестислива постановка цього не бачить.
@@ -3197,16 +3235,18 @@ class CaseCfg:
             ma_tip = phys.mach(tip, self.flow.sound_speed)
             if ma_tip > 0.9 and not self.flow.compressible:
                 out.append(("bad", (
-                    tr("Кінець лопаті йде {tip:.0f} м/с — це M = {ma_tip:.2f}. "
-                    "Нестислива постановка тут дає безглуздя незалежно від "
-                    "того, що літак летить повільно. Перемкніть режим течії "
-                    "на стисливий або зменште оберти.", tip=tip, ma_tip=ma_tip))))
+                    tr("The blade tip moves at {tip:.0f} m/s — that is M "
+                       "= {ma_tip:.2f}. An incompressible setup gives "
+                       "nonsense here, even though the aircraft flies "
+                       "slowly. Switch the flow mode to compressible or "
+                       "reduce the rpm.", tip=tip, ma_tip=ma_tip))))
             elif ma_tip > 0.6 and not self.flow.compressible:
                 out.append(("warn", (
-                    tr("Кінець лопаті йде {tip:.0f} м/с (M = {ma_tip:.2f}), "
-                    "хоча набігаючий потік лише M = {mach:.2f}. "
-                    "Стисливість на лопаті вже помітна — результат буде "
-                    "оптимістичний.", tip=tip, ma_tip=ma_tip, mach=self.flow.mach))))
+                    tr("The blade tip moves at {tip:.0f} m/s (M = "
+                       "{ma_tip:.2f}), though the freestream is only M = "
+                       "{mach:.2f}. Compressibility on the blade is "
+                       "already noticeable — the result will be "
+                       "optimistic.", tip=tip, ma_tip=ma_tip, mach=self.flow.mach))))
 
             # РЕЖИМ ГВИНТА — найтихіша з усіх бід у цьому списку.
             #
@@ -3241,23 +3281,23 @@ class CaseCfg:
                 need_txt = f"{need:,.0f}".replace(",", " ")
                 out.append((
                     "bad" if j > ADVANCE_RATIO_BAD else "warn",
-                    tr("Зона {name}: коефіцієнт ходу J = {j:.1f} при "
-                    "{u_inf:.0f} м/с і {rpm:.0f} об/хв "
-                    "(гвинт {dia} завширшки). Потік набігає "
-                    "на кінець лопаті під {ang:.0f}° до площини обертання, "
-                    "тож тягти вона могла б, лише будучи закрученою "
-                    "крутіше за цей кут. Тут буде не тяга, а ГАЛЬМУВАННЯ — "
-                    "і прийде воно не помилкою, а зайвим опором у звіті. "
-                    "Щоб вийти на робочий J ≈ {ADVANCE_RATIO_NORMAL:g}, "
-                    "треба близько {need_txt} об/хв — або менша швидкість.", name=z.name, j=j, u_inf=self.flow.u_inf, rpm=abs(z.rpm), dia=phys.fmt_len(dia), ang=ang, ADVANCE_RATIO_NORMAL=ADVANCE_RATIO_NORMAL, need_txt=need_txt)))
+                    tr("Zone {name}: advance ratio J = {j:.1f} at "
+                       "{u_inf:.0f} m/s and {rpm:.0f} rpm (propeller "
+                       "{dia} in diameter). The flow meets the blade tip "
+                       "at {ang:.0f}° to the plane of rotation, so the "
+                       "blade could pull only if it were twisted more "
+                       "steeply than this angle. There will be no thrust "
+                       "here but BRAKING — and it will come not as an "
+                       "error but as extra drag in the report. To reach "
+                       "a working J ≈ {ADVANCE_RATIO_NORMAL:g}, you need "
+                       "about {need_txt} rpm — or a lower speed.", name=z.name, j=j, u_inf=self.flow.u_inf, rpm=abs(z.rpm), dia=phys.fmt_len(dia), ang=ang, ADVANCE_RATIO_NORMAL=ADVANCE_RATIO_NORMAL, need_txt=need_txt)))
 
             local = self.local_cell_at(z.centre)
             if local > 0 and z.radius < local * 4:
                 out.append(("warn", (
-                    tr("Зона {name} радіусом {radius} при "
-                    "комірці {local} — на неї припадає менше "
-                    "чотирьох комірок. Обертання на такій сітці не "
-                    "розвʼязується.", name=z.name, radius=phys.fmt_len(z.radius), local=phys.fmt_len(local)))))
+                    tr("Zone {name} with radius {radius} at a cell of "
+                       "{local} — fewer than four cells fall on it. "
+                       "Rotation is not resolved on such a mesh.", name=z.name, radius=phys.fmt_len(z.radius), local=phys.fmt_len(local)))))
         return out
 
     def patch_names(self) -> list[str]:
@@ -6464,15 +6504,15 @@ def summary(cfg: CaseCfg) -> dict[str, str]:
     return {
         "Re": f"{re:.3g}",
         "Mach": f"{f.mach:.3f}",
-        "Домен": tr("{sx:.4g} x {sy:.4g} x {sz:.4g} м", sx=sx, sy=sy, sz=sz),
-        "Фонова комірка": phys.fmt_len(cfg.base_cell),
-        "Комірка на поверхні": phys.fmt_len(cfg.surface_cell),
-        "Комірок (оцінка)": phys.fmt_cells(est.total),
-        "Памʼять snappy": tr("{snappy_peak_gb:.1f} ГБ", snappy_peak_gb=est.snappy_peak_gb),
-        "Памʼять solver": tr("{solver_gb:.1f} ГБ", solver_gb=est.solver_gb),
-        "y+ (оцінка)": f"{yp:.1f}" if yp else "шарів немає",
-        "Перший шар": phys.fmt_len(stack.first_abs) if stack.n_layers else "—",
-        "Стек шарів / погран.шар": (
+        "Domain": tr("{sx:.4g} x {sy:.4g} x {sz:.4g} m", sx=sx, sy=sy, sz=sz),
+        "Background cell": phys.fmt_len(cfg.base_cell),
+        "Surface cell": phys.fmt_len(cfg.surface_cell),
+        "Cells (estimate)": phys.fmt_cells(est.total),
+        "snappy memory": tr("{snappy_peak_gb:.1f} GB", snappy_peak_gb=est.snappy_peak_gb),
+        "solver memory": tr("{solver_gb:.1f} GB", solver_gb=est.solver_gb),
+        "y+ (estimate)": f"{yp:.1f}" if yp else "no layers",
+        "First layer": phys.fmt_len(stack.first_abs) if stack.n_layers else "—",
+        "Layer stack / boundary layer": (
             f"{stack.covers_bl(f.u_inf, f.l_ref, f.nu):.2f}" if stack.n_layers else "—"
         ),
     }

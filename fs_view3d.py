@@ -86,9 +86,9 @@ def window_kind() -> str | None:
 LEVELS = ("gpu", "soft", "vtk", "cpu")
 LEVEL_TEXT = {
     "gpu": "3D: GPU",
-    "soft": "3D: програмний GPU — повільніше",
+    "soft": "3D: software GPU — slower",
     "vtk": "3D: VTK (OpenGL)",
-    "cpu": "3D: CPU без GPU — повільно",
+    "cpu": "3D: CPU without GPU — slow",
 }
 PROBE_VERSION = 2          # змінити, коли міняється сама проба: кеш стане старим
 PROBE_TIMEOUT = 25.0       # с на одного кандидата
@@ -110,7 +110,7 @@ class Level:
         return self.level in ("gpu", "soft", "cpu")
 
     def text(self) -> str:
-        t = LEVEL_TEXT.get(self.level, self.level)
+        t = tr(LEVEL_TEXT.get(self.level, self.level))
         if self.level in ("gpu", "soft") and self.adapter:
             t += f" ({self.adapter}, {self.backend})" if self.backend else f" ({self.adapter})"
         return t
@@ -118,6 +118,10 @@ class Level:
     def as_dict(self) -> dict:
         return {"level": self.level, "backend": self.backend, "adapter": self.adapter,
                 "note": self.note}
+
+    def note_text(self) -> str:
+        """`note` for the person, in the interface language (see note_text)."""
+        return note_text(self.note)
 
     def __repr__(self):
         return f"Level({self.as_dict()})"
@@ -155,7 +159,7 @@ def check_frame(r) -> tuple[bool, str]:
     fg = img[h // 2, w // 2, :3].astype(int)
     ok = (np.abs(bg - _BG).max() < 12) and (np.abs(fg - _FG).max() < 12)
     if not ok:
-        return False, tr("кадр не той: тло {tolist}, центр {tolist2}", tolist=bg.tolist(),
+        return False, tr("wrong frame: background {tolist}, center {tolist2}", tolist=bg.tolist(),
                          tolist2=fg.tolist())
     if hasattr(r, "set_scalar_triangles"):
         # Шар із полем («Результати»): інший шейдер і таблиця кольорів у
@@ -169,7 +173,7 @@ def check_frame(r) -> tuple[bool, str]:
         r.remove("probe")
         fg = img[h // 2, w // 2, :3].astype(int)
         if np.abs(fg - _FG2).max() >= 12:
-            return False, tr("шар із полем не той: центр {tolist}", tolist=fg.tolist())
+            return False, tr("wrong frame of a layer with a field: center {tolist}", tolist=fg.tolist())
     return True, ""
 
 
@@ -199,7 +203,7 @@ def _probe_vtk() -> tuple[bool, str]:
         h, w = img.shape[:2]
         fg = img[h // 2, w // 2, :3].astype(int)
         ok = np.abs(fg - _FG).max() < 20
-        return bool(ok), "OpenGL" if ok else tr("кадр не той: центр {tolist}", tolist=fg.tolist())
+        return bool(ok), "OpenGL" if ok else tr("wrong frame: center {tolist}", tolist=fg.tolist())
     except Exception as exc:                              # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
 
@@ -240,6 +244,30 @@ def _cache_key(adapters: list[dict]) -> str:
     return json.dumps([PROBE_VERSION, ver, sys.platform, rows], ensure_ascii=False)
 
 
+# "ok" of the probe; older versions wrote its translation ("ок").
+_LEGACY_NOTE_OK = ("ok", "ок", "OK")
+
+
+def note_text(note: str) -> str:
+    """A probe note ("<adapter> (<backend>): ok; VTK: ok") for the person.
+
+    The cache file (view3d.json) keeps the note of the probe time. The
+    probe writes "ok" (versions before 2026-11-11 wrote the translation of
+    that time, for example "ок"), so each part is translated here, in the
+    interface language of NOW.
+    """
+    parts = []
+    for part in (note or "").split("; "):
+        head, sep, tail = part.rpartition(": ")
+        if not sep:
+            parts.append(tr(part))
+        elif tail in _LEGACY_NOTE_OK:
+            parts.append(f"{head}: {tr('OK', ctx="status")}")
+        else:
+            parts.append(f"{head}: {tr(tail)}")
+    return "; ".join(p for p in parts if p)
+
+
 def _run_probe(args: list[str]) -> tuple[bool, str]:
     """Проба в дочірньому процесі: падіння чи зависання драйвера не валить
     програму, а GL / OpenGL не чіпає контекст VTK цього процесу."""
@@ -265,14 +293,14 @@ def _run_probe(args: list[str]) -> tuple[bool, str]:
                             errors="replace", timeout=PROBE_TIMEOUT, creationflags=flags,
                             env=env)
     except subprocess.TimeoutExpired:
-        return False, tr("проба зависла (> {PROBE_TIMEOUT:.0f} с)",
+        return False, tr("probe hung (> {PROBE_TIMEOUT:.0f} s)",
                          PROBE_TIMEOUT=PROBE_TIMEOUT)
     except OSError as exc:
-        return False, tr("проба не запустилась: {exc}", exc=exc)
+        return False, tr("probe did not start: {exc}", exc=exc)
     lines = [s for s in cp.stdout.splitlines() if s.startswith("{")]
     if not lines:
         tail = (cp.stderr.strip().splitlines() or ["?"])[-1][:200]
-        return False, tr("проба впала (код {returncode}): {tail}", returncode=cp.returncode,
+        return False, tr("probe crashed (code {returncode}): {tail}", returncode=cp.returncode,
                          tail=tail)
     res = json.loads(lines[-1])
     return bool(res.get("ok")), str(res.get("note", ""))
@@ -287,7 +315,7 @@ def _probe_main(argv: list[str]) -> int:
     else:
         _, lv, be, ad = (argv + ["", "", "", ""])[:4]
         if _fv is None:
-            ok, note = False, "foamview не зібрано"
+            ok, note = False, "foamview is not built"
         else:
             ok, note = _probe_foamview(Level(lv, be or None, ad or None))
     print(json.dumps({"ok": ok, "note": note}, ensure_ascii=False), flush=True)
@@ -322,7 +350,7 @@ def select_level(refresh: bool = False, log=None) -> Level:
         _LEVEL = lv
         return lv
     if _fv is None:
-        _LEVEL = Level("vtk", note="foamview не зібрано")
+        _LEVEL = Level("vtk", note="foamview is not built")
         return _LEVEL
     adapters = _adapters()
     key = _cache_key(adapters)
@@ -350,7 +378,7 @@ def check_graphics(log=None) -> Level:
     """
     say = log or (lambda s: None)
     if _fv is None:
-        return Level("vtk", note="foamview не зібрано")
+        return Level("vtk", note="foamview is not built")
     adapters = _adapters()
     return _probe_chain(adapters, _cache_key(adapters), _cache_path(), say)
 
@@ -376,16 +404,18 @@ def _probe_chain(adapters: list[dict], key: str, path: Path, say) -> Level:
     notes = []
     chosen = None
     for c in candidates(adapters):
-        say(tr("3D: пробую {adapter} ({backend})…", adapter=c.adapter, backend=c.backend))
+        say(tr("3D: trying {adapter} ({backend})…", adapter=c.adapter, backend=c.backend))
         ok, note = _run_probe(["foamview", c.level, c.backend or "", c.adapter or ""])
-        notes.append(f"{c.adapter} ({c.backend}): {tr('ок') if ok else note}")
+        # "ok", not tr('ок'): the cache keeps this note, and note_text()
+        # translates it when it is shown (the language can change).
+        notes.append(f"{c.adapter} ({c.backend}): {'ok' if ok else note}")
         if ok:
             chosen = Level(c.level, c.backend, c.adapter)
             break
     if chosen is None:
-        say("3D: пробую VTK…")
+        say(tr("3D: trying VTK…"))
         ok, note = _run_probe(["vtk"])
-        notes.append(f"VTK: {tr('ок') if ok else note}")
+        notes.append(f"VTK: {'ok' if ok else note}")
         chosen = Level("vtk") if ok else Level("cpu")
     chosen.note = "; ".join(notes)
     try:
@@ -418,7 +448,7 @@ def probe(level: Level | None = None) -> tuple[bool, str]:
     lv = level or Level("gpu")
     k = (lv.level, lv.backend, lv.adapter)
     if k not in _PROBE:
-        _PROBE[k] = ((False, "foamview не зібрано") if _fv is None
+        _PROBE[k] = ((False, "foamview is not built") if _fv is None
                      else _probe_foamview(lv))
     return _PROBE[k]
 
@@ -1589,7 +1619,8 @@ class Plotter:
         elif a.kind == "text":
             # Нові ключі — лише коли потрібні: старий foamview.pyd їх не знає.
             extra = {k: True for k in ("viewport", "right") if st.get(k)}
-            g.set_labels(a.name, st["anchors"], st["texts"], col,
+            g.set_labels(a.name, st["anchors"], [str(tr(t)) for t in st["texts"]],
+                         col,
                          size=int(st.get("size", 14)), screen=bool(st.get("screen")),
                          center=bool(st.get("center")),
                          offset=tuple(st.get("offset", (0.0, 0.0))), **extra)
@@ -1622,7 +1653,7 @@ class Plotter:
             anchors = [(x1, y + h * i / (n - 1), 0.0) for i in range(n)]
             g.set_labels(bar.parts[1], anchors, ticks, col, size=bar.label_size,
                          viewport=True, offset=(4.0, -0.62 * bar.label_size))
-            g.set_labels(bar.parts[2], [(x + w, y + h, 0.0)], [bar.title.rstrip()], col,
+            g.set_labels(bar.parts[2], [(x + w, y + h, 0.0)], [str(tr(bar.title)).rstrip()], col,
                          size=bar.title_size, viewport=True, right=True,
                          offset=(0.0, -1.25 * bar.title_size - 6.0))
         else:
@@ -1634,7 +1665,7 @@ class Plotter:
             anchors = [(x + w * i / (n - 1), y0, 0.0) for i in range(n)]
             g.set_labels(bar.parts[1], anchors, ticks, col, size=bar.label_size,
                          viewport=True, center=True, offset=(0.0, 3.0))
-            g.set_labels(bar.parts[2], [(x + 0.5 * w, y + h, 0.0)], [bar.title.rstrip()], col,
+            g.set_labels(bar.parts[2], [(x + 0.5 * w, y + h, 0.0)], [str(tr(bar.title)).rstrip()], col,
                          size=bar.title_size, viewport=True, center=True,
                          offset=(0.0, -1.25 * bar.title_size - 4.0))
         g.set_scalar_triangles(bar.parts[0], pts, quad, vals, st["lut"], (lo, hi),
@@ -1759,7 +1790,8 @@ class Plotter:
         pts = np.asarray(points, float).reshape(-1, 3)
         name = name or f"labels{len(self.actors)}"
         st = dict(color=text_color, anchors=[tuple(map(float, p)) for p in pts],
-                  texts=[str(t) for t in labels], size=int(font_size * 1.1),
+                  texts=[t if isinstance(t, str) else str(t) for t in labels],
+                  size=int(font_size * 1.1),
                   offset=(8.0, -8.0))
         return self._add(Actor(self, name, pv.PolyData(pts), "text", st))
 
@@ -1781,7 +1813,10 @@ class Plotter:
         name = name or f"text{len(self.actors)}"
         size = int(font_size * 1.3)
         lines = max(1, str(text).count("\n") + 1)
-        st = dict(color=color, texts=[str(text)], size=size)
+        # A TrStr stays a TrStr: the draw translates it into the language of
+        # the moment (a live change of the language, T28).
+        st = dict(color=color, texts=[text if isinstance(text, str)
+                                      else str(text)], size=size)
         if isinstance(position, str) and position in self._CORNERS:
             (x, y), align, edge = self._CORNERS[position]
             st.update(anchors=[(x, y, 0.0)], viewport=True, center=align == "center",

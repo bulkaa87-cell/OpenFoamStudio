@@ -18,6 +18,11 @@ from PySide6 import QtCore, QtWidgets
 
 import fs_live as fl
 from fs_i18n import tr
+import fs_i18n
+
+# The Qt text setters translate and keep the key of each text, also in a
+# widget that is made before the main window (T28).
+fs_i18n.install()
 
 LIVE_STYLE = "color:#d35400; font-weight:bold;"
 
@@ -29,7 +34,7 @@ class LiveBar(QtWidgets.QGroupBox):
     _job_done = QtCore.Signal(str, object, object)     # вид, результат, виняток
 
     def __init__(self, parent=None):
-        super().__init__(tr("Проміжний результат (прогін іде)"), parent)
+        super().__init__(tr("Intermediate result (the run continues)"), parent)
         self._src: fl.Source | None = None
         self._cfg_fn = None
         self._probe: fl.Probe | None = None
@@ -46,25 +51,26 @@ class LiveBar(QtWidgets.QGroupBox):
         self.cmb_times.setSizeAdjustPolicy(
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.cmb_times.setToolTip(tr(
-            "Моменти, які прогін уже записав. «Поверхні» — малі файли, які "
-            "прогін пише сам на кожен запис (тіло й середня площина). «З "
-            "повного зрізу» — програма зробить поверхню тіла з повного "
-            "зрізу на машині прогону (foamToVTK з найнижчим пріоритетом)."))
-        self.btn_refresh = QtWidgets.QPushButton(tr("Оновити список"))
+            "Times that the run has written. \"Surfaces\" are small files "
+            "that the run writes at each write time (the body and the "
+            "mid-plane). \"From the full time step\": the program makes "
+            "the body surface from the full time step on the run machine "
+            "(foamToVTK at the lowest priority)."))
+        self.btn_refresh = QtWidgets.QPushButton(tr("Update the list"))
         self.btn_load = QtWidgets.QPushButton(
-            tr("Завантажити проміжний результат"))
+            tr("Load the intermediate result"))
         self.btn_load.setToolTip(tr(
-            "Забрати вибраний момент і показати його тут. Розвʼязувач це не "
-            "зупиняє і не гальмує: читаються лише вже записані файли."))
-        self.chk_auto = QtWidgets.QCheckBox(tr("оновлювати кожні"))
+            "Get the selected time and show it here. This does not stop "
+            "or slow the solver: the program reads only files that are "
+            "already written."))
+        self.chk_auto = QtWidgets.QCheckBox(tr("update every"))
         self.chk_auto.setToolTip(tr(
-            "Сама забирати й показувати найновіший момент, щойно прогін "
-            "його запише."))
+            "Get and show the newest time automatically when the run writes it."))
         self.spin_min = QtWidgets.QSpinBox()
         self.spin_min.setRange(1, 120)
         self.spin_min.setValue(10)
-        self.spin_min.setSuffix(tr(" хв"))
-        row.addWidget(QtWidgets.QLabel(tr("Момент")))
+        self.spin_min.setSuffix(tr(" min"))
+        row.addWidget(QtWidgets.QLabel(tr("Time", ctx="snapshot")))
         row.addWidget(self.cmb_times, 1)
         row.addWidget(self.btn_refresh)
         row.addWidget(self.btn_load)
@@ -76,15 +82,14 @@ class LiveBar(QtWidgets.QGroupBox):
         self.lbl_state = QtWidgets.QLabel("")
         self.lbl_state.setWordWrap(True)
         self.btn_enable = QtWidgets.QPushButton(
-            tr("Увімкнути поверхні для цього прогону"))
+            tr("Turn on the surfaces for this run"))
         self.btn_enable.setToolTip(tr(
-            "Дописати в system/controlDict прогону функцію, яка на кожен "
-            "запис кладе малу поверхню тіла й середню площину. Розвʼязувач "
-            "підхопить її сам з наступного кроку."))
-        self.btn_final = QtWidgets.QPushButton(tr("Остаточні результати"))
+            "Add a function to system/controlDict of the run. At each "
+            "write time it writes a small body surface and the "
+            "mid-plane. The solver reads it at the next step."))
+        self.btn_final = QtWidgets.QPushButton(tr("Final results"))
         self.btn_final.setToolTip(tr(
-            "Повернутися до результатів, що лежать у кейсі на цьому "
-            "компʼютері."))
+            "Go back to the results in the case on this computer."))
         row2.addWidget(self.lbl_state, 1)
         row2.addWidget(self.btn_enable)
         row2.addWidget(self.btn_final)
@@ -123,7 +128,7 @@ class LiveBar(QtWidgets.QGroupBox):
             self.hide()
             return
         self.show()
-        self._state(tr("Питаю машину прогону, які моменти вже записано…"))
+        self._state(tr("Asking the run machine which times are written…"))
         # Перший запит — не одразу: на старті сценарій ще кладе кейс і
         # будує сітку, а вікно саме зайняте.
         QtCore.QTimer.singleShot(3000, lambda: self.refresh())
@@ -157,11 +162,11 @@ class LiveBar(QtWidgets.QGroupBox):
             i = self.cmb_times.currentData()
             usable = self._probe.usable() if self._probe else []
             if i is None or not 0 <= int(i) < len(usable):
-                self._state(tr("Немає моменту, який можна завантажити."))
+                self._state(tr("There is no time that can be loaded."))
                 return
             lt = usable[int(i)]
         patches = self._patches()
-        self._state(tr("Забираю момент {t}…", t=lt.name))
+        self._state(tr("Getting time {t}…", t=lt.name))
         self._run("fetch", lambda: (lt, src.fetch(lt, patches), explicit))
 
     def enable(self) -> None:
@@ -169,17 +174,18 @@ class LiveBar(QtWidgets.QGroupBox):
         if src is None or cfg is None:
             return
         answer = QtWidgets.QMessageBox.question(
-            self, tr("Увімкнути проміжні поверхні?"),
-            tr("Програма допише у system/controlDict цього прогону дві "
-               "функції (поверхня тіла й середня площина, формат VTK). "
-               "Розвʼязувач перечитує словник сам і почне писати їх з "
-               "наступного запису, разом із полями. Рахунок це не зупиняє: "
-               "кожен запис стане довшим на частку секунди, а файли — кілька "
-               "МБ на момент.\n\nСтарий словник лишиться копією в "
-               "studio/controlDict.before-live.\n\nДописати?"))
+            self, tr("Turn on the intermediate surfaces?"),
+            tr("The program adds two functions to system/controlDict of "
+               "this run (the body surface and the mid-plane, VTK "
+               "format). The solver reads the dictionary again by itself "
+               "and writes them from the next write time, together with "
+               "the fields. This does not stop the run: each write takes "
+               "a fraction of a second more, and the files are a few MB "
+               "for each time.\n\nA copy of the old dictionary stays in "
+               "studio/controlDict.before-live.\n\nAdd them?"))
         if answer != QtWidgets.QMessageBox.Yes:
             return
-        self._state(tr("Дописую функції в controlDict…"))
+        self._state(tr("Adding the functions to controlDict…"))
         self._run("enable", lambda: src.enable(cfg))
 
     def _final(self) -> None:
@@ -210,19 +216,19 @@ class LiveBar(QtWidgets.QGroupBox):
         if self._src is None:
             return
         if err is not None:
-            self._state(tr("Не вийшло: {err}", err=err), bad=True)
+            self._state(tr("Failed: {err}", err=err), bad=True)
             return
         if kind == "probe":
             self._take_probe(res)
         elif kind == "auto":
             self._on_auto(res)
         elif kind == "enable":
-            msg = {"added": tr("Функції дописано. Поверхні з'являться з "
-                               "наступного запису."),
-                   "present": tr("Функції вже стоять у словнику цього "
-                                 "прогону.")}.get(res, tr(
-                       "Не вдалося дописати: у system/controlDict немає "
-                       "блоку functions."))
+            msg = {"added": tr("The functions are added. The surfaces "
+                               "come from the next write time."),
+                   "present": tr("The functions are already in the "
+                                 "dictionary of this run.")}.get(res, tr(
+                       "Cannot add them: system/controlDict has no "
+                       "functions block."))
             self._state(msg, bad=res not in ("added", "present"))
             self.refresh()
         elif kind == "fetch":
@@ -232,8 +238,8 @@ class LiveBar(QtWidgets.QGroupBox):
             self._shown = lt.time
             self.btn_final.show()
             mb = stats.get("bytes", 0) / 1e6
-            self._state(tr("Показано ПРОМІЖНИЙ результат: {what}. "
-                           "Забрано {mb:.1f} МБ за {s:.1f} с.",
+            self._state(tr("This is an INTERMEDIATE result: {what}. Got "
+                           "{mb:.1f} MB in {s:.1f} s.",
                            what=fl.label(lt, self._steady()), mb=mb,
                            s=stats.get("seconds", 0.0)), live=True)
             cfg = self._run_cfg or fl.run_cfg(
@@ -262,25 +268,25 @@ class LiveBar(QtWidgets.QGroupBox):
         if self._shown is not None:
             return
         if not pr.ok:
-            self._state(tr("Не вдалося запитати машину прогону: {why}",
+            self._state(tr("Cannot ask the run machine: {why}",
                            why=pr.why), bad=True)
         elif any(t.surface for t in usable):
-            self._state(tr("Записано моментів: {n}. Виберіть і натисніть "
-                           "«Завантажити».", n=len(usable)))
+            self._state(tr("Times written: {n}. Select one and click \"Load\".", n=len(usable)))
         elif pr.has_fo:
-            self._state(tr("Поверхні з'являться після наступного запису "
-                           "прогону."))
+            self._state(tr("The surfaces come after the next write of the run."))
         elif usable:
-            self._state(tr("Цей прогін пущено без проміжних поверхонь. Можна "
-                           "зробити поверхню тіла з повного зрізу (повільніше) "
-                           "або ввімкнути поверхні для наступних записів."))
+            self._state(tr("This run started without the intermediate "
+                           "surfaces. You can make the body surface from "
+                           "a full time step (slower), or turn on the "
+                           "surfaces for the next write times."))
         elif pr.distributed:
-            self._state(tr("Прогін розподілений між машинами і пущений без "
-                           "проміжних поверхонь: повні зрізи лежать на інших "
-                           "машинах. Увімкніть поверхні — вони з'являться з "
-                           "наступного запису."))
+            self._state(tr("The run is distributed over machines and "
+                           "started without the intermediate surfaces: "
+                           "the full time steps are on the other "
+                           "machines. Turn on the surfaces: they come "
+                           "from the next write time."))
         else:
-            self._state(tr("Прогін ще не записав жодного моменту."))
+            self._state(tr("The run has not written a time yet."))
 
     # --- автооновлення -------------------------------------------------
 
@@ -345,12 +351,12 @@ class LiveBar(QtWidgets.QGroupBox):
 
     def _state(self, text: str, bad: bool = False, live: bool = False) -> None:
         stamp = time.strftime("%H:%M")
-        self.lbl_state.setText(f"{stamp}  {text}")
+        self.lbl_state.setText(stamp + "  " + text)    # "+" keeps the key
         self.lbl_state.setStyleSheet(
             "color:#c0392b;" if bad else LIVE_STYLE if live else "")
 
 
 def banner(lt: "fl.LiveTime", steady: bool) -> str:
     """Перший рядок під екраном, поки показано проміжний результат."""
-    return tr("⚠ ПРОМІЖНИЙ РЕЗУЛЬТАТ, не остаточний: {what}. Прогін ще "
-              "йде, дані зміняться.", what=fl.label(lt, steady))
+    return tr("⚠ INTERMEDIATE RESULT, not the final one: {what}. The run "
+              "continues, and the data will change.", what=fl.label(lt, steady))

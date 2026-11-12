@@ -38,28 +38,38 @@ import fs_live
 import fs_livebar
 import fs_backend as be
 import fs_case as fc
+import fs_crashlog as crashlog
 import fs_geometry as geo
 import fs_i18n
+import fs_icons
 import fs_library as lib
 import fs_memfit as memfit
 import fs_meshlock as meshlock
 import fs_meshfix as meshfix
+import fs_repair
 import fs_panels as panels
 import fs_physics as phys
 import fs_settings as fset
 import fs_settingsdlg
+import fs_serverwiz
+import fs_restart
 import fs_post as post
 import fs_slicebar as slicebar
 import fs_statusbar as sbar
 import fs_views as fv
-import fs_winfix as winfix
 import fs_yplus as fy
 from fs_i18n import tr
 
-APP_DIR = Path(__file__).resolve().parent
+import fs_paths
+
+# Program files (help pages): read only in an installed copy.
+APP_DIR = fs_paths.program_dir()
+# Cases, projects, session: next to the program in a source copy,
+# Documents/OpenFOAM Studio in an installed copy (fs_paths).
+DATA_DIR = fs_paths.data_dir()
 # Рядок журналу: почалося повернення результатів (індикатор «не вимикайте»).
-FETCH_MARK = "===== повернення результатів на диск Windows ====="
-DEFAULT_CASES = APP_DIR / "cases"
+FETCH_MARK = "===== copying results back to the Windows disk ====="
+DEFAULT_CASES = DATA_DIR / "cases"
 
 # Куди складаємо дрібні налаштування вікна (реєстр Windows). Виділено в
 # константи, щоб тести могли взяти власну область і не лізти в справжні
@@ -105,18 +115,20 @@ COL_ROTOR_AXIS = "#a855f7"  # вісь обертання вибраного г�
 # гадати, що означає рожеве на моделі, і відразу бачити, чого саме в цій
 # моделі бракує.
 PROBLEM_LAYERS = {
-    "holes": ("Дірки", COL_HOLE,
-              "Відкриті ребра. Дірка, більша за комірку, стає каналом "
-              "усередину тіла. Закриває «Полагодити» (метод meshfix)."),
-    "flip": ("Вивернуті", COL_FLIP,
-             "Грані частин, що дивляться нормалями всередину. Ламають "
-             "перевірки «всередині/зовні» у snappy. Розвертає «Полагодити»."),
+    "holes": ("Holes", COL_HOLE,
+              "Open edges. A hole larger than a cell becomes a channel "
+              "into the body. “Repair” closes it (meshfix method)."),
+    "flip": ("Flipped", COL_FLIP,
+             "Faces of parts whose normals point inward. They break the "
+             "“inside/outside” checks in snappy. “Repair” flips them "
+             "back."),
     "nm": ("Non-manifold", COL_NM,
-           "Ребра, які ділять понад два трикутники — сліди врізання деталей "
-           "одна в одну. Castellation це стерпить; кромки лагодить "
-           "includedAngle 170 або булеве обʼєднання в CAD."),
-    "degen": ("Вироджені", COL_DEGEN,
-              "Трикутники нульової площі. Прибирає «Полагодити»."),
+           "Edges shared by more than two triangles — traces of parts "
+           "that cut into each other. Castellation tolerates this; "
+           "feature edges are fixed by includedAngle 170 or a Boolean "
+           "union in CAD."),
+    "degen": ("Degenerate", COL_DEGEN,
+              "Triangles with zero area. “Repair” removes them."),
 }
 
 _LAYER_STYLE = {
@@ -267,7 +279,7 @@ class Part:
 
     @property
     def name(self) -> str:
-        return Path(self.path).name or self.path or "модель"
+        return Path(self.path).name or self.path or tr("model")
 
     def angle_at(self, channels) -> float:
         """Кут відхилення цієї деталі при даному положенні стіків."""
@@ -473,7 +485,7 @@ class PlotView(QtWidgets.QWidget):
                                  QtWidgets.QSizePolicy.Ignored)
 
         bar = QtWidgets.QHBoxLayout()
-        self.btn_save = QtWidgets.QPushButton("Зберегти графік…")
+        self.btn_save = QtWidgets.QPushButton("Save Plot…")
         self.btn_save.clicked.connect(self._save)
         bar.addWidget(self.btn_save)
         bar.addStretch(1)
@@ -489,7 +501,7 @@ class PlotView(QtWidgets.QWidget):
 
     def _save(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Зберегти графік", "convergence.png", "PNG (*.png)")
+            self, tr("Save Plot"), "convergence.png", "PNG (*.png)")
         if path:
             self.fig.savefig(path, dpi=150)
 
@@ -512,17 +524,17 @@ class PlotView(QtWidgets.QWidget):
         # сама колонка «Time» в логу, але підпис «ітерація» над секундами
         # збивав би з пантелику, а заголовок «Збіжність» над нестаціонаром —
         # тим паче: там ніщо не сходиться, розрахунок просто йде далі.
-        axis = "ітерація" if self._steady else "час, с"
+        axis = tr("iteration") if self._steady else tr("time, s")
         self.ax_res.set_yscale("log")
         self.ax_res.set_xlabel(axis)
-        self.ax_res.set_ylabel("початковий резидуал")
+        self.ax_res.set_ylabel(tr("initial residual"))
         self.ax_res.grid(True, which="both", alpha=0.25)
-        self.ax_res.set_title("Збіжність" if self._steady else "Резидуали",
+        self.ax_res.set_title(tr("Convergence") if self._steady else tr("Residuals"),
                               fontsize=10)
         self.ax_co.set_xlabel(axis)
-        self.ax_co.set_ylabel("коефіцієнт")
+        self.ax_co.set_ylabel(tr("coefficient"))
         self.ax_co.grid(True, alpha=0.25)
-        self.ax_co.set_title("Аеродинамічні коефіцієнти", fontsize=10)
+        self.ax_co.set_title(tr("Aerodynamic coefficients"), fontsize=10)
 
     def set_steady(self, steady: bool) -> None:
         if steady != self._steady:
@@ -610,16 +622,16 @@ class Viewport(QtWidgets.QWidget):
         bar.setContentsMargins(6, 2, 6, 4)
         self.chk = {}
         for key, label, default in (
-            ("body", "Модель", True),
-            ("holes", "Дірки", True),
-            ("flip", "Вивернуті", True),
+            ("body", "Model", True),
+            ("holes", "Holes", True),
+            ("flip", "Flipped", True),
             ("nm", "Non-manifold", False),
-            ("degen", "Вироджені", True),
-            ("domain", "Домен", True),
-            ("box", "Згущення", True),
-            ("point", "Точка в потоці", True),
-            ("flow", "Напрямок потоку", True),
-            ("ruler", "Лінійка", False),
+            ("degen", "Degenerate", True),
+            ("domain", "Domain", True),
+            ("box", "Refinement", True),
+            ("point", "Point in Flow", True),
+            ("flow", "Flow Direction", True),
+            ("ruler", "Ruler", False),
         ):
             c = QtWidgets.QCheckBox(label)
             c.setChecked(default)
@@ -636,27 +648,27 @@ class Viewport(QtWidgets.QWidget):
             self._label[key] = label
         for key in PROBLEM_LAYERS:
             self.set_problem(key, 0, "")
-        for label, view in (("Ізо", "iso"), ("X", "yz"), ("Y", "xz"), ("Z", "xy")):
+        for label, view in (("Iso", "iso"), ("X", "yz"), ("Y", "xz"), ("Z", "xy")):
             b = QtWidgets.QPushButton(label)
             b.setFixedWidth(38)
             b.clicked.connect(lambda _=False, v=view: self.set_view(v))
             bar.addWidget(b)
-        self.btn_spot = QtWidgets.QPushButton("До проблеми ▸")
+        self.btn_spot = QtWidgets.QPushButton("Next Problem ▸")
         self.btn_spot.setToolTip(
-            "Підлетіти до наступної дірки, вивернутої деталі чи виродженого "
-            "трикутника — найбільші спершу")
+            "Fly to the next hole, flipped part or degenerate triangle — "
+            "largest first")
         self.btn_spot.setEnabled(False)
         bar.addWidget(self.btn_spot)
         # Колись тут було «Модель» — так само, як галочка зліва, що ховає
         # тіло. Дві різні речі під одним словом в одній смузі.
-        self.btn_fit = QtWidgets.QPushButton("До моделі")
+        self.btn_fit = QtWidgets.QPushButton("Fit to model")
         self.btn_fit.setToolTip(
-            "Камера — до моделі в УСІХ вʼюпортах: і тут, і в результатах. "
-            "Бік, з якого ви дивитесь, лишається. Ctrl+0")
+            "Camera fits the model in ALL viewports: both here and in "
+            "the results. The side you look from stays the same. Ctrl+0")
         self.btn_fit.clicked.connect(lambda: self.to_model_requested.emit())
         bar.addWidget(self.btn_fit)
-        self.btn_fit_all = QtWidgets.QPushButton("Усе")
-        self.btn_fit_all.setToolTip("Вписати в кадр увесь домен")
+        self.btn_fit_all = QtWidgets.QPushButton("All")
+        self.btn_fit_all.setToolTip("Fit the whole domain in the view")
         self.btn_fit_all.clicked.connect(self.fit_all)
         bar.addWidget(self.btn_fit_all)
         lay.addWidget(bar_box)
@@ -696,7 +708,7 @@ class Viewport(QtWidgets.QWidget):
     def _set_level(self, lv):
         self.level = lv
         self.backend_note = lv.note
-        self.level_changed.emit(lv.text(), lv.note)
+        self.level_changed.emit(lv.text(), lv.note_text())
 
     def _level_changed(self, lv):
         """Віджет сам перейшов на CPU (GPU відмовив під час роботи)."""
@@ -786,7 +798,7 @@ class Viewport(QtWidgets.QWidget):
         for p1, p2, title in rulers:
             try:
                 actors.append(self.plotter.add_ruler(
-                    p1, p2, title=title, font_size_factor=0.5,
+                    p1, p2, title=tr(title), font_size_factor=0.5,
                     label_format="%.3g", number_labels=5))
             except Exception:
                 pass
@@ -960,14 +972,15 @@ class Viewport(QtWidgets.QWidget):
         label, colour, advice = PROBLEM_LAYERS[key]
         if count:
             chk.setEnabled(True)
-            chk.setText(f"{label} {count:,}".replace(",", " "))
+            chk.setText(tr("{label} {count}", label=label,
+                           count=f"{count:,}".replace(",", " ")))
             chk.setStyleSheet(f"color:{colour}; font-weight:bold;")
             chk.setToolTip(advice)
         else:
             chk.setEnabled(False)
             chk.setText(label)
             chk.setStyleSheet("color:#6b7278;")
-            chk.setToolTip(tr("{label}: у цій моделі такого немає", label=label))
+            chk.setToolTip(tr("{label}: this model does not have it", label=label))
 
     def mark_spot(self, centre, radius: float):
         """Ставить помітну кулю там, куди щойно підлетіли.
@@ -999,7 +1012,7 @@ class Viewport(QtWidgets.QWidget):
             return
         self.actors["result"] = self.plotter.add_mesh(
             mesh, scalars=field, cmap=cmap, smooth_shading=True,
-            scalar_bar_args=dict(title=field, n_labels=5, fmt="%.3g"),
+            scalar_bar_args=dict(title=tr(field), n_labels=5, fmt="%.3g"),
             name="result", reset_camera=False)
         self.plotter.render()
 
@@ -1179,14 +1192,14 @@ class GeometryLoader(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            self.step.emit("Читаю файл…")
+            self.step.emit(tr("Reading file…"))
             mesh = geo.load_surface(self.path)
             if mesh.n_cells == 0:
-                self.failed.emit("У файлі немає трикутників.")
+                self.failed.emit(tr("The file has no triangles."))
                 return
             self.step.emit(
-                tr("Перевіряю геометрію ({n_cells} "
-                "трикутників): дірки, вивернуті грані, мідель…", n_cells=phys.fmt_cells(mesh.n_cells)))
+                tr("Checking the geometry ({n_cells} triangles): holes, "
+                   "flipped faces, maximum cross-section…", n_cells=phys.fmt_cells(mesh.n_cells)))
             factor, why = geo.guess_scale(mesh)
             diag = geo.diagnose(geo.apply_scale(mesh, factor))
             self.ready.emit(mesh, factor, why, diag)
@@ -1269,6 +1282,9 @@ class RunWorker(QtCore.QObject):
     line = QtCore.Signal(str)
     step = QtCore.Signal(str, int, int)
     done = QtCore.Signal(bool, str)
+    # (name, value): "detached" (the run lives on the server), "fetch"
+    # (results are copied back). The window does not match log texts.
+    event = QtCore.Signal(str, str)
 
     def __init__(self, backend, case_dir, steps, native_dir=None,
                  sync_back=False, name="", stop_on_bad_mesh=True,
@@ -1312,6 +1328,7 @@ class RunWorker(QtCore.QObject):
                     tail_lines(text, LogView.MAX_BLOCKS)),
                 on_step=lambda n, i, t: self.step.emit(n, i, t),
                 on_done=self._finish,
+                on_event=self.event.emit,
                 native_dir=self.native_dir,
                 stop_on_bad_mesh=self.stop_on_bad_mesh,
             )
@@ -1333,9 +1350,19 @@ class RunWorker(QtCore.QObject):
             self.done.emit(False, traceback.format_exc(limit=3))
 
     def _finish(self, ok, msg):
+        # The window let the run go (leave() at close): the run continues on
+        # the server. Do not copy back. sync_from_ssh first deletes the local
+        # results and then downloads the whole case; at close this ran in
+        # this thread after closeEvent stopped waiting, and the end of the
+        # process destroyed the still running QThread (qFatal, c0000409 in
+        # Qt6Core.dll, T26).
+        if self.runner is not None and getattr(self.runner, "left", False):
+            self.done.emit(ok, msg)
+            return
         if self.native_dir and self.sync_back:
             self.line.emit("")
-            self.line.emit(FETCH_MARK)
+            self.line.emit(tr(FETCH_MARK))
+            self.event.emit("fetch", "")
             try:
                 if self.backend.kind == "ssh":
                     be.sync_from_ssh(self.backend, self.native_dir,
@@ -1344,7 +1371,7 @@ class RunWorker(QtCore.QObject):
                     be.sync_from_wsl(self.backend, self.native_dir,
                                      self.case_dir)
             except Exception as exc:
-                self.line.emit(tr("не вдалося скопіювати назад: {exc}", exc=exc))
+                self.line.emit(tr("could not copy back: {exc}", exc=exc))
         self.done.emit(ok, msg)
 
     def stop(self):
@@ -1353,7 +1380,7 @@ class RunWorker(QtCore.QObject):
 
     def soft_stop(self) -> tuple[bool, str]:
         if not self.runner:
-            return (False, "прогону немає")
+            return (False, tr("no run"))
         return self.runner.soft_stop()
 
     def leave(self) -> bool:
@@ -1386,11 +1413,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # Старі значення з QSettings і session.json переносимо один раз.
         # До fs_i18n: мова інтерфейсу — теж налаштування.
         fset.bind_qsettings(SETTINGS_ORG, SETTINGS_APP)
-        fset.migrate(APP_DIR)
+        fset.migrate(DATA_DIR)
         be.MESH_KEEP = fset.get("mesh_keep")
         fs_i18n.install()       # the interface language (before any widget)
         super().__init__()
-        self.setWindowTitle("OpenFOAM Studio — зовнішня аеродинаміка")
+        self.setWindowTitle("OpenFOAM Studio — external aerodynamics")
+        self.setWindowIcon(fs_icons.icon(fs_icons.OFS))
         self.resize(1560, 950)
 
         self.cfg = fc.CaseCfg()
@@ -1544,6 +1572,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_session.toggled.connect(
             lambda on: fset.set("restore_session", on))
         fset.subscribe(self._setting_changed)
+        # A new language in «Файл → Налаштування» changes the interface at
+        # once (T28): fs_i18n translates each widget again from its key,
+        # and retranslate_ui makes the texts that are composed from parts.
+        fs_i18n.on_language_changed(self.language_changed)
         self.destroyed.connect(
             lambda _=None, fn=self._setting_changed: fset.unsubscribe(fn))
         geometry = store.value("geometry")
@@ -1577,8 +1609,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.detect_backends()
             else:
                 self.statusBar().showMessage(
-                    "Машини на старті не перевіряються (Файл → Налаштування). "
-                    "Щоб знайти OpenFOAM, натисніть «Пошук» на вкладці «Запуск».",
+                    tr("The program does not find the machines at start "
+                    "(File → Settings). To find OpenFOAM, click «Search» "
+                    "on the «Run» tab."),
                     10000)
         finally:
             # Ті самі кроки й той самий порядок, що й раніше: пошук завжди
@@ -1669,14 +1702,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tabs_left = QtWidgets.QTabWidget()
         for w, name in (
-            (self.panel_geo, "Геометрія"),
-            (self.panel_dom, "Домен"),
-            (self.panel_mesh, "Сітка"),
-            (self.panel_flow, "Потік"),
-            (self.panel_solve, "Розвʼязувач"),
-            (self.panel_tx, "Пульт"),
-            (self.panel_adv, "Помічник"),
-            (self.panel_run, "Запуск"),
+            (self.panel_geo, "Geometry"),
+            (self.panel_dom, "Domain"),
+            (self.panel_mesh, "Mesh"),
+            (self.panel_flow, "Flow"),
+            (self.panel_solve, "Solver"),
+            (self.panel_tx, "Controls"),
+            (self.panel_adv, "Assistant"),
+            (self.panel_run, "Run"),
         ):
             scroll = QtWidgets.QScrollArea()
             scroll.setWidgetResizable(True)
@@ -1700,10 +1733,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tabs_right = QtWidgets.QTabWidget()
         self.tabs_right.addTab(self.viewport, "3D")
-        self.tabs_right.addTab(self.log, "Журнал")
-        self.tabs_right.addTab(self.plots, "Збіжність")
-        self.tabs_right.addTab(self.results_view, "Результати")
-        self.tabs_right.addTab(self.panel_lib, "Збережені")
+        self.tabs_right.addTab(self.log, "Log")
+        self.tabs_right.addTab(self.plots, "Convergence")
+        self.tabs_right.addTab(self.results_view, "Results")
+        self.tabs_right.addTab(self.panel_lib, "Saved")
 
         self.split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.split.addWidget(self.tabs_left)
@@ -1712,137 +1745,151 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.split)
 
         bar = self.menuBar()
-        file_menu = bar.addMenu("Файл")
+        file_menu = bar.addMenu("File")
 
-        act = QtGui.QAction("Відкрити STL…", self)
+        act = QtGui.QAction("Open STL…", self)
         act.setShortcut("Ctrl+O")
         act.triggered.connect(self.open_stl)
         file_menu.addAction(act)
 
-        act = QtGui.QAction("Зберегти проєкт…", self)
+        act = QtGui.QAction("Save Project…", self)
         act.setShortcut("Ctrl+Shift+S")
-        act.setStatusTip("Один файл, у якому ВСЕ: геометрія кожної деталі "
-                         "як вона є в сцені, ролі, оберти, осі, завіси й "
-                         "усі налаштування. Без сітки (крім зафіксованої "
-                         "сітки з проєкту)")
+        act.setStatusTip("One file that holds EVERYTHING: the geometry "
+                         "of each part as it is in the scene, roles, "
+                         "rotations, axes, hinges and all settings. "
+                         "Without the mesh (except a locked mesh from "
+                         "the project)")
         act.triggered.connect(lambda: self.save_project())
         file_menu.addAction(act)
 
-        self.act_save_mesh = QtGui.QAction("Зберегти проєкт із сіткою…", self)
+        self.act_save_mesh = QtGui.QAction("Save Project with Mesh…", self)
         self.act_save_mesh.setStatusTip(
-            "Проєкт разом із готовою сіткою (стиснена). Відкритий, він бере "
-            "цю сітку замість snappyHexMesh, а поля, що змінюють сітку, "
-            "замкнені")
+            "The project together with the finished mesh (compressed). "
+            "When opened, it uses this mesh instead of snappyHexMesh, "
+            "and the fields that change the mesh are locked")
         self.act_save_mesh.triggered.connect(self.save_project_with_mesh)
         file_menu.addAction(self.act_save_mesh)
         file_menu.setToolTipsVisible(True)
         file_menu.aboutToShow.connect(self._update_mesh_menu)
 
-        act = QtGui.QAction("Відкрити проєкт…", self)
-        act.setStatusTip("Повернути сцену такою, якою її зберегли")
+        act = QtGui.QAction("Open Project…", self)
+        act.setStatusTip("Restore the scene as it was saved")
         act.triggered.connect(self.open_project)
         file_menu.addAction(act)
 
-        act = QtGui.QAction("Тека для проєктів…", self)
-        act.setStatusTip("Куди проєкти лягають за замовчуванням: сюди пише "
-                         "автозбереження перед прогоном, звідси ж починається "
-                         "вікно «Зберегти проєкт»")
+        act = QtGui.QAction("Projects Folder…", self)
+        act.setStatusTip("Where projects go by default: autosave before "
+                         "a run writes here, and the “Save Project” "
+                         "window starts here")
         act.triggered.connect(self.choose_projects_dir)
         file_menu.addAction(act)
         file_menu.addSeparator()
 
-        act = QtGui.QAction("Зберегти геометрію як STL…", self)
-        act.setStatusTip("Записати те, що зараз у сцені — уже в метрах, "
-                         "розвернуте й полагоджене")
+        act = QtGui.QAction("Save Geometry as STL…", self)
+        act.setStatusTip("Write what is in the scene now — already in "
+                         "meters, rotated and repaired")
         act.triggered.connect(self.save_geometry)
         file_menu.addAction(act)
         file_menu.addSeparator()
 
-        act = QtGui.QAction("Зберегти налаштування…", self)
+        act = QtGui.QAction("Save Settings…", self)
         act.setShortcut("Ctrl+S")
-        act.setStatusTip("Усі налаштування окремим файлом — перенести на іншу "
-                         "машину або тримати як заготовку")
+        act.setStatusTip("All settings in a separate file — to move to "
+                         "another machine or to keep as a template")
         act.triggered.connect(self.save_settings)
         file_menu.addAction(act)
 
-        act = QtGui.QAction("Відкрити налаштування…", self)
+        act = QtGui.QAction("Open Settings…", self)
         act.setShortcut("Ctrl+Shift+O")
-        act.setStatusTip("Приймає і файл налаштувань, і studio.json "
-                         "будь-якого кейсу")
+        act.setStatusTip("Accepts both a settings file and the "
+                         "studio.json of any case")
         act.triggered.connect(self.load_settings)
         file_menu.addAction(act)
 
-        act = QtGui.QAction("Скинути налаштування", self)
-        act.setStatusTip("Повернути всі налаштування до типових. Геометрія "
-                         "в сцені лишається на місці")
+        act = QtGui.QAction("Reset Settings", self)
+        act.setStatusTip("Return all settings to the defaults. The "
+                         "geometry in the scene stays in place")
         act.triggered.connect(self.reset_settings)
         file_menu.addAction(act)
         file_menu.addSeparator()
 
-        self.act_session = QtGui.QAction("Відновлювати останню сесію", self)
+        self.act_session = QtGui.QAction("Restore the last session", self)
         self.act_session.setCheckable(True)
         self.act_session.setStatusTip(
-            "Після запуску повертати налаштування, геометрію і кейс, з якими "
-            "закрили програму")
+            "At start, restore the settings, the geometry and the case "
+            "that were open when you closed the program")
         file_menu.addAction(self.act_session)
 
-        act = QtGui.QAction("Відновити зараз", self)
+        act = QtGui.QAction("Restore Now", self)
         act.setShortcut("F4")
         act.triggered.connect(self.restore_session)
         file_menu.addAction(act)
         file_menu.addSeparator()
 
-        act = QtGui.QAction("Вийти", self)
+        act = QtGui.QAction("Exit", self)
         act.setShortcut("Ctrl+Q")
         act.triggered.connect(self.close)
-        self.act_settings = QtGui.QAction("Налаштування…", self)
+        self.act_settings = QtGui.QAction("Settings…", self)
         self.act_settings.setShortcut("Ctrl+,")
         self.act_settings.setMenuRole(QtGui.QAction.PreferencesRole)
         self.act_settings.setStatusTip(
-            "Налаштування програми: мова, теки, машини, 3D, сітка")
+            "Program settings: language, folders, machines, 3D, mesh")
         self.act_settings.triggered.connect(self.open_settings)
         file_menu.addAction(self.act_settings)
+        self.act_server_wizard = QtGui.QAction("Set up a server…", self)
+        self.act_server_wizard.setStatusTip(
+            "Connect a calculation server: Tailscale, SSH key, OpenFOAM check")
+        self.act_server_wizard.triggered.connect(self.open_server_wizard)
+        file_menu.addAction(self.act_server_wizard)
         file_menu.addSeparator()
         file_menu.addAction(act)
 
-        view_menu = bar.addMenu("Вигляд")
+        view_menu = bar.addMenu("View")
 
-        self.act_to_model = QtGui.QAction("До моделі", self)
+        self.act_to_model = QtGui.QAction("Fit to model", self)
         self.act_to_model.setShortcut("Ctrl+0")
         self.act_to_model.setStatusTip(
-            "Камера в усіх вʼюпортах — до моделі: і в 3D, і в результатах. "
-            "Бік, з якого ви дивитесь, лишається")
+            "Camera fits the model in all viewports: both in 3D and in "
+            "the results. The side you look from stays the same")
         self.act_to_model.triggered.connect(self.to_model)
         view_menu.addAction(self.act_to_model)
 
-        help_menu = bar.addMenu("Довідка")
+        help_menu = bar.addMenu("Help")
+        self._help_menu = help_menu
 
-        self.act_rookie = QtGui.QAction("Режим новачка", self)
+        self.act_rookie = QtGui.QAction("Beginner mode", self)
         self.act_rookie.setCheckable(True)
         self.act_rookie.setShortcut("F2")
         self.act_rookie.setStatusTip(
-            "Пояснення до кожного налаштування: що це, на що впливає і що "
-            "буде, якщо перегнути")
+            "An explanation for each setting: what it is, what it "
+            "affects and what happens if you overdo it")
         self.act_rookie.toggled.connect(self.set_rookie)
         help_menu.addAction(self.act_rookie)
         help_menu.addSeparator()
 
-        act = QtGui.QAction("Настанова: мешінг і розрахунок", self)
+        act = QtGui.QAction("Guide: Meshing and Solving", self)
         act.setShortcut("F1")
         act.triggered.connect(self.open_manual)
         help_menu.addAction(act)
 
-        act = QtGui.QAction("Словник термінів і формул", self)
+        act = QtGui.QAction("Install and server guide", self)
+        act.setStatusTip("Install the program, connect a server through "
+                         "Tailscale, and what to do when the connection hangs")
+        act.triggered.connect(self.open_install_guide)
+        help_menu.addAction(act)
+
+        act = QtGui.QAction("Glossary of Terms and Formulas", self)
         act.setShortcut("F5")
-        act.setStatusTip("Що означають Cd, Aref, y+, перекіс… і як із "
-                         "коефіцієнтів виходять сили — у браузері")
+        act.setStatusTip("What Cd, Aref, y+, skewness… mean and how "
+                         "forces come from the coefficients — in the "
+                         "browser")
         act.triggered.connect(self.open_glossary)
         help_menu.addAction(act)
 
-        act = QtGui.QAction("Збережені симуляції", self)
+        act = QtGui.QAction("Saved Simulations", self)
         act.setShortcut("F3")
-        act.setStatusTip("Список кейсів у каталозі: налаштування, результати, "
-                         "порівняння")
+        act.setStatusTip("List of cases in the folder: settings, "
+                         "results, comparison")
         act.triggered.connect(self.show_library)
         help_menu.addAction(act)
 
@@ -1863,13 +1910,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # сервері. Раніше це був лише рядок посеред журналу, і питання «коли
         # можна вимикати?» доводилося ставити вголос.
         self.lbl_detached = sbar.StatusText(
-            "✔ Прогін живе на сервері — ноут можна вимикати")
+            "✔ The run lives on the server — you can turn off the laptop")
         self.lbl_detached.setStyleSheet("color:#7ee787; font-weight:600;")
         self.lbl_detached.setToolTip(
-            "Вивантаження кейсу закінчилось, і сервер рахує сам. Закрийте "
-            "програму хрестиком (не «Зупинити») або просто вимкніть ноут. "
-            "Потім: «Підключитися» — і журнал, графіки й результати "
-            "підтягнуться.")
+            "The case upload is complete, and the server runs on its "
+            "own. Close the program with the X button (not “Stop”) or "
+            "just turn off the laptop. Later: “Connect” — and the log, "
+            "plots and results will load.")
         self.lbl_detached.setVisible(False)
         self.statusBar().addPermanentWidget(self.lbl_detached)
         # Хто малює «3D»: щоб було видно, коли працює повільний запасний
@@ -1888,16 +1935,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewport.level_changed.connect(self._show_3d_level)
         lv = getattr(self.viewport, "level", None)
         if lv is not None:
-            self._show_3d_level(lv.text(), lv.note)
+            self._show_3d_level(lv.text(), lv.note_text())
 
     def _show_3d_level(self, text: str, note: str):
         self.lbl_3d.setText(text)
         slow = not text.startswith(("3D: GPU", "3D: VTK"))
         self.lbl_3d.setStyleSheet("color:#f0b429; font-weight:600;" if slow else "")
         self.lbl_3d.setToolTip(
-            tr("Хто малює вкладку «3D». Порядок: GPU → програмний GPU → "
-               "VTK → CPU; вибір запамʼятовується для цього компʼютера. "
-               "Примусово: змінна середовища FS_3D=gpu|soft|vtk|cpu.{v}", v=f"\n\n{note}" if note else ""))
+            tr("What draws the “3D” tab. Order: GPU → software GPU → VTK "
+               "→ CPU; the choice is remembered for this computer. To "
+               "force one: environment variable "
+               "FS_3D=gpu|soft|vtk|cpu.{v}", v=f"\n\n{note}" if note else ""))
 
     def _build_results_tab(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
@@ -1905,26 +1953,28 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.setContentsMargins(6, 6, 6, 6)
 
         bar = QtWidgets.QHBoxLayout()
-        self.btn_load_res = QtWidgets.QPushButton("Завантажити результати")
+        self.btn_load_res = QtWidgets.QPushButton("Download Results")
         self.cmb_time = QtWidgets.QComboBox()
-        self.cmb_field = QtWidgets.QComboBox()
-        self.btn_paraview = QtWidgets.QPushButton("Відкрити в ParaView")
+        # Items: the field (an array name, or a key of fv.BODY_FIELDS) is
+        # the item data; the person sees its translated title.
+        self.cmb_field = panels.ValueCombo()
+        self.btn_paraview = QtWidgets.QPushButton("Open in ParaView")
         # Через лямбду: clicked передає перший аргумент checked, і він
         # приїхав би замість шляху до кейсу.
         self.btn_paraview.clicked.connect(lambda: self.open_in_paraview())
         bar.addWidget(self.btn_load_res)
         bar.addWidget(self.btn_paraview)
-        bar.addWidget(QtWidgets.QLabel("Час"))
+        bar.addWidget(QtWidgets.QLabel("Time"))
         bar.addWidget(self.cmb_time)
-        bar.addWidget(QtWidgets.QLabel("Поле на тілі"))
+        bar.addWidget(QtWidgets.QLabel("Field on Body"))
         bar.addWidget(self.cmb_field)
         bar.addStretch(1)
         # Тут, а не лише в меню: саме на цій вкладці стоять Cd, Cl і Cp, і
         # саме тут питають, що вони означають і як із них вийде сила.
-        self.btn_glossary = QtWidgets.QPushButton("Словник")
+        self.btn_glossary = QtWidgets.QPushButton("Glossary")
         self.btn_glossary.setToolTip(
-            "Відкрити в браузері словник термінів програми з формулами сил: "
-            "Cd, Cl, CdA, Aref, Cp, y+… (F5)")
+            "Open the program glossary with the force formulas in the "
+            "browser: Cd, Cl, CdA, Aref, Cp, y+… (F5)")
         self.btn_glossary.clicked.connect(lambda: self.open_glossary())
         bar.addWidget(self.btn_glossary)
         lay.addLayout(bar)
@@ -1954,12 +2004,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._anim_timer = QtCore.QTimer(self)
         self._anim_timer.timeout.connect(self._anim_tick)
 
+        # Попередження просто над видом (T29): лінії потоку лише в одній
+        # площині. Рядок під видом легко не помітити, а картина інакше
+        # схожа на зламану.
+        self.lbl_view_note = QtWidgets.QLabel()
+        self.lbl_view_note.setWordWrap(True)
+        self.lbl_view_note.setStyleSheet(fs_livebar.LIVE_STYLE)
+        self.lbl_view_note.hide()
+        lay.addWidget(self.lbl_view_note)
+
         self.res_plotter = self._make_res_plotter(w)
         self.res_plotter.set_background("#22262b", top="#3a4149")
         self.res_plotter.add_axes(line_width=2)
         lay.addWidget(self.res_plotter.interactor, 1)
 
-        self.lbl_coeffs = QtWidgets.QLabel("Результатів ще немає.")
+        self.lbl_coeffs = QtWidgets.QLabel("No results yet.")
         self.lbl_coeffs.setStyleSheet("font-family: Consolas, monospace;")
         self.lbl_coeffs.setWordWrap(True)
         lay.addWidget(self.lbl_coeffs)
@@ -1994,7 +2053,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_geo.add_requested.connect(self.add_stl)
         self.panel_geo.part_toggled.connect(self.part_toggled)
         self.panel_geo.part_removed.connect(
-            lambda i: self._geo_guard(i, "прибрати деталь") and self.part_removed(i))
+            lambda i: self._geo_guard(i, tr("remove part")) and self.part_removed(i))
         self.panel_geo.part_role.connect(self.part_role_set)
         self.panel_geo.part_engine.connect(self.part_engine_set)
         self.panel_geo.part_flip.connect(self.part_flip)
@@ -2007,7 +2066,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_geo.hinge_guess.connect(self.guess_hinge)
         self.panel_tx.channels_changed.connect(self.set_channels)
         self.panel_geo.part_solo.connect(
-            lambda i: self._geo_guard(i, "лишити саму цю деталь", solo=True)
+            lambda i: self._geo_guard(i, tr("keep only this part"), solo=True)
             and self.part_solo(i))
         self.panel_geo.repair_requested.connect(self.repair)
         self.panel_geo.transform_requested.connect(self.transform)
@@ -2191,12 +2250,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def choose_projects_dir(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Тека для проєктів", str(self.projects_dir()))
+            self, tr("Projects Folder"), str(self.projects_dir()))
         if not path:
             return
         fset.set("projects_dir", path)
-        self.log.push(tr("Проєкти зберігатимуться в {path}", path=path))
-        self.statusBar().showMessage(tr("Тека проєктів: {path}", path=path), 8000)
+        self.log.push(tr("Projects will be saved in {path}", path=path))
+        self.statusBar().showMessage(tr("Projects folder: {path}", path=path), 8000)
 
     # --- налаштування програми (Файл → Налаштування, T22) ----------------
 
@@ -2213,11 +2272,73 @@ class MainWindow(QtWidgets.QMainWindow):
         if fset.get("ssh_host") != host_before:
             QtCore.QTimer.singleShot(0, self.recheck_server)
 
+    def open_server_wizard(self) -> str:
+        """«File → Set up a server…» (T34): Tailscale, SSH key, check."""
+        host_before = fset.get("ssh_host")
+        alias = fs_serverwiz.run_wizard(self)
+        if fset.get("ssh_host") != host_before:
+            QtCore.QTimer.singleShot(0, self.recheck_server)
+        return alias
+
+    def offer_server_wizard(self) -> None:
+        """First start of an installed copy: offer the server wizard once.
+
+        Not modal: the window stays usable, and the question does not block
+        an automatic start (tests, the installer).
+        """
+        fset.set("server_wizard_offered", True)
+        box = QtWidgets.QMessageBox(self)
+        box.setObjectName("ServerWizardOffer")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setWindowTitle("OpenFOAM Studio")
+        box.setText(tr("Do you want to set up a calculation server now?"))
+        box.setInformativeText(tr(
+            "A Linux server through Tailscale and SSH. You can also do it "
+            "later: File → Set up a server…"))
+        box.setStandardButtons(QtWidgets.QMessageBox.Yes
+                               | QtWidgets.QMessageBox.No)
+        box.setWindowModality(QtCore.Qt.NonModal)
+        box.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        box.buttonClicked.connect(
+            lambda b: box.standardButton(b) == QtWidgets.QMessageBox.Yes
+            and QtCore.QTimer.singleShot(0, self.open_server_wizard))
+        self._server_offer = box
+        box.show()
+
+    def apply_language(self, lang: str) -> None:
+        """The language setting changed: switch the interface at once.
+
+        FS_LANG of the environment wins over the setting: then only a note
+        (fs_restart.ask_restart tells what to do).
+        """
+        if fs_i18n.env_language():
+            if fs_i18n.env_language() != lang:
+                fs_restart.ask_restart(self)
+            return
+        fs_i18n.set_language(lang)
+
+    def language_changed(self, lang: str = "") -> None:
+        """After a live change of the language: make again the texts that
+        the window composes from parts and values (fs_i18n has already
+        translated each widget text that has a key)."""
+        try:
+            self.refresh_all()
+        except Exception:                                  # noqa: BLE001
+            traceback.print_exc()
+        # Texts in the 3D views (scale titles, captions, labels) are drawn
+        # from the scene: draw it again.
+        try:
+            if self.results is not None:
+                self.draw_results()
+            self.viewport.plotter.render()
+        except Exception:                                  # noqa: BLE001
+            traceback.print_exc()
+
     def _level_text(self) -> str:
         lv = getattr(self.viewport, "level", None)
         if lv is None:
             return "VTK"
-        return lv.text() + (f" ({lv.note})" if lv.note else "")
+        return lv.text() + (f" ({lv.note_text()})" if lv.note else "")
 
     def _store_cases_dir(self):
         text = self.panel_run.ed_dir.text().strip()
@@ -2244,9 +2365,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     ed.setText(value)
             elif key == "mesh_keep":
                 be.MESH_KEEP = int(value)
-            elif key in ("ui_language", "view3d_backend"):
+            elif key == "ui_language":
+                self.apply_language(value)
+            elif key == "view3d_backend":
                 self.statusBar().showMessage(
-                    "Зміна діє після перезапуску програми.", 8000)
+                    tr("The change takes effect after you restart the program."), 8000)
         except RuntimeError:            # вікно вже знищене (тести)
             fset.unsubscribe(self._setting_changed)
 
@@ -2257,7 +2380,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 or backend.kind == "native" or be.local_mesh_dir(key) is not None):
             return
         self.log.push(fs_i18n.tr(
-            "Забираю сітку {key} з {host} (Файл → Налаштування → Сітка)…",
+            "Copying the mesh {key} from {host} (File → Settings → Mesh)…",
             key=key, host=backend.host or backend.label))
 
         def job():
@@ -2273,9 +2396,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _mesh_fetched(self, key: str, err: str) -> None:
         if err:
-            self.log.push(fs_i18n.tr("Сітку {key} не забрано: {err}", key=key, err=err))
+            self.log.push(fs_i18n.tr("The mesh {key} was not copied: {err}", key=key, err=err))
         else:
-            self.log.push(fs_i18n.tr("Сітку {key} забрано на цей компʼютер.", key=key))
+            self.log.push(fs_i18n.tr("The mesh {key} is now on this computer.", key=key))
 
     def default_project_path(self) -> Path:
         return self.projects_dir() / f"{self.cfg.name or 'project'}{lib.PROJECT_EXT}"
@@ -2319,17 +2442,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if not live:
             if ask:
                 QtWidgets.QMessageBox.warning(
-                    self, "Нічого зберігати",
-                    "У сцені немає жодної прочитаної моделі.")
+                    self, tr("Nothing to save"),
+                    tr("No model in the scene has been read."))
             return ""
         if not path:
             start = str(Path(self._project_path) if self._project_path
                         else self.default_project_path())
             if ask:
                 path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                    self, ("Зберегти проєкт із сіткою" if with_mesh
-                           else "Зберегти проєкт"), start,
-                    tr("Проєкт OpenFOAM Studio (*{PROJECT_EXT});;Усі файли (*)", PROJECT_EXT=lib.PROJECT_EXT))
+                    self, ("Save Project with Mesh" if with_mesh
+                           else "Save Project"), start,
+                    tr("OpenFOAM Studio project (*{PROJECT_EXT});;All files (*)", PROJECT_EXT=lib.PROJECT_EXT))
                 if not path:
                     return ""
             else:
@@ -2353,13 +2476,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if mdir is None:
                 if ask:
                     QtWidgets.QMessageBox.warning(
-                        self, "Сітки немає",
-                        "Для теперішніх налаштувань сітки на цьому "
-                        "компʼютері немає.")
+                        self, tr("No mesh"),
+                        tr("There is no mesh on this computer for the "
+                        "current settings."))
                 return ""
         try:
             out = self._off_thread(
-                tr("Записую проєкт{v}", v=" із сіткою…" if mdir else "…"),
+                tr("Writing the project{v}", v=" with mesh…" if mdir else "…"),
                 lambda: lib.write_project(path, self.cfg, rows, extra,
                                           mesh_key=mkey, mesh_dir=mdir,
                                           keep_mesh=keep),
@@ -2367,9 +2490,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except OSError as exc:
             if ask:
                 QtWidgets.QMessageBox.critical(
-                    self, "Не вдалося зберегти", str(exc))
+                    self, tr("Could not save"), str(exc))
             else:
-                self.log.push(tr("Проєкт не збережено: {exc}", exc=exc))
+                self.log.push(tr("Project not saved: {exc}", exc=exc))
             return ""
         size = os.path.getsize(out) / 1e6
         self._project_path = out
@@ -2377,10 +2500,10 @@ class MainWindow(QtWidgets.QMainWindow):
         has = lib.project_mesh_key(out)
         if has and self._pmesh.active:
             self._pmesh.project = out
-        self.log.push(tr("Проєкт збережено: {out} ({size:.1f} МБ, "
-                         "{n_rows} деталей{v})", out=out, size=size, n_rows=len(rows), v=tr(", із сіткою {has}", has=has) if has else ", без сітки"))
+        self.log.push(tr("Project saved: {out} ({size:.1f} MB, {n_rows} "
+                         "parts{v})", out=out, size=size, n_rows=len(rows), v=tr(", with mesh {has}", has=has) if has else ", without mesh"))
         self.statusBar().showMessage(
-            tr("Проєкт збережено: {name}", name=Path(out).name), 8000)
+            tr("Project saved: {name}", name=Path(out).name), 8000)
         return out
 
     # --- сітка в проєкті (fs_meshlock) -------------------------------------
@@ -2392,7 +2515,7 @@ class MainWindow(QtWidgets.QMainWindow):
         (треба забрати); "" — сітки немає, а «чому ні» каже чому.
         """
         if not any(p.loaded for p in self.parts):
-            return "", "", "У сцені немає жодної моделі."
+            return "", "", tr("There is no model in the scene.")
         if self._pmesh.active:
             if be.local_mesh_dir(self._pmesh.key) is not None:
                 return self._pmesh.key, "local", ""
@@ -2406,15 +2529,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 key = ""
             self._mesh_menu_cache = (sig, key)
         if not key:
-            return "", "", "У сцені немає геометрії."
+            return "", "", tr("There is no geometry in the scene.")
         if be.local_mesh_dir(key) is not None:
             return key, "local", ""
         b = self.panel_run.current_backend()
         if b is not None and (self._res_key(b), key) in self._remote_meshes:
             return key, "remote", ""
-        return key, "", ("Для теперішніх налаштувань сітки ще немає: її "
-                         "збудує перший прогін (snappyHexMesh). Або після "
-                         "прогону змінено налаштування сітки чи геометрію.")
+        return key, "", (tr("There is no mesh for the current settings yet: "
+                         "the first run will build it (snappyHexMesh). "
+                         "Or the mesh settings or the geometry were "
+                         "changed after the run."))
 
     def _update_mesh_menu(self) -> None:
         """Пункт «Зберегти проєкт із сіткою» — лише коли сітка є."""
@@ -2425,10 +2549,11 @@ class MainWindow(QtWidgets.QMainWindow):
         act = self.act_save_mesh
         act.setEnabled(bool(where))
         if where == "remote":
-            act.setToolTip(tr("Сітка {key} лежить на сервері: її буде забрано "
-                           "на цей компʼютер (сотні МБ) і покладено в проєкт.", key=key))
+            act.setToolTip(tr("Mesh {key} is on the server: it will be "
+                              "downloaded to this computer (hundreds of "
+                              "MB) and put into the project.", key=key))
         elif where:
-            act.setToolTip(tr("Сітка {key} — уже на цьому компʼютері.", key=key))
+            act.setToolTip(tr("Mesh {key} is already on this computer.", key=key))
         else:
             act.setToolTip(why)
         b = self.panel_run.current_backend()
@@ -2454,21 +2579,21 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         key, where, why = self._mesh_for_save()
         if not where:
-            QtWidgets.QMessageBox.information(self, "Сітки ще немає", why)
+            QtWidgets.QMessageBox.information(self, tr("No mesh yet"), why)
             return ""
         if where == "remote":
             b = self.panel_run.current_backend()
             try:
                 err = self._off_thread(
-                    tr("Забираю сітку {key} з {v} (сотні МБ, "
-                    "це може тривати хвилини)…", key=key, v=b.host or b.label),
+                    tr("Getting mesh {key} from {v} (hundreds of MB, "
+                       "this can take minutes)…", key=key, v=b.host or b.label),
                     lambda: be.fetch_mesh(b, key), size=BIG_MESH)
             except Exception as exc:                       # noqa: BLE001
                 err = str(exc)
             if err:
-                QtWidgets.QMessageBox.warning(self, "Сітку не забрано", err)
+                QtWidgets.QMessageBox.warning(self, tr("Mesh not downloaded"), err)
                 return ""
-            self.log.push(tr("Сітку {key} забрано на цей компʼютер.", key=key))
+            self.log.push(tr("The mesh {key} is now on this computer.", key=key))
         return self.save_project(with_mesh=True)
 
     def _show_pmesh(self) -> None:
@@ -2479,10 +2604,9 @@ class MainWindow(QtWidgets.QMainWindow):
             lbl.setText(("🔒 " if self._pmesh.active else "") + text)
             lbl.setVisible(bool(text))
             lbl.setToolTip(
-                (tr("Ключ сітки {key}, з проєкту "
-                 "{name}. Поля, що змінюють "
-                 "сітку, приглушені: клік по них спитає, чи перебудувати "
-                 "сітку.", key=self._pmesh.key, name=Path(self._pmesh.project).name)) if self._pmesh.active else "")
+                (tr("Mesh key {key}, from project {name}. Fields that "
+                    "change the mesh are dimmed: a click on one asks "
+                    "whether to rebuild the mesh.", key=self._pmesh.key, name=Path(self._pmesh.project).name)) if self._pmesh.active else "")
 
     def _pmesh_activate(self, key: str, project: str) -> bool:
         """Сітка проєкту `key` діє: запамʼятати базовий ключ і замкнути поля."""
@@ -2500,13 +2624,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_pmesh()
         same = self._pmesh.baseline == key
         self.log.push(
-            tr("Сітка з проєкту {key} ({cells:,} комірок) "
-            "зафіксована: прогін візьме її, snappyHexMesh не буде.", key=key, cells=self._pmesh.cells)
+            tr("Mesh from project {key} ({cells:,} cells) is locked: the "
+               "run uses it, snappyHexMesh will not run.", key=key, cells=self._pmesh.cells)
             .replace(",", " ")
             + ("" if same else
-               tr(" Ця версія програми записала б налаштування трохи інакше "
-               "(ключ {baseline}), але ви нічого не міняли — "
-               "діє сітка проєкту.", baseline=self._pmesh.baseline)))
+               tr(" This version of the program would write the settings "
+                  "a bit differently (key {baseline}), but you changed "
+                  "nothing — the project mesh applies.", baseline=self._pmesh.baseline)))
         return True
 
     def _snappy_minutes(self) -> int:
@@ -2518,15 +2642,15 @@ class MainWindow(QtWidgets.QMainWindow):
         name = what or (panels._field_name(widget) if widget is not None else "")
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setWindowTitle("Сітка з проєкту")
+        box.setWindowTitle("Mesh from Project")
         box.setText(
-            tr("Якщо змінити це значення, сітку доведеться перебудувати "
-            "(snappyHexMesh, ~{snappy_minutes} хв на сервері). "
-            "Змінити?", snappy_minutes=self._snappy_minutes()))
+            tr("If you change this value, the mesh must be rebuilt "
+               "(snappyHexMesh, ~{snappy_minutes} min on the server). "
+               "Change it?", snappy_minutes=self._snappy_minutes()))
         if name:
-            box.setInformativeText(tr("Поле: {name}", name=name))
-        cancel = box.addButton("Скасувати", QtWidgets.QMessageBox.RejectRole)
-        go = box.addButton("Змінити й перебудувати",
+            box.setInformativeText(tr("Field: {name}", name=name))
+        cancel = box.addButton(tr("Cancel"), QtWidgets.QMessageBox.RejectRole)
+        go = box.addButton(tr("Change and Rebuild"),
                            QtWidgets.QMessageBox.AcceptRole)
         box.setDefaultButton(cancel)
         box.setEscapeButton(cancel)
@@ -2541,8 +2665,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pmesh.active = False
         self._pmesh.released = True
         self._show_pmesh()
-        self.log.push("Сітку з проєкту відпущено: налаштування сітки знову "
-                      "вільні, наступний прогін збудує нову сітку.")
+        self.log.push(tr("The project mesh is released: the mesh settings "
+                      "are unlocked again, the next run will build a new "
+                      "mesh."))
 
     def _geo_guard(self, index: int, what: str, solo: bool = False) -> bool:
         """Перед зміною складу сцени зі списку деталей (не через замкнене
@@ -2588,7 +2713,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:                       # noqa: BLE001
             # Автозбереження не має права зірвати запуск: людина натиснула
             # «Запустити», а не «Зберегти».
-            self.log.push(tr("Проєкт не збережено автоматично: {exc}", exc=exc))
+            self.log.push(tr("Project not saved automatically: {exc}", exc=exc))
             return ""
 
     def project_for_case(self, case_name: str) -> Path | None:
@@ -2601,20 +2726,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_project(self, path: str = ""):
         if self._load_thread is not None:
             self.statusBar().showMessage(
-                "Зачекайте: ще читається попередня геометрія.", 6000)
+                tr("Wait: the previous geometry is still being read."), 6000)
             return
         if not path:
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Відкрити проєкт", str(self.projects_dir()),
-                tr("Проєкт OpenFOAM Studio (*{PROJECT_EXT});;Усі файли (*)", PROJECT_EXT=lib.PROJECT_EXT))
+                self, tr("Open Project"), str(self.projects_dir()),
+                tr("OpenFOAM Studio project (*{PROJECT_EXT});;All files (*)", PROJECT_EXT=lib.PROJECT_EXT))
         if not path:
             return
         data = lib.read_project(path)
         if data is None:
             QtWidgets.QMessageBox.critical(
-                self, "Це не проєкт",
-                tr("Файл {name} не вдалося прочитати як проєкт "
-                "OpenFOAM Studio.", name=Path(path).name))
+                self, tr("This is not a project"),
+                tr("Could not read the file {name} as an OpenFOAM Studio "
+                   "project.", name=Path(path).name))
             return
         # Нова сцена: сітка попереднього проєкту більше не діє.
         self._mlock.unlock()
@@ -2626,13 +2751,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if lib.project_mesh_key(path):
             try:
                 key = self._off_thread(
-                    "Розпаковую сітку з проєкту…",
+                    tr("Unpacking the mesh from the project…"),
                     lambda: lib.extract_project_mesh(path, be.LOCAL_MESH_STORE))
                 if key:
                     # Діяти почне, коли сцена збереться (_apply_project).
                     self._pmesh_pending = (key, str(path))
             except Exception as exc:                      # noqa: BLE001
-                self.log.push(tr("Сітку з проєкту не розпаковано: {exc}", exc=exc))
+                self.log.push(tr("Project mesh not unpacked: {exc}", exc=exc))
         self._open_project_data(data, path)
 
     def _open_project_data(self, data: dict, path: str,
@@ -2649,16 +2774,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not rows:
             if session is None:
                 QtWidgets.QMessageBox.critical(
-                    self, "У проєкті немає геометрії",
-                    "Жодної деталі прочитати не вдалося.")
+                    self, tr("The project has no geometry"),
+                    tr("Could not read any part."))
             return False
         if lost:
             # Мовчки проковтнути зниклу деталь не можна: сцена виглядатиме
             # цілою, а в кейс піде не те, що людина зберігала.
             QtWidgets.QMessageBox.warning(
-                self, "Частина геометрії відсутня",
-                tr("У файлі немає STL для: "
-                   "{join}{v}{NEWLINE}{NEWLINE}Решту буде відкрито.", join=", ".join(lost[:8]), v="…" if len(lost) > 8 else "", NEWLINE=NEWLINE))
+                self, tr("Part of the geometry is missing"),
+                tr("The file has no STL for: "
+                   "{join}{v}{NEWLINE}{NEWLINE}The rest will be opened.", join=", ".join(lost[:8]), v="…" if len(lost) > 8 else "", NEWLINE=NEWLINE))
 
         # Розпаковуємо у ТИМЧАСОВУ теку, а не поруч із проєктом: проєкт
         # може лежати на флешці чи в теці лише для читання.
@@ -2744,8 +2869,9 @@ class MainWindow(QtWidgets.QMainWindow):
         live = list(reversed([p for p in self.parts if p.loaded]))
         if len(live) != len(rows):
             self.log.push(
-                tr("Проєкт: деталей у сцені {n_live}, а в файлі "
-                "{n_rows} — ролі роздано за порядком, перевірте їх.", n_live=len(live), n_rows=len(rows)))
+                tr("Project: {n_live} parts in the scene, but {n_rows} "
+                   "in the file — the roles were assigned in order, "
+                   "check them.", n_live=len(live), n_rows=len(rows)))
         for part, row in zip(live, rows):
             part.path = row.get("path") or part.path
             part.enabled = bool(row.get("enabled", True))
@@ -2832,13 +2958,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # після відкриття питав би, чи зберегти нічим не змінений проєкт.
         self._project_mark = self._project_signature()
         self.log.push(
-            tr("Проєкт відкрито: {n_live} деталей, "
-            "ролі й завіси відновлено.", n_live=len(live)))
+            tr("Project opened: {n_live} parts, roles and hinges restored.", n_live=len(live)))
         pending = getattr(self, "_pmesh_pending", None)
         self._pmesh_pending = None
         if pending:
             self._pmesh_activate(*pending)
-        self.statusBar().showMessage("Проєкт відкрито.", 8000)
+        self.statusBar().showMessage(tr("Project opened."), 8000)
 
     def save_geometry(self):
         """Віддає назовні те, що зараз у сцені.
@@ -2853,7 +2978,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if self.mesh is None:
             QtWidgets.QMessageBox.warning(
-                self, "Немає геометрії", "У сцені порожньо.")
+                self, tr("No geometry"), tr("The scene is empty."))
             return
         start = self.cfg.name or "body"
         for part in self.parts:
@@ -2862,21 +2987,20 @@ class MainWindow(QtWidgets.QMainWindow):
                     Path(part.path).stem + "_fixed.stl"))
                 break
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Зберегти геометрію", start,
+            self, tr("Save Geometry"), start,
             "STL (*.stl);;PLY (*.ply);;VTK PolyData (*.vtp)")
         if not path:
             return
         try:
             geo.write_stl(self.mesh, path, binary=True)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Не вдалося записати",
+            QtWidgets.QMessageBox.critical(self, tr("Could not write"),
                                            f"{type(exc).__name__}: {exc}")
             return
         size = os.path.getsize(path) / 1e6
         self.statusBar().showMessage(
-            tr("Записано {name}: "
-            "{n_cells} трикутників, {size:.1f} МБ. "
-            "Геометрія в метрах — саме та, що у вʼюпорті.", name=Path(path).name, n_cells=phys.fmt_cells(self.mesh.n_cells), size=size), 12000)
+            tr("Wrote {name}: {n_cells} triangles, {size:.1f} MB. The "
+               "geometry is in meters — exactly what is in the viewport.", name=Path(path).name, n_cells=phys.fmt_cells(self.mesh.n_cells), size=size), 12000)
 
     def open_stl(self):
         self._ask_file(add=False)
@@ -2885,8 +3009,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ask_file(add=True)
 
     def _ask_file(self, add: bool):
-        if not self.mesh_guard("додати геометрію" if add
-                               else "відкрити іншу геометрію"):
+        if not self.mesh_guard(tr("add geometry") if add
+                               else tr("open other geometry")):
             return
         start = ""
         for part in self.parts:
@@ -2894,8 +3018,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 start = str(Path(part.path).parent)
                 break
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Додати геометрію" if add else "Відкрити геометрію", start,
-            "Поверхні (*.stl *.obj *.ply *.vtp);;Усі файли (*)")
+            self, "Add Geometry" if add else "Open Geometry", start,
+            "Surfaces (*.stl *.obj *.ply *.vtp);;All files (*)")
         if not paths:
             return
         if not add and self._pmesh.released:
@@ -2925,7 +3049,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self._load_thread is not None:
             self.statusBar().showMessage(
-                "Зачекайте: ще читається попередня геометрія.", 6000)
+                tr("Wait: the previous geometry is still being read."), 6000)
             return
         self._batch_queue = list(paths[1:])
         self._batch_failed = []
@@ -2948,11 +3072,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # У пачці кажемо, котрий саме файл: без цього довге читання
         # десятка моделей виглядає як зависання на першій.
-        head = tr("Читаю {name}…", name=Path(path).name)
+        head = tr("Reading {name}…", name=Path(path).name)
         if self._batch_total > 1:
             done = self._batch_total - len(self._batch_queue)
-            head = (tr("Читаю {done} з {batch_total}: "
-                    "{name}…", done=done, batch_total=self._batch_total, name=Path(path).name))
+            head = (tr("Reading {done} of {batch_total}: {name}…", done=done, batch_total=self._batch_total, name=Path(path).name))
         self._progress = QtWidgets.QProgressDialog(head, "", 0, 0, self)
         self._progress.setWindowTitle("OpenFOAM Studio")
         self._progress.setCancelButton(None)
@@ -2962,6 +3085,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_head = head
         self._loader = GeometryLoader(path)
         self._load_thread = QtCore.QThread(self)
+        self._load_thread.setObjectName("load")
         self._loader.moveToThread(self._load_thread)
         self._load_thread.started.connect(self._loader.run)
         self._loader.ready.connect(self._on_geometry_ready)
@@ -3008,7 +3132,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self._finish_batch()
             return
-        QtWidgets.QMessageBox.critical(self, "Не вдалося прочитати", msg)
+        QtWidgets.QMessageBox.critical(self, tr("Could not read"), msg)
 
     def _finish_batch(self):
         """Підсумок пачки: скільки прочиталося і що не далося."""
@@ -3022,13 +3146,13 @@ class MainWindow(QtWidgets.QMainWindow):
             # Модальне вікно тут доречне: мовчки проковтнути непрочитані
             # файли гірше, ніж перебити роботу. Але воно ОДНЕ на пачку.
             QtWidgets.QMessageBox.warning(
-                self, "Не всі файли прочиталися",
-                tr("Прочитано {ok} з {total}. Не вдалося:\n\n{join}{v}", ok=ok, total=total, join="\n".join(failed[:10]), v="\n…" if len(failed) > 10 else ""))
+                self, tr("Not all files could be read"),
+                tr("Read {ok} of {total}. Failed:\n\n{join}{v}", ok=ok, total=total, join="\n".join(failed[:10]), v="\n…" if len(failed) > 10 else ""))
         elif total > 1:
             self.statusBar().showMessage(
-                tr("Додано моделей: {ok}.", ok=ok), 8000)
+                tr("Models added: {ok}.", ok=ok), 8000)
         if ok:
-            self.log.push(tr("Пачка: прочитано {ok} з {total} файлів.", ok=ok, total=total))
+            self.log.push(tr("Batch: read {ok} of {total} files.", ok=ok, total=total))
 
     @QtCore.Slot(object, float, str, object)
     def _on_geometry_ready(self, mesh, factor, why, diag):
@@ -3100,10 +3224,11 @@ class MainWindow(QtWidgets.QMainWindow):
                        else self.panel_geo.unit_factor(factor))
                 if got > 0 and factor > 0 and max(got / factor,
                                                   factor / got) > 4.0:
-                    text = (tr("Одиниці: вибрано «{chosen}», а за габаритом "
-                            "схоже на множник {factor:g} ({why}). Якщо "
-                            "модель у сцені завелика чи замала в рази — "
-                            "відкрийте її ще раз з іншими одиницями.", chosen=chosen, factor=factor, why=why))
+                    text = (tr("Units: “{chosen}” is selected, but the "
+                               "overall size suggests a factor of "
+                               "{factor:g} ({why}). If the model in the "
+                               "scene is many times too large or too "
+                               "small, open it again with other units.", chosen=chosen, factor=factor, why=why))
                     self.log.push(text)
                     self.statusBar().showMessage(text, 20000)
 
@@ -3172,9 +3297,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._finish_batch()
         if add:
             self.statusBar().showMessage(
-                tr("Додано {name}: у сцені {n_enabled_parts} "
-                "моделей, {n_cells} трикутників. "
-                "У кейс піде їхнє обʼєднання.", name=part.name, n_enabled_parts=len(self.enabled_parts()), n_cells=phys.fmt_cells(self.mesh.n_cells)), 12000)
+                tr("Added {name}: {n_enabled_parts} models in the scene, "
+                   "{n_cells} triangles. Their union goes into the case.", name=part.name, n_enabled_parts=len(self.enabled_parts()), n_cells=phys.fmt_cells(self.mesh.n_cells)), 12000)
 
     # --- моделі у сцені -------------------------------------------------
 
@@ -3199,7 +3323,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return os.path.normcase(os.path.abspath(path)) if path else ""
 
     def _cache_dir(self) -> Path:
-        return Path(APP_DIR) / lib.SESSION_DIR / "parts"
+        return Path(DATA_DIR) / lib.SESSION_DIR / "parts"
 
     def _park(self, part: Part) -> None:
         """Покласти геометрію деталі в кеш перед тим, як забути сітку.
@@ -3222,9 +3346,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:                     # noqa: BLE001
             # Кеш — послуга, а не умова: без нього лишається вихідний файл.
             part.cache = ""
-            self.log.push(tr("Не вдалося зберегти геометрію «{name}» "
-                          "перед тим, як прибрати її в історію: {exc}. "
-                          "Повторна галочка перечитає вихідний файл.", name=part.name, exc=exc))
+            self.log.push(tr("Could not save the geometry of “{name}” "
+                             "before moving it to history: {exc}. "
+                             "Checking it again re-reads the source file.", name=part.name, exc=exc))
 
     def _note_part(self, part: Part, diag=None):
         """Позначка біля моделі в списку: чим саме цей файл поганий."""
@@ -3247,40 +3371,40 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         live = self.enabled_parts()
         if not live:
-            return "у сцені порожньо"
+            return tr("the scene is empty")
         if self.mesh is None:
             return ""
         # Гвинти-диски в сітку не йдуть — і в цьому рядку їх не рахуємо,
         # а називаємо окремо.
         disks = [p for p in live if p.role == fc.DISK_ROLE]
         meshed = [p for p in live if p.role != fc.DISK_ROLE]
-        tail = (tr("; гвинтів-дисків {n_disks} (у сітку не йдуть)", n_disks=len(disks))
+        tail = (tr("; actuator disks: {n_disks} (not in the mesh)", n_disks=len(disks))
                 if disks else "")
         if not meshed:
-            return tr("у сітку не йде нічого{tail}", tail=tail)
+            return tr("nothing goes into the mesh{tail}", tail=tail)
         tris = phys.fmt_cells(sum(p.tris for p in meshed))
         if len(meshed) == 1:
-            return tr("у кейс піде {name}: {tris} трикутників{tail}", name=meshed[0].name, tris=tris, tail=tail)
-        return (tr("у кейс піде обʼєднання {n_meshed} моделей: {tris} "
-                   "трикутників{tail}", n_meshed=len(meshed), tris=tris, tail=tail))
+            return tr("the case gets {name}: {tris} triangles{tail}", name=meshed[0].name, tris=tris, tail=tail)
+        return (tr("the case gets a union of {n_meshed} models: {tris} "
+                   "triangles{tail}", n_meshed=len(meshed), tris=tris, tail=tail))
 
     def _part_rows(self) -> list[dict]:
         rows = []
         for part in self.parts:
             if part.loaded:
-                info = (tr("{tris} тр. · {span}{v}", tris=phys.fmt_cells(part.tris), span=phys.fmt_len(part.span), v="  (обгортка)" if part.wrapped else ""))
+                info = (tr("{tris} tri. · {span}{v}", tris=phys.fmt_cells(part.tris), span=phys.fmt_len(part.span), v="  (wrap)" if part.wrapped else ""))
                 bad = []
                 if part.open_edges:
-                    bad.append(tr("{open_edges} відкритих ребер", open_edges=part.open_edges))
+                    bad.append(tr("{open_edges} open edges", open_edges=part.open_edges))
                 if part.bad_winding:
-                    bad.append(tr("{bad_winding} неузгоджених ребер", bad_winding=part.bad_winding))
+                    bad.append(tr("{bad_winding} inconsistent edges", bad_winding=part.bad_winding))
                 if part.inverted:
-                    bad.append(tr("{inverted} вивернутих частин", inverted=part.inverted))
+                    bad.append(tr("{inverted} inside-out parts", inverted=part.inverted))
                 tip = part.path + NEWLINE + ("; ".join(bad) if bad
-                                             else "явних вад не видно")
+                                             else tr("no obvious defects"))
             else:
-                info = "не прочитана"
-                tip = tr("{path}{NEWLINE}галочка — прочитати й додати в сцену", path=part.path, NEWLINE=NEWLINE)
+                info = tr("not read")
+                tip = tr("{path}{NEWLINE}checkbox — read and add to the scene", path=part.path, NEWLINE=NEWLINE)
             # `key` — ПОВНИЙ ШЛЯХ, і це не те саме, що `name`. Імена тут
             # базові, тож два різні файли легко звуться однаково
             # (wing.stl у двох теках). Панель тримає за цим ключем
@@ -3440,9 +3564,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.disks = disks
         if refused:
             self.log.push(
-                tr("Ці моделі позначені гвинтами-дисками, але формою на "
-                   "диск не схожі (уздовж вибраної осі не тонкі): "
-                   "{refused}. Спробуйте іншу вісь обертання.", refused=", ".join(refused)))
+                tr("These models are marked as actuator disks, but their "
+                   "shape is not like a disk (they are not thin along "
+                   "the selected axis): {refused}. Try another rotation "
+                   "axis.", refused=", ".join(refused)))
 
     def _full_throttle_once(self, had: bool) -> None:
         """Q15: перший двигун чи диск ставить газ на повний.
@@ -3459,9 +3584,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_tx.set_quiet("throttle", 1.0)
         for x in list(self.cfg.engines) + list(self.cfg.disks):
             x.throttle = 1.0
-        self.log.push("Газ поставлено на повний: у сцені з'явилася тяга "
-                      "(двигун чи гвинт-диск), а на нульовому газі її не "
-                      "було б.")
+        self.log.push(tr("Throttle set to full: the scene now has thrust "
+                      "(an engine or an actuator disk), and at zero "
+                      "throttle there would be none."))
 
     def _sync_engines(self, pairs) -> None:
         """Двигуни з кришок, щоразу наново — як і обертові зони.
@@ -3564,10 +3689,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.sync_zone_boxes(level=self.zone_box_level)
         if refused:
             self.log.push(
-                tr("Ці моделі позначені гвинтами, але формою на диск не "
-                   "схожі, і зони для них не створено: {refused}. Диск "
-                   "тонкий уздовж осі й КРУГЛИЙ у двох інших напрямках; "
-                   "у крила такої форми немає.", refused=", ".join(refused)))
+                tr("These models are marked as propellers, but their "
+                   "shape is not like a disk, and no zones were made for "
+                   "them: {refused}. A disk is thin along the axis and "
+                   "ROUND in the two other directions; a wing does not "
+                   "have such a shape.", refused=", ".join(refused)))
 
     def _show_split(self) -> None:
         # Усі поверхні, а не лише стінки: інакше мотор із двома кришками
@@ -3586,7 +3712,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         part = self.parts[index]
         if (self._pmesh.active and bool(on) != bool(part.enabled and part.loaded)
-                and not self.mesh_guard(tr("деталь «{name}»", name=part.name))):
+                and not self.mesh_guard(tr("part “{name}”", name=part.name))):
             # Галочку вертаємо: деталь у сцені лишається, як була.
             self.panel_geo.show_parts(self._part_rows(), self._scene_line())
             return
@@ -3596,11 +3722,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # і розбивати її на потоки з відкладеним доробленням нема чого.
             try:
                 mesh = self._off_thread(
-                    tr("Повертаю «{name}» такою, якою вона була…", name=part.name),
+                    tr("Restoring “{name}” to how it was…", name=part.name),
                     lambda: geo.load_surface(part.cache))
             except Exception as exc:                   # noqa: BLE001
-                self.log.push(tr("Кеш «{name}» не прочитався ({exc}) — "
-                              "читаю вихідний файл.", name=part.name, exc=exc))
+                self.log.push(tr("Cache of “{name}” could not be read "
+                                 "({exc}) — reading the source file.", name=part.name, exc=exc))
                 part.cache = ""
                 return self.part_toggled(index, on)
             part.mesh, part.enabled = mesh, True
@@ -3613,17 +3739,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if on and not part.loaded:
             if not os.path.isfile(part.path):
                 QtWidgets.QMessageBox.warning(
-                    self, "Файл зник",
-                    tr("{path}{NEWLINE}{NEWLINE}Його перейменували, "
-                       "перенесли або видалили. Рядок лишається в списку "
-                       "— приберіть його або поверніть файл на місце.", path=part.path, NEWLINE=NEWLINE))
+                    self, tr("File disappeared"),
+                    tr("{path}{NEWLINE}{NEWLINE}It was renamed, moved or "
+                       "deleted. The row stays in the list — remove it "
+                       "or put the file back.", path=part.path, NEWLINE=NEWLINE))
                 self.panel_geo.show_parts(self._part_rows(), self._scene_line())
                 return
             if self._load_thread is not None:
                 # Інший файл ще читається: позначка без читання лишила б
                 # список і сцену в різних станах.
                 self.statusBar().showMessage(
-                    "Зачекайте: ще читається попередня геометрія.", 6000)
+                    tr("Wait: the previous geometry is still being read."), 6000)
                 self.panel_geo.show_parts(self._part_rows(), self._scene_line())
                 return
             part.enabled = True
@@ -3720,6 +3846,7 @@ class MainWindow(QtWidgets.QMainWindow):
         got = _BusyReceiver(loop)
         worker = BusyWorker(job)
         thread = QtCore.QThread(self)
+        thread.setObjectName("busy")
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.done.connect(got.take)
@@ -3781,7 +3908,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             self.diag, display, layers = self._off_thread(
-                "Перевіряю геометрію й готую її до показу…", job,
+                tr("Checking the geometry and preparing it for display…"), job,
                 mesh.n_cells)
             if key is not None:
                 self._diag_cache = (key, (self.diag, display if fresh else None,
@@ -3815,7 +3942,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._spot_at = -1
         if not self._spots:
             self.statusBar().showMessage(
-                "Проблемних місць не знайдено — показувати нічого.", 6000)
+                tr("No problem spots found — nothing to show."), 6000)
             return
         self._spot_at = (self._spot_at + 1) % len(self._spots)
         spot = self._spots[self._spot_at]
@@ -3826,9 +3953,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewport.mark_spot(spot["centre"], radius)
         size = (f", {phys.fmt_len(spot['size'])}" if spot["size"] > 0 else "")
         self.statusBar().showMessage(
-            tr("{capitalize} {v} з "
-            "{n_spots}{size}.  Кнопка «Модель» повертає загальний "
-            "вид.", capitalize=spot['what'].capitalize(), v=self._spot_at + 1, n_spots=len(self._spots), size=size), 12000)
+            tr("{capitalize} {v} of {n_spots}{size}.  The “Model” button "
+               "returns to the full view.", capitalize=tr(spot['what']).map(lambda s: s[:1].upper() + s[1:]), v=self._spot_at + 1, n_spots=len(self._spots), size=size), 12000)
 
     def _move_layers(self, move):
         """Повертає/зсуває вже пораховану підсвітку замість перерахунку."""
@@ -3942,8 +4068,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_all()
         if self.diag is not None:
             self.statusBar().showMessage(
-                tr("Після повороту Lref і Aref перераховано: Lref {lref}, "
-                   "Aref {aref:.5g} м²", lref=phys.fmt_len(self.cfg.flow.l_ref),
+                tr("After the rotation, Lref and Aref are calculated "
+                   "again: Lref {lref}, Aref {aref:.5g} m²", lref=phys.fmt_len(self.cfg.flow.l_ref),
                    aref=self.cfg.flow.a_ref),
                 10000)
 
@@ -3961,12 +4087,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.mesh is None or not live:
             return
         if self._fix_thread is not None:
-            self.statusBar().showMessage("Зачекайте: ремонт ще триває.", 5000)
+            self.statusBar().showMessage(tr("Wait: the repair is still running."), 5000)
             return
         try:
             job, mode = self._repair_job(key, live)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Ремонт не вдався", str(exc))
+            QtWidgets.QMessageBox.critical(self, tr("Repair failed"), str(exc))
             return
         if job is None:
             return
@@ -3982,7 +4108,7 @@ class MainWindow(QtWidgets.QMainWindow):
             missing = [p.name for p in live if not os.path.isfile(p.path)]
             if missing:
                 raise FileNotFoundError(
-                    tr("не знайдено на диску: {missing}", missing=", ".join(missing)))
+                    tr("not found on disk: {missing}", missing=", ".join(missing)))
             plan = [(p.path, p.factor) for p in live]
 
             for part in live:
@@ -3991,75 +4117,41 @@ class MainWindow(QtWidgets.QMainWindow):
             def job(meshes, say):
                 out = []
                 for path, factor in plan:
-                    say(tr("перечитую {name}", name=Path(path).name))
+                    say(tr("re-reading {name}", name=Path(path).name))
                     out.append(geo.apply_scale(geo.load_surface(path), factor))
                 return out
             return job, "parts"
 
-        if key == "winfix":
-            # Кнопка неактивна, коли служби немає, але дійти сюди все одно
-            # можна: сесію відкривають і на іншій машині.
-            if not winfix.available():
+        if key in fs_repair.KEYS:
+            # meshfix, alpha wrap, Windows, volume: the same code as in
+            # MeshFix Studio (fs_repair.repair_meshes). Do not repair here.
+            # The button is disabled without the tool, but a session from
+            # another computer can still come here.
+            if not fs_repair.available(key):
                 QtWidgets.QMessageBox.information(
-                    self, "Полагодити: Windows", winfix.why_not())
+                    self, tr("Repair"), fs_repair.why_not(key))
                 return None, ""
+            mode = fs_repair.mode(key)
+            # "wrap": one shell from the whole scene, thus the job gets the
+            # merged mesh of the window.
+            merged = self.mesh if mode == "wrap" else None
 
-            def job(meshes, say):
-                out = []
-                for i, mesh in enumerate(meshes, 1):
-                    # Служба каже про себе сама («готую пакунок», «ремонт…»),
-                    # тому тут лишається дописати, котра це модель.
-                    head = (tr("модель {i} з {n_meshes}: ", i=i, n_meshes=len(meshes))
-                            if len(meshes) > 1 else "")
-                    out.append(winfix.repair(
-                        mesh, lambda text, h=head: say(h + text)))
-                return out
-            return job, "parts"
-
-        if key == "meshfix":
-            # The button is disabled without the Rust module, but a session
-            # from another computer can still come here.
-            if not meshfix.available():
-                QtWidgets.QMessageBox.information(
-                    self, "meshfix", meshfix.why_not())
-                return None, ""
-
-            def job(meshes, say):
-                out = []
-                for i, mesh in enumerate(meshes, 1):
-                    head = (tr("модель {i} з {n_meshes}: ", i=i, n_meshes=len(meshes))
-                            if len(meshes) > 1 else "")
-                    out.append(meshfix.repair(
-                        mesh, lambda text, h=head: say(h + text)))
-                return out
-            return job, "parts"
-
-        if key in ("alphawrap", "volume"):
-            # Our Rust alpha wrap and volumetric remesh (rust/meshfix,
-            # forced methods). Both give one body from the whole assembly,
-            # thus the mode is "wrap" and the job gets the merged mesh.
-            if not meshfix.available():
-                QtWidgets.QMessageBox.information(
-                    self, "Полагодити", meshfix.why_not())
-                return None, ""
-            merged = self.mesh
-
-            def job(meshes, say, method=key):
-                return [meshfix.repair(merged, say, method=method)]
-            return job, "wrap"
+            def job(meshes, say, key=key, merged=merged):
+                return fs_repair.repair_meshes(key, meshes, say, merged=merged)
+            return job, mode
 
         if key == "subdivide":
             if self.mesh.n_cells > 400_000:
                 QtWidgets.QMessageBox.warning(
-                    self, "Забагато",
-                    "Понад 400 тис. трикутників — згущення вчетверо "
-                    "зробить файл некерованим.")
+                    self, tr("Too many"),
+                    tr("More than 400k triangles — refining four times will "
+                    "make the file unmanageable."))
                 return None, ""
 
             def job(meshes, say):
                 out = []
                 for i, mesh in enumerate(meshes, 1):
-                    say(tr("згущую, модель {i} з {n_meshes}", i=i, n_meshes=len(meshes)))
+                    say(tr("refining, model {i} of {n_meshes}", i=i, n_meshes=len(meshes)))
                     out.append(geo.subdivide(mesh, 1))
                 return out
             return job, "parts"
@@ -4067,7 +4159,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if key == "decimate":
             total = self.mesh.n_cells
             n, ok = QtWidgets.QInputDialog.getInt(
-                self, "Проріднити", "Скільки трикутників лишити:",
+                self, tr("Decimate"), tr("How many triangles to keep:"),
                 min(60000, total), 100, total)
             if not ok:
                 return None, ""
@@ -4080,7 +4172,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def job(meshes, say):
             out = []
             for i, mesh in enumerate(meshes, 1):
-                say(tr("проріднюю, модель {i} з {n_meshes}", i=i, n_meshes=len(meshes)))
+                say(tr("decimating, model {i} of {n_meshes}", i=i, n_meshes=len(meshes)))
                 share = mesh.n_cells / total if total else 1.0
                 out.append(geo.decimate(mesh, max(100, int(target * share))))
             return out
@@ -4099,7 +4191,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fix_before = self.diag
 
         self._fix_progress = QtWidgets.QProgressDialog(
-            "Ремонт геометрії…", "", 0, 0, self)
+            "Repairing geometry…", "", 0, 0, self)
         self._fix_progress.setWindowTitle("OpenFOAM Studio")
         self._fix_progress.setCancelButton(None)
         self._fix_progress.setWindowModality(QtCore.Qt.WindowModal)
@@ -4111,6 +4203,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_geo.setEnabled(False)
         self._fixer = RepairWorker(job, [p.mesh for p in live])
         self._fix_thread = QtCore.QThread(self)
+        self._fix_thread.setObjectName("fix")
         self._fixer.moveToThread(self._fix_thread)
         self._fix_thread.started.connect(self._fixer.run)
         self._fixer.step.connect(self._on_repair_step)
@@ -4135,6 +4228,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_repair_step(self, text: str):
+        verdict = text.endswith(meshfix.VERDICT)
+        text = text.rstrip(meshfix.VERDICT)
         if self._fix_progress is not None:
             self._fix_progress.setLabelText(text)
         # ВИРОК ЗАЛИШАЄТЬСЯ В ЖУРНАЛІ, а не лише блимає в діалозі.
@@ -4144,8 +4239,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Для кроків це байдуже («зшиваю вершини…»), а для чисел, якими
         # правка міряє себе, — ні: людина мусить мати змогу повернутися й
         # подивитися, чи стало краще.
-        if any(w in text or tr(w) in text for w in ("СТАЛО", "без змін", "не різав",
-                                   "зрізано")):
+        # The verdict is marked with meshfix.VERDICT, not found by its words:
+        # the words are translated.
+        if verdict:
             self.log.push(text)
 
     @QtCore.Slot(str)
@@ -4153,9 +4249,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._end_repair()
         self._undo_repair()
         QtWidgets.QMessageBox.critical(
-            self, "Ремонт не вдався",
-            tr("{message}{NEWLINE}{NEWLINE}Геометрію повернуто до стану "
-               "перед ремонтом.", message=message, NEWLINE=NEWLINE))
+            self, tr("Repair failed"),
+            tr("{message}{NEWLINE}{NEWLINE}The geometry is restored to "
+               "its state before the repair.", message=message, NEWLINE=NEWLINE))
 
     @QtCore.Slot(object)
     def _on_repair_ready(self, meshes):
@@ -4178,7 +4274,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # буде нижче. Саме з ним і треба порівнювати.
             wrapped, before_wrap = meshes[0], self.mesh
             self._wrap_dev = self._off_thread(
-                "Міряю, наскільки обгортка відійшла від тіла…",
+                tr("Measuring how far the wrap moved from the body…"),
                 lambda: geo.surface_deviation(wrapped, before_wrap),
                 wrapped.n_cells + before_wrap.n_cells)
         else:
@@ -4192,15 +4288,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if empty:
             self._undo_repair()
             QtWidgets.QMessageBox.critical(
-                self, "Ремонт не вдався",
-                tr("Порожня поверхня після ремонту: "
-                   "{empty}{NEWLINE}{NEWLINE}Геометрію повернуто до "
-                   "стану перед ремонтом.", empty=", ".join(empty), NEWLINE=NEWLINE))
+                self, tr("Repair failed"),
+                tr("Empty surface after the repair: "
+                   "{empty}{NEWLINE}{NEWLINE}The geometry was returned "
+                   "to its state before the repair.", empty=", ".join(empty), NEWLINE=NEWLINE))
             return
 
         noted = [p for p in live if p.enabled and p.loaded]
         facts = self._off_thread(
-            "Перевіряю відремонтоване…",
+            tr("Checking the repaired geometry…"),
             lambda: [(geo.quick_facts(p.mesh),
                       geo.inverted_part_count(p.mesh)[0]) for p in noted],
             sum(p.mesh.n_cells for p in noted))
@@ -4218,15 +4314,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         deltas = []
         if before.n_triangles != after.n_triangles:
-            deltas.append(tr("трикутників {n_triangles} → "
-                          "{n_triangles2}", n_triangles=phys.fmt_cells(before.n_triangles), n_triangles2=phys.fmt_cells(after.n_triangles)))
+            deltas.append(tr("triangles {n_triangles} → {n_triangles2}", n_triangles=phys.fmt_cells(before.n_triangles), n_triangles2=phys.fmt_cells(after.n_triangles)))
         if before.open_edges != after.open_edges:
-            deltas.append(tr("відкритих ребер {open_edges} → {open_edges2}", open_edges=before.open_edges, open_edges2=after.open_edges))
+            deltas.append(tr("open edges {open_edges} → {open_edges2}", open_edges=before.open_edges, open_edges2=after.open_edges))
         if before.non_manifold_edges != after.non_manifold_edges:
             deltas.append(f"non-manifold {before.non_manifold_edges} → "
                           f"{after.non_manifold_edges}")
         if before.parts != after.parts:
-            deltas.append(tr("частин {parts} → {parts2}", parts=before.parts, parts2=after.parts))
+            deltas.append(tr("parts {parts} → {parts2}", parts=before.parts, parts2=after.parts))
 
         if mode != "wrap" and before.volume > 0 and after.volume > 0:
             # Для обгортки це число оманливе: у вихідній збірці вивернуті
@@ -4234,54 +4329,56 @@ class MainWindow(QtWidgets.QMainWindow):
             # 29%» означало б лише те, що їх розвернули.
             change = after.volume / before.volume - 1.0
             if abs(change) > 0.005:
-                deltas.append(tr("обʼєм {v:+.1f}%", v=change * 100))
-        msg = ", ".join(deltas) if deltas else "нічого не змінилося"
+                deltas.append(tr("volume {v:+.1f}%", v=change * 100))
+        msg = fs_i18n.join(", ", deltas) if deltas else tr("nothing changed")
         if mode == "wrap":
             n = getattr(self, "_wrap_from", 1)
             self._wrap_from = 1
-            msg = (tr("{n} моделей обгорнуто в одну замкнену оболонку.  ", n=n) if n > 1
-                   else "Обгортка готова.  ") + msg
+            msg = (tr("{n} models wrapped into one closed shell.  ", n=n) if n > 1
+                   else tr("Wrap done.  ")) + msg
             if after.open_edges == 0:
-                msg += ".  Дірок і non-manifold ребер більше немає"
+                msg += tr(".  No more holes and non-manifold edges")
             med, p90, worst = getattr(self, "_wrap_dev", (0.0, 0.0, 0.0))
             if worst > 0:
-                msg += (tr(".  Поверхня зсунулася: медіана {med}, "
-                        "90% у межах {p90}, максимум "
-                        "{worst}", med=phys.fmt_len(med), p90=phys.fmt_len(p90), worst=phys.fmt_len(worst)))
+                msg += (tr(".  The surface moved: median {med}, 90% "
+                           "within {p90}, maximum {worst}", med=phys.fmt_len(med), p90=phys.fmt_len(p90), worst=phys.fmt_len(worst)))
         if key == "decimate" and after.open_edges > before.open_edges:
             # Квадричне проріднення рве тонкі місця й зони взаємного врізання.
-            msg += (".  Відкритих ребер побільшало: проріднення рве тонкі "
-                    "стінки. Якщо дірки стали більшими за комірку — "
-                    "прорідніть менше")
+            msg += (tr(".  There are more open edges: decimation tears thin "
+                    "walls. If the holes are now larger than a cell, "
+                    "decimate less"))
         if key == "winfix" and before.open_edges and after.open_edges == 0:
-            msg += (".  Дірок більше немає, і модель при цьому не прорідило — "
-                    "на відміну від обгортання")
+            msg += (tr(".  No more holes, and the model was not decimated — "
+                    "unlike with wrapping"))
         if key in meshfix.METHODS and meshfix.last_report:
-            msg += (f".  {meshfix.METHODS[key][0]}: "
+            msg += (".  " + tr(meshfix.METHODS[key][0]) + ": "
                     + meshfix.summary(meshfix.last_report))
-        self.statusBar().showMessage(tr("Ремонт: {msg}", msg=msg), 12000)
+        self.statusBar().showMessage(tr("Repair: {msg}", msg=msg), 12000)
 
     def set_rookie(self, on: bool):
         """Показує або ховає блоки пояснень біля всіх налаштувань."""
         panels.set_rookie(on)
         fset.set("rookie", bool(on))
         self.statusBar().showMessage(
-            "Режим новачка увімкнено: біля кожного налаштування зʼявилося "
-            "пояснення, на що воно впливає." if on
-            else "Режим новачка вимкнено. Підказки лишаються при наведенні "
-                 "миші.", 8000)
+            "Beginner mode is on: each setting now has an explanation of "
+            "what it affects." if on
+            else "Beginner mode is off. Tooltips still show on mouse hover.", 8000)
 
     def open_manual(self):
         path = fs_i18n.localized(APP_DIR / "NASTANOVA.md")
         if not path.is_file():
             QtWidgets.QMessageBox.information(
-                self, "Настанови немає", tr("Очікувався файл {path}", path=path))
+                self, tr("Guide not found"), tr("Expected the file {path}", path=path))
             return
         try:
             os.startfile(str(path))
         except OSError:
             QtGui.QDesktopServices.openUrl(
                 QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_install_guide(self):
+        """«Help → Install and server guide»: docs/INSTALL.<lang>.md."""
+        self._guide = fs_serverwiz.open_guide(self)
 
     def open_glossary(self) -> bool:
         """Словник термінів і формул — у браузері за замовчуванням.
@@ -4294,7 +4391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         path = fs_i18n.localized(APP_DIR / "SLOVNYK.html")
         if not path.is_file():
             QtWidgets.QMessageBox.information(
-                self, "Словника немає", tr("Очікувався файл {path}", path=path))
+                self, tr("Glossary not found"), tr("Expected the file {path}", path=path))
             return False
         if not QtGui.QDesktopServices.openUrl(
                 QtCore.QUrl.fromLocalFile(str(path))):
@@ -4302,10 +4399,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 os.startfile(str(path))
             except OSError as exc:
                 QtWidgets.QMessageBox.warning(
-                    self, "Не вдалося відкрити словник",
+                    self, tr("Could not open the dictionary"),
                     f"{path}{NEWLINE}{NEWLINE}{exc}")
                 return False
-        self.statusBar().showMessage(tr("Словник: {path}", path=path), 6000)
+        self.statusBar().showMessage(tr("Glossary: {path}", path=path), 6000)
         return True
 
     # --- помічник -------------------------------------------------------
@@ -4313,8 +4410,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def compute_advice(self):
         if self.diag is None:
             QtWidgets.QMessageBox.information(
-                self, "Немає геометрії",
-                "Спершу завантажте STL — помічник рахує саме з нього.")
+                self, tr("No geometry"),
+                tr("Load an STL first — the assistant computes from it."))
             return
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
@@ -4336,14 +4433,14 @@ class MainWindow(QtWidgets.QMainWindow):
             trial = copy.deepcopy(self.cfg)
             adv.apply_plan(trial, plan)
             if (fc.mesh_dicts(trial) != fc.mesh_dicts(self.cfg)
-                    and not self.mesh_guard("зміни Помічника")):
+                    and not self.mesh_guard(tr("the Assistant changes"))):
                 return
         adv.apply_plan(self.cfg, plan)
         self.reload_panels()
         self.refresh_all()
         self.statusBar().showMessage(
-            tr("Застосовано {n_changes} змін. Перерахуйте, якщо "
-            "міняли швидкість або геометрію.", n_changes=len(plan.changes)), 10000)
+            tr("Applied {n_changes} changes. Compute again if you "
+               "changed the speed or the geometry.", n_changes=len(plan.changes)), 10000)
 
     def reload_panels(self):
         """Переносить значення з конфігу назад у віджети — усі, а не вибрані.
@@ -4380,12 +4477,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         target = max(need * 2, 20_000)
         ans = QtWidgets.QMessageBox.question(
-            self, "Проріднити геометрію?",
-            tr("У моделі {have:,} трикутників, а при комірці "
-            "{cell} достатньо приблизно {need:,}.\n\n"
-            "Зайва тесселяція не додасть точності, але сповільнить "
-            "snappyHexMesh і саму програму.\n\n"
-            "Проріднити до {target:,} трикутників?", have=have, cell=phys.fmt_len(cell), need=need, target=target).replace(",", " "),
+            self, tr("Decimate the geometry?"),
+            tr("The model has {have:,} triangles, but with a cell of "
+               "{cell} about {need:,} are enough.\n\nExtra tessellation "
+               "does not add accuracy, but it slows down snappyHexMesh "
+               "and the program itself.\n\nDecimate to {target:,} "
+               "triangles?", have=have, cell=phys.fmt_len(cell), need=need, target=target).replace(",", " "),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes)
         if ans != QtWidgets.QMessageBox.Yes:
@@ -4458,8 +4555,7 @@ class MainWindow(QtWidgets.QMainWindow):
         box_notes = self.cfg.guard_boxes() + self.cfg.guard_scale()
         self.panel_mesh.show_box_note(
             "  ".join(t for _, t in box_notes) if box_notes
-            else (tr("Коробка: {volume:.4g} м³, "
-                  "рівень {level}.", volume=self.cfg.mesh.boxes[0].volume, level=self.cfg.mesh.boxes[0].level)
+            else (tr("Box: {volume:.4g} m³, level {level}.", volume=self.cfg.mesh.boxes[0].volume, level=self.cfg.mesh.boxes[0].level)
                   if self.cfg.mesh.boxes else ""))
         self.panel_dom.refresh()
         self.panel_mesh.refresh()
@@ -4472,10 +4568,10 @@ class MainWindow(QtWidgets.QMainWindow):
             extra = []
             lvl, msg = geo.leak_advice(self.diag, self.cfg.surface_cell)
             if msg:
-                extra.append(("Ризик витоку", msg, lvl))
+                extra.append((tr("Leak risk"), msg, lvl))
             lvl, msg = geo.tesselation_advice(self.diag, self.cfg.surface_cell)
             if msg:
-                extra.append(("Тесселяція vs комірка", msg, lvl))
+                extra.append((tr("Tessellation vs cell"), msg, lvl))
             self.panel_geo.show_diagnosis(
                 geo.diagnosis_rows(self.diag), self.diag.notes, extra)
             self.viewport.refresh_scene(self.cfg)
@@ -4492,9 +4588,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """"" if the trial mesh fits maxGlobalCells and memory, else why."""
         est = trial.estimate()
         if est.total > trial.mesh.max_global_cells:
-            return (tr("оцінка {total} комірок більша за "
-                    "maxGlobalCells "
-                    "{max_global_cells}", total=phys.fmt_cells(est.total), max_global_cells=phys.fmt_cells(trial.mesh.max_global_cells)))
+            return (tr("the estimate of {total} cells is larger than "
+                       "maxGlobalCells {max_global_cells}", total=phys.fmt_cells(est.total), max_global_cells=phys.fmt_cells(trial.mesh.max_global_cells)))
         try:
             fit = self._mem_fit(trial)
         except Exception:                                  # noqa: BLE001
@@ -4525,7 +4620,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_turbulence(self, model: str) -> None:
         """Fix button of the y+ check: another turbulence model."""
         self.panel_flow.cmb_turb.setCurrentText(model)
-        self.statusBar().showMessage(tr("Модель турбулентності: {model}.", model=model), 6000)
+        self.statusBar().showMessage(tr("Turbulence model: {model}.", model=model), 6000)
 
     def _set_treatment(self, key: str) -> None:
         """Fix button of the y+ check: another wall treatment."""
@@ -4533,7 +4628,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if i >= 0:
             self.panel_flow.cmb_wall.setCurrentIndex(i)
             self.statusBar().showMessage(
-                tr("Обробка стінки: {TREATMENT_LABELS}.", TREATMENT_LABELS=fy.TREATMENT_LABELS[key]), 6000)
+                tr("Wall treatment: {TREATMENT_LABELS}.", TREATMENT_LABELS=fy.TREATMENT_LABELS[key]), 6000)
 
     def update_status(self):
         s = fc.summary(self.cfg)
@@ -4541,12 +4636,12 @@ class MainWindow(QtWidgets.QMainWindow):
         parts = [
             f"Re {s['Re']}",
             f"M {s['Mach']}",
-            tr("комірок ~{s}", s=s['Комірок (оцінка)']),
-            f"snappy ~{s['Памʼять snappy']}",
-            f"y+ {s['y+ (оцінка)']}",
-            tr("комірка {s} → {s2}", s=s['Фонова комірка'], s2=s['Комірка на поверхні']),
+            tr("cells ~{s}", s=s['Cells (estimate)']),
+            f"snappy ~{s['snappy memory']}",
+            f"y+ {s['y+ (estimate)']}",
+            tr("cell {s} → {s2}", s=s['Background cell'], s2=s['Surface cell']),
         ]
-        self.status.setText("   |   ".join(parts))
+        self.status.setText(fs_i18n.join("   |   ", parts))
 
         warn = []
         fit = self._mem_fit()
@@ -4556,19 +4651,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.setToolTip(tip)
         self.lbl_warn.setToolTip(tip)
         if est.total > self.cfg.mesh.max_global_cells:
-            warn.append("⚠ оцінка перевищує maxGlobalCells")
+            warn.append(tr("⚠ estimate exceeds maxGlobalCells"))
         if self.diag is not None and not self.diag.closed:
             lvl, _ = geo.leak_advice(self.diag, self.cfg.surface_cell)
-            warn.append("⚠ дірки більші за комірку — протече" if lvl == "bad"
-                        else "⚠ поверхня не замкнена")
+            warn.append(tr("⚠ holes larger than a cell — it will leak") if lvl == "bad"
+                        else tr("⚠ surface not closed"))
         f = self.cfg.flow
         if f.farfield_mode == "tunnel" and (abs(f.aoa_deg) > 0.01
                                             or abs(f.aos_deg) > 0.01):
-            warn.append("⚠ slip зріже кут атаки")
+            warn.append(tr("⚠ slip will cut the angle of attack"))
         yc = fy.case_check(self.cfg)
         if not yc.ok:
             warn.append("⚠ " + yc.short)
-        self.lbl_warn.setText("   ".join(warn))
+        self.lbl_warn.setText(fs_i18n.join("   ", warn))
         # Лише «ℹ» (памʼять ще невідома) — не тривога: сірим, не червоним.
         alarm = any("⚠" in t for t in warn)
         self.lbl_warn.setStyleSheet("color:#c0392b; font-weight:bold;" if alarm
@@ -4608,11 +4703,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._detecting = True
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self._busy("⏳ Шукаю OpenFOAM…")
+            self._busy(tr("⏳ Searching for OpenFOAM…"))
             self.backends = be.detect_all(
                 ssh_hosts=self._ssh_hosts(),
+                containers=be.containers_setting(fset.get("ssh_containers")),
                 progress=lambda name, i, n: self._busy(
-                    tr("⏳ Перевіряю машини: {name}… ({i} з {n})", name=name, i=i, n=n)))
+                    tr("⏳ Checking machines: {name}… ({i} of {n})", name=name, i=i, n=n)))
             self._detect_done()
         finally:
             self._busy("")
@@ -4623,12 +4719,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _backends_summary(self) -> str:
         """Коротко: які машини відповіли. Для рядка стану після пошуку."""
         if not self.backends:
-            return "Машини перевірено: OpenFOAM не знайдено ніде."
+            return tr("Machines checked: OpenFOAM was not found anywhere.")
         parts = []
         for b in self.backends:
             name = b.host if b.kind == "ssh" and b.host else b.label.split(" / ")[0]
             parts.append(f"{name} {'✔' if b.ready else '✖'}")
-        return tr("Машини перевірено: {parts}", parts=", ".join(parts))
+        return tr("Machines checked: {parts}", parts=", ".join(parts))
 
     def _detect_done(self):
         """Що робимо зі знайденими бекендами: список, вибір, ресурси."""
@@ -4644,7 +4740,7 @@ class MainWindow(QtWidgets.QMainWindow):
         b = self.panel_run.current_backend()
         if b is not None:
             # Для сервера це ще один запит по SSH.
-            self._busy(tr("⏳ Читаю ядра й памʼять: {v}…", v=b.host or b.label))
+            self._busy(tr("⏳ Reading cores and memory: {v}…", v=b.host or b.label))
         self._show_resources(clamp=True)
         self.update_status()
 
@@ -4674,11 +4770,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # готовим, його памʼять так і лишилася б невідомою (а раніше
             # бралися 8 ГБ чи памʼять попереднього бекенда). Спитаємо при
             # наступному пошуку бекендів.
-        where = b.host if b.kind == "ssh" else "цьому компʼютері"
+        where = b.host if b.kind == "ssh" else tr("this computer", ctx="locative")
         cores, threads, ram = self._res_cache.get(key, (0, 0, 0.0))
         if cores <= 0:
             self.panel_solve.lbl_res.setText(
-                tr("Ядра й памʼять на {where} ще невідомі{v}", where=where, v=" — сервер ще не відповів." if b.kind == "ssh" else "."))
+                tr("Cores and memory on {where} are not known yet{v}", where=where, v=" — the server has not answered yet." if b.kind == "ssh" else "."))
             return
         self.panel_solve.set_resources(cores, ram, threads=threads, where=where)
         # Число процесів пересуваємо лише при першому пошуку: інакше
@@ -4717,11 +4813,11 @@ class MainWindow(QtWidgets.QMainWindow):
         b = pr.current_backend()
         ram = self._backend_resources(b)[2]
         if b is None:
-            name, kind = "бекенді", "ssh"
+            name, kind = "the backend", "ssh"
         elif b.kind == "ssh":
             name, kind = b.host, "ssh"
         else:
-            name = tr("цьому компʼютері{v}", v=" (WSL)" if b.kind == "wsl" else "")
+            name = tr("this computer{v}", v=" (WSL)" if b.kind == "wsl" else "")
             kind = b.kind
         mesher = memfit.MemHost(name, ram, memfit.headroom_for(kind),
                                 ranks=max(1, cfg.solver.n_procs))
@@ -4752,10 +4848,10 @@ class MainWindow(QtWidgets.QMainWindow):
         distro = b.distro if b and b.distro else "Ubuntu"
         argv, script = be.install_command(distro)
         ans = QtWidgets.QMessageBox.question(
-            self, "Встановити OpenFOAM",
-            tr("Відкриється консоль WSL і виконає:\n\n{script}\n\nЦе "
-               "завантажить близько 1-2 ГБ і попросить пароль sudo. "
-               "Продовжити?", script=script),
+            self, tr("Install OpenFOAM"),
+            tr("A WSL console will open and run:\n\n{script}\n\nThis will "
+               "download about 1-2 GB and ask for the sudo password. "
+               "Continue?", script=script),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
         if ans != QtWidgets.QMessageBox.Yes:
             return
@@ -4763,16 +4859,16 @@ class MainWindow(QtWidgets.QMainWindow):
             import subprocess
             subprocess.Popen(argv)
             self.panel_run.lbl_status.setText(
-                "Консоль відкрито. Після завершення натисніть «Пошук».")
+                "Console opened. When it is done, click “Search”.")
         except OSError as exc:
-            QtWidgets.QMessageBox.critical(self, "Не вдалося запустити", str(exc))
+            QtWidgets.QMessageBox.critical(self, tr("Could not start"), str(exc))
 
     # --- кейс -----------------------------------------------------------
 
     def create_case(self, report=True) -> str | None:
         if self.mesh is None:
-            QtWidgets.QMessageBox.warning(self, "Немає геометрії",
-                                          "Спершу завантажте STL.")
+            QtWidgets.QMessageBox.warning(self, tr("No geometry"),
+                                          tr("Load an STL first."))
             return None
         # Точка в потоці — та, від якої snappy заливає повітря. Якщо вона
         # сидить усередині габариту тіла або стоїть на межі домену, кейс
@@ -4780,15 +4876,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # обтікання. Мовчки такого пропускати не можна.
         if self.cfg.point_clearance(self.cfg.location_in_mesh) <= 0:
             QtWidgets.QMessageBox.critical(
-                self, "Точці в потоці немає де стати",
-                tr("Точка, від якої snappyHexMesh заливає повітря, "
-                   "виходить усередині габариту тіла або рівно на межі "
-                   "домену.{NEWLINE}{NEWLINE}Точка: "
-                   "{location_in_mesh}{NEWLINE}Домен: "
-                   "{tuple}{NEWLINE}{NEWLINE}Так буває від нульових "
-                   "відступів домену або від власної точки, що приїхала "
-                   "з імпортованих налаштувань. Збільште відступи на "
-                   "вкладці «Домен» — і кейс збереться.", NEWLINE=NEWLINE, location_in_mesh=self.cfg.location_in_mesh, tuple=tuple(round(v, 4) for v in self.cfg.bounds)))
+                self, tr("There is no place for the point in flow"),
+                tr("The point from which snappyHexMesh fills the air is "
+                   "inside the body bounding box or exactly on the "
+                   "domain boundary.{NEWLINE}{NEWLINE}Point: "
+                   "{location_in_mesh}{NEWLINE}Domain: "
+                   "{tuple}{NEWLINE}{NEWLINE}This happens with zero "
+                   "domain margins or with a custom point that came from "
+                   "imported settings. Increase the margins on the "
+                   "“Domain” tab — and the case will build.", NEWLINE=NEWLINE, location_in_mesh=self.cfg.location_in_mesh, tuple=tuple(round(v, 4) for v in self.cfg.bounds)))
             return None
         # Налаштування часу в нестаціонарі легко задати так, що прогін
         # триватиме тижні або забʼє диск тисячами тек. Це видно ЩЕ ДО
@@ -4806,20 +4902,20 @@ class MainWindow(QtWidgets.QMainWindow):
         warnings = [text for level, text in checks if level == "warn"]
         if blocking:
             QtWidgets.QMessageBox.critical(
-                self, "Так рахувати не вийде",
-                tr("{blocking}{NEWLINE}{NEWLINE}Кейс не створено. Те "
-                   "саме показано й на самих вкладках, поруч із "
-                   "налаштуванням, якого це стосується.", blocking=(NEWLINE + NEWLINE).join(blocking), NEWLINE=NEWLINE))
+                self, tr("Cannot run like this"),
+                tr("{blocking}{NEWLINE}{NEWLINE}The case was not "
+                   "created. The same message is also shown on the tabs, "
+                   "next to the setting it applies to.", blocking=(NEWLINE + NEWLINE).join(blocking), NEWLINE=NEWLINE))
             return None
         if warnings and self._series_quiet():
             # На першому куті серії людина це вже бачила й погодилась.
             for text in warnings:
-                self.log.push(tr("Попередження (погоджено на першому куті "
-                              "серії): {text}", text=text))
+                self.log.push(tr("Warning (accepted at the first angle "
+                                 "of the series): {text}", text=text))
         elif warnings:
             ans = QtWidgets.QMessageBox.question(
-                self, "Перевірте налаштування",
-                tr("{warnings}{NEWLINE}{NEWLINE}Створити кейс попри це?", warnings=(NEWLINE + NEWLINE).join(warnings), NEWLINE=NEWLINE),
+                self, tr("Check the settings"),
+                tr("{warnings}{NEWLINE}{NEWLINE}Create the case anyway?", warnings=(NEWLINE + NEWLINE).join(warnings), NEWLINE=NEWLINE),
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No)
             if ans != QtWidgets.QMessageBox.Yes:
@@ -4829,9 +4925,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Імʼя йде в теку: «11:15» тут валило створення ([WinError 123]).
         name = fc.safe_case_name(self.cfg.name)
         if name != self.cfg.name:
-            self.log.push(tr("Назву кейсу «{name}» змінено на «{name2}»: "
-                          "у теці не можна мати двокрапку, пробіли, лапки "
-                          "тощо.", name=self.cfg.name, name2=name))
+            self.log.push(tr("Case name “{name}” changed to “{name2}”: a "
+                             "folder name cannot have a colon, spaces, "
+                             "quotes and so on.", name=self.cfg.name, name2=name))
             self.cfg.name = name
             self.panel_run.ed_name.blockSignals(True)
             self.panel_run.ed_name.setText(name)
@@ -4854,8 +4950,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # find MRF cellZone», хоча сама постановка виглядала чистою.
             stale = fc.prune_stale_files(case_dir, files)
             if stale:
-                self.log.push(tr("Прибрано застарілі файли кейса (умова "
-                                 "більше не виконується): {stale}", stale=", ".join(stale)))
+                self.log.push(tr("Removed stale case files (their "
+                                 "condition no longer applies): {stale}", stale=", ".join(stale)))
             for rel, text in files.items():
                 p = case_dir / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -4874,7 +4970,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lib.write_manifest(case_dir, self.cfg,
                                stl_source=self.stl_source or self.stl_path)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Не вдалося записати кейс",
+            QtWidgets.QMessageBox.critical(self, tr("Could not write the case"),
                                            traceback.format_exc(limit=3))
             return None
 
@@ -4883,11 +4979,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if report:
             est = self.cfg.estimate()
             QtWidgets.QMessageBox.information(
-                self, "Кейс створено",
-                tr("{case_dir}\n\n"
-                "Комірок (оцінка): {total}\n"
-                "Памʼять snappy:   {snappy_peak_gb:.1f} ГБ\n"
-                "Трикутників STL:  {n_cells:,}", case_dir=case_dir, total=phys.fmt_cells(est.total), snappy_peak_gb=est.snappy_peak_gb, n_cells=self.mesh.n_cells).replace(",", " "))
+                self, tr("Case created"),
+                tr("{case_dir}\n\nCells (estimate): {total}\nsnappy memory: "
+                   "   {snappy_peak_gb:.1f} GB\nSTL triangles:    "
+                   "{n_cells:,}", case_dir=case_dir, total=phys.fmt_cells(est.total), snappy_peak_gb=est.snappy_peak_gb, n_cells=self.mesh.n_cells).replace(",", " "))
         return self.case_dir
 
     def _ssh_hosts(self) -> list[str]:
@@ -4909,23 +5004,25 @@ class MainWindow(QtWidgets.QMainWindow):
         fset.set("ssh_host", host)
         if not host:
             self.detect_backends()
-            self.statusBar().showMessage("Сервер прибрано, рахуємо тут.", 8000)
+            self.statusBar().showMessage(tr("Server removed, running here."), 8000)
             return
-        self.statusBar().showMessage(tr("Перевіряю {host}…", host=host))
+        self.statusBar().showMessage(tr("Checking {host}…", host=host))
         QtWidgets.QApplication.processEvents()
-        found = be.detect_ssh([host])
+        found = be.detect_ssh(
+            [host], be.containers_setting(fset.get("ssh_containers")))
         self.detect_backends()
         if found and found[0].ready:
             b = found[0]
             self.statusBar().showMessage(
                 f"{host}: OpenFOAM {b.version}, {b.detail}", 15000)
         else:
-            why = found[0].detail if found else "немає відповіді"
+            why = found[0].detail if found else tr("no response")
             QtWidgets.QMessageBox.warning(
-                self, "Сервер не готовий",
-                tr("{host}: {why}{NEWLINE}{NEWLINE}Потрібен вхід по "
-                   "ключу без пароля і встановлений OpenFOAM. Перевірити "
-                   "вручну: ssh {host} і потім ls /usr/lib/openfoam/", host=host, why=why, NEWLINE=NEWLINE))
+                self, tr("Server not ready"),
+                tr("{host}: {why}{NEWLINE}{NEWLINE}Key login without a "
+                   "password and an installed OpenFOAM are necessary. To "
+                   "check manually: ssh {host} and then ls "
+                   "/usr/lib/openfoam/", host=host, why=why, NEWLINE=NEWLINE))
 
     # --- підключення до прогону, що вже йде --------------------------------
 
@@ -4950,7 +5047,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _peek_worker(self, host: str):
         """Опитування в окремій нитці: ssh думає секунди, вікно не чекає."""
         try:
-            found = [b for b in be.detect_ssh([host]) if b.ready]
+            found = [b for b in be.detect_ssh(
+                [host], be.containers_setting(fset.get("ssh_containers")))
+                if b.ready]
             live = be.list_sessions(found[0]) if found else []
         except Exception:
             live = []          # мовчки: див. docstring вище
@@ -4961,12 +5060,12 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _how_long(seconds: int) -> str:
         if seconds < 0:
-            return "колись"
+            return tr("some time ago")
         if seconds < 90:
-            return "щойно"
+            return tr("just now")
         if seconds < 5400:
-            return tr("{v} хв тому", v=seconds // 60)
-        return tr("{v} год тому", v=seconds // 3600)
+            return tr("{v} min ago", v=seconds // 60)
+        return tr("{v} h ago", v=seconds // 3600)
 
     @QtCore.Slot(object)
     def _say_sessions(self, found):
@@ -4980,28 +5079,23 @@ class MainWindow(QtWidgets.QMainWindow):
         over = [s for s in found if not (s.running and s.alive)]
         self.log.push("")
         if going:
-            self.log.push("НА СЕРВЕРІ ЗАРАЗ РАХУЄТЬСЯ:")
+            self.log.push(tr("RUNNING ON THE SERVER NOW:"))
             for s in going:
-                self.log.push(tr("  • {name} — крок «{v}», "
-                              "пущено {v2}, "
-                              "{log_lines} рядків журналу", name=s.name, v=s.step or '?', v2=s.started or 'невідомо коли', log_lines=s.log_lines))
+                self.log.push(tr("  • {name} — step “{v}”, started {v2}, "
+                                 "{log_lines} log lines", name=s.name, v=s.step_text or '?', v2=s.started or 'at an unknown time', log_lines=s.log_lines))
         if over:
-            self.log.push("СКІНЧИЛОСЯ, ПОКИ ПРОГРАМИ НЕ БУЛО:")
+            self.log.push(tr("FINISHED WHILE THE PROGRAM WAS CLOSED:"))
             for s in over:
                 tail = f" — {s.message}" if s.message else ""
                 self.log.push(f"  • {s.name}: {s.human()} "
                               f"{self._how_long(s.age)}{tail}")
-        self.log.push("Кнопка «Підключитися до прогону» на вкладці «Запуск» "
-                      "покаже журнал і поверне результати.")
+        self.log.push(tr("The “Connect to Run” button on the “Run” tab will "
+                      "show the log and bring back the results."))
         if going:
-            note = (tr("На сервері {v} "
-                    "{n_going} "
-                    "{v2}", v='іде' if len(going) == 1 else 'ідуть', n_going=len(going), v2='прогін' if len(going) == 1 else 'прогони'))
+            note = (tr("{n_going} {v2} {v} on the server", v='there is' if len(going) == 1 else 'there are', n_going=len(going), v2='run' if len(going) == 1 else 'runs'))
         else:
-            note = (tr("{n_over} "
-                    "{v} на сервері "
-                    "скінчилося, поки вас не було", n_over=len(over), v='прогін' if len(over) == 1 else 'прогони'))
-        self.statusBar().showMessage(tr("{note} — див. вкладку «Запуск».", note=note), 20000)
+            note = (tr("{n_over} {v} on the server finished while you were away", n_over=len(over), v='run' if len(over) == 1 else 'runs'))
+        self.statusBar().showMessage(tr("{note} — see the “Run” tab.", note=note), 20000)
         # Кнопку підсвічуємо: журнал легко проминути, а це те саме
         # повідомлення, тільки там, де на нього можна натиснути.
         self.panel_run.btn_attach.setStyleSheet(
@@ -5019,23 +5113,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if backend is None:
             return
         self.statusBar().showMessage(
-            tr("Питаю {host}, що там рахується…", host=backend.host))
+            tr("Asking {host} what is running there…", host=backend.host))
         QtWidgets.QApplication.processEvents()
         try:
             sessions = be.list_sessions(backend)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
-                self, "Сервер не відповів", str(exc)[:400])
+                self, tr("The server did not respond"), str(exc)[:400])
             return
         self.statusBar().clearMessage()
         if not sessions:
             QtWidgets.QMessageBox.information(
-                self, "Прогонів немає",
-                tr("На {host} немає жодного прогону, пущеного цією "
-                   "програмою.{NEWLINE}{NEWLINE}Прогони живуть у "
-                   "~/openfoam-studio/<назва кейсу>. Якщо ви запускали "
-                   "розрахунок руками, програма про нього не знає — вона "
-                   "шукає свою теку studio/ поруч із кейсом.", host=backend.host, NEWLINE=NEWLINE))
+                self, tr("No runs"),
+                tr("On {host} there is no run started by this "
+                   "program.{NEWLINE}{NEWLINE}Runs live in "
+                   "~/openfoam-studio/<case name>. If you started a "
+                   "calculation manually, the program does not know "
+                   "about it — it looks for its studio/ folder next to "
+                   "the case.", host=backend.host, NEWLINE=NEWLINE))
             return
         picked = self.pick_session(sessions)
         if picked is None:
@@ -5048,9 +5143,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not host:
             self.panel_run.ed_server.setFocus()
             QtWidgets.QMessageBox.information(
-                self, "Сервер не вказано",
-                "Впишіть сервер у поле «Сервер» — імʼя з ~/.ssh/config "
-                "або user@host.")
+                self, tr("No server specified"),
+                tr("Enter the server in the “Server” field — a name from "
+                "~/.ssh/config or user@host."))
             return None
         if not self.panel_run.select_ssh_backend():
             self.recheck_server()
@@ -5066,21 +5161,21 @@ class MainWindow(QtWidgets.QMainWindow):
         уміти його обійти, не зупиняючись назавжди.
         """
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Прогони на сервері")
+        dlg.setWindowTitle("Runs on the Server")
         dlg.resize(760, 360)
         lay = QtWidgets.QVBoxLayout(dlg)
         lay.addWidget(QtWidgets.QLabel(
-            "Виберіть прогін. Той, що йде, показуватиметься далі наживо; "
-            "той, що скінчився, відкриється журналом і результатами."))
+            "Select a run. A run in progress will continue to show live; "
+            "a finished run will open with its log and results."))
         table = QtWidgets.QTableWidget(len(sessions), 5, dlg)
         table.setHorizontalHeaderLabels(
-            ["Кейс", "Стан", "Крок", "Пущено", "Рядків"])
+            ["Case", "Status", "Pitch", "Started", tr("Lines", ctx="log")])
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.verticalHeader().setVisible(False)
         for r, s in enumerate(sessions):
-            for c, text in enumerate((s.name, s.human(), s.step or "—",
+            for c, text in enumerate((s.name, s.human(), s.step_text or "—",
                                       s.started or "—", str(s.log_lines))):
                 item = QtWidgets.QTableWidgetItem(text)
                 if s.stale:
@@ -5094,8 +5189,8 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(table, 1)
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Підключитися")
-        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Скасувати")
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Connect")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Cancel")
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         table.doubleClicked.connect(dlg.accept)
@@ -5109,7 +5204,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Почати читати журнал сесії з сервера."""
         if self.thread is not None and self.thread.isRunning():
             QtWidgets.QMessageBox.information(
-                self, "Зачекайте", "Спершу зупиніть поточний прогін.")
+                self, tr("Wait"), tr("Stop the current run first."))
             return
         # Кейс беремо той, з якого прогін пустили, якщо він ще на місці.
         # Якщо ні — читаємо самий лише журнал: результати нікуди не
@@ -5119,16 +5214,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if case_dir:
             self.case_dir = case_dir
         self.log.clear_log()
-        self.log.push(tr("Підключаюсь до {host}:{remote_dir}", host=backend.host, remote_dir=session.remote_dir))
-        self.log.push(tr("Кейс «{name}», стан: {human}{v}", name=session.name, human=session.human(), v=tr(", крок «{step}»", step=session.step) if session.step else ""))
+        self.log.push(tr("Connecting to {host}:{remote_dir}", host=backend.host, remote_dir=session.remote_dir))
+        self.log.push(tr("Case “{name}”, status: {human}{v}", name=session.name, human=session.human(), v=tr(", step “{step}”", step=session.step_text) if session.step else ""))
         if not case_dir and session.case_dir:
             self.log.push(
-                tr("Теки {case_dir} тут немає — результати за потреби "
-                "заберете кнопкою «Забрати з сервера».", case_dir=session.case_dir))
+                tr("The folder {case_dir} is not here — if necessary, "
+                   "get the results with the “Get from Server” button.", case_dir=session.case_dir))
         if session.stale:
-            self.log.push("УВАГА: у стані написано «іде», а процесу на "
-                          "сервері немає. Журнал покажу, але прогін уже не "
-                          "триває.")
+            self.log.push(tr("WARNING: the status says “running”, but there "
+                          "is no process on the server. The log will be "
+                          "shown, but the run is no longer in progress."))
         self.plots.set_steady(self.cfg.solver.steady)
         self.plots.update_plots({}, {})
         self._run_started = time.monotonic()
@@ -5142,9 +5237,11 @@ class MainWindow(QtWidgets.QMainWindow):
             sync_back=bool(case_dir), name=session.name,
             attach_to=session.remote_dir)
         self.thread = QtCore.QThread(self)
+        self.thread.setObjectName("run")
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.line.connect(self._run_line)
+        self.worker.event.connect(self._run_event)
         # Підключення — до прогону, що вже живе на сервері сам.
         self._laptop("free")
         self.worker.step.connect(self.on_step)
@@ -5182,7 +5279,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Відкриває збережену симуляцію: налаштування, геометрію, результати."""
         if self._load_thread is not None:
             self.statusBar().showMessage(
-                "Зачекайте: ще читається попередня геометрія.", 6000)
+                tr("Wait: the previous geometry is still being read."), 6000)
             return
         # ПРОЄКТ МАЄ ПЕРЕВАГУ НАД КЕЙСОМ, якщо він є. У кейсі лежить уже
         # злита геометрія, а в проєкті — кожна деталь окремо, з роллю,
@@ -5190,7 +5287,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # прогоном, тож для всього, що рахувалося з цієї програми, він є.
         proj = self.project_for_case(Path(path).name)
         if proj is not None:
-            self.log.push(tr("Для кейсу є проєкт {name} — відкриваю його", name=proj.name))
+            self.log.push(tr("There is a project {name} for the case — opening it", name=proj.name))
             # Кейс беремо той, що вибрали в списку, а не той, що записаний
             # у проєкті: кейс могли перейменувати чи перенести.
             self._project_force_case = path
@@ -5238,19 +5335,19 @@ class MainWindow(QtWidgets.QMainWindow):
         """Кейс без маніфесту: налаштування невідомі, лишається перегляд."""
         if not info.times:
             QtWidgets.QMessageBox.information(
-                self, "Нічого відкривати",
-                tr("У кейсі «{name}» немає ні файла {MANIFEST} з "
-                "налаштуваннями, ні прорахованих часових каталогів.\n\n"
-                "Логи можна почитати в каталозі кейсу, а щоб рахувати далі — "
-                "створіть кейс заново.", name=info.name, MANIFEST=lib.MANIFEST))
+                self, tr("Nothing to open"),
+                tr("The case “{name}” has neither a {MANIFEST} file with "
+                   "settings nor computed time directories.\n\nYou can "
+                   "read the logs in the case directory, but to continue "
+                   "the run, create the case again.", name=info.name, MANIFEST=lib.MANIFEST))
             return
         ans = QtWidgets.QMessageBox.question(
-            self, "Тільки результати",
-            tr("У кейсі «{name}» немає файла {MANIFEST}, тому "
-            "налаштування відновити не вийде — у system/ лежать уже готові "
-            "словники.\n\nПоказати самі результати? Cp рахуватиметься з "
-            "поточної швидкості {u_inf:.4g} м/с, а не з тієї, "
-            "з якою кейс рахувався.", name=info.name, MANIFEST=lib.MANIFEST, u_inf=self.cfg.flow.u_inf),
+            self, tr("Results Only"),
+            tr("The case “{name}” has no {MANIFEST} file, so the "
+               "settings cannot be restored — system/ holds only the "
+               "finished dictionaries.\n\nShow just the results? Cp will "
+               "be computed from the current speed {u_inf:.4g} m/s, not "
+               "from the speed the case was run with.", name=info.name, MANIFEST=lib.MANIFEST, u_inf=self.cfg.flow.u_inf),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes)
         if ans != QtWidgets.QMessageBox.Yes:
@@ -5296,23 +5393,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.viewport.show_body(self.mesh_display, reset=True)
         self.refresh_all()
 
-        says = [tr("Відкрито «{name}».", name=self.cfg.name)]
+        says = [tr("Opened “{name}”.", name=self.cfg.name)]
         if not info.stl:
-            says.append("STL у кейсі немає — перед запуском відкрийте модель.")
+            says.append(tr("There is no STL in the case — open a model before you run."))
         if dropped:
-            says.append(tr("Не прийнято з маніфесту: {join}.", join=", ".join(dropped[:8])))
+            says.append(tr("Not accepted from the manifest: {join}.", join=", ".join(dropped[:8])))
         if info.times:
             self.load_results()
             self.tabs_right.setCurrentWidget(self.results_view)
-            says.append(tr("Часових зрізів: {n_times}.", n_times=len(info.times)))
+            says.append(tr("Time directories: {n_times}.", n_times=len(info.times)))
         else:
             self.results = None
             self.slice_bar.setEnabled(False)
             self._drop_scene()
-            self.lbl_coeffs.setText("Результатів у цьому кейсі немає.")
+            self.lbl_coeffs.setText("There are no results in this case.")
             if self.mesh is not None:
                 self.tabs_right.setCurrentWidget(self.viewport)
-            says.append("Результатів немає — можна запускати.")
+            says.append(tr("No results — you can run."))
         self.statusBar().showMessage("  ".join(says), 20000)
 
     def open_saved_in_paraview(self, path: str):
@@ -5322,38 +5419,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def save_settings(self):
         """Усі налаштування окремим файлом."""
-        name = tr("{v}-налаштування.json", v=self.cfg.name or "case")
+        name = tr("{v}-settings.json", v=self.cfg.name or "case")
         start = str(Path(self.panel_run.ed_dir.text().strip()
                          or DEFAULT_CASES) / name)
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Зберегти налаштування", start, "JSON (*.json)")
+            self, tr("Save Settings"), start, "JSON (*.json)")
         if not path:
             return
         try:
             lib.export_settings(path, self.cfg)
         except OSError as exc:
-            QtWidgets.QMessageBox.critical(self, "Не вдалося зберегти",
+            QtWidgets.QMessageBox.critical(self, tr("Could not save"),
                                            str(exc))
             return
-        self.statusBar().showMessage(tr("Налаштування збережено: {path}", path=path), 12000)
+        self.statusBar().showMessage(tr("Settings saved: {path}", path=path), 12000)
 
     def load_settings(self):
         """Читає налаштування з файлу — свого або studio.json будь-якого кейсу."""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Відкрити налаштування",
+            self, tr("Open Settings"),
             self.panel_run.ed_dir.text().strip() or str(DEFAULT_CASES),
-            "Налаштування (*.json);;Усі файли (*)")
+            "Settings (*.json);;All files (*)")
         if not path:
             return
         data = lib.import_settings(path)
         if data is None:
             QtWidgets.QMessageBox.warning(
-                self, "Не ті налаштування",
-                tr("У файлі «{name}» немає налаштувань кейсу.\n\n"
-                "Годиться файл, збережений цією програмою, або "
-                "{MANIFEST} з каталогу будь-якого кейсу.", name=Path(path).name, MANIFEST=lib.MANIFEST))
+                self, tr("Wrong settings"),
+                tr("The file “{name}” has no case settings.\n\nUse a file "
+                   "saved by this program, or {MANIFEST} from the "
+                   "directory of any case.", name=Path(path).name, MANIFEST=lib.MANIFEST))
             return
-        if not self.mesh_guard("налаштування з файлу"):
+        if not self.mesh_guard(tr("settings from file")):
             return
 
         # Назва кейсу, файл STL і габарит належать відкритій геометрії, а не
@@ -5368,10 +5465,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.reload_panels()
         self.refresh_all()
-        says = [tr("Налаштування з «{name}» застосовано — "
-                "назва кейсу й габарит лишилися ваші.", name=Path(path).name)]
+        says = [tr("Settings from “{name}” applied — the case name and "
+                   "the bounding box stayed yours.", name=Path(path).name)]
         if dropped:
-            says.append(tr("Не прийнято: {join}.", join=", ".join(dropped[:6])))
+            says.append(tr("Not accepted: {join}.", join=", ".join(dropped[:6])))
         self.statusBar().showMessage("  ".join(says), 15000)
 
     def reset_settings(self):
@@ -5387,15 +5484,15 @@ class MainWindow(QtWidgets.QMainWindow):
         те, від чого бережеться `load_settings`.
         """
         if QtWidgets.QMessageBox.question(
-                self, "Скинути налаштування",
-                tr("Повернути всі налаштування до "
-                   "типових?{NEWLINE}{NEWLINE}Геометрія в сцені, назва "
-                   "кейсу й габарит лишаться. Скинуться режим течії, "
-                   "швидкість, сітка, розвʼязувач, ролі деталей і зони.", NEWLINE=NEWLINE),
+                self, tr("Reset Settings"),
+                tr("Reset all settings to defaults?{NEWLINE}{NEWLINE}The "
+                   "geometry in the scene, the case name and the "
+                   "bounding box stay. The flow mode, speed, mesh, "
+                   "solver, part roles and zones will be reset.", NEWLINE=NEWLINE),
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes:
             return
-        if not self.mesh_guard("скинути налаштування"):
+        if not self.mesh_guard(tr("reset settings")):
             return
 
         keep = (self.cfg.name, self.cfg.stl_file, self.cfg.bbox_min,
@@ -5424,9 +5521,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reload_panels()
         self.rebuild_geometry()
         self.refresh_all()
-        self.log.push("Налаштування скинуто до типових. Геометрія, назва "
-                      "кейсу й габарит лишилися.")
-        self.statusBar().showMessage("Налаштування скинуто до типових.", 12000)
+        self.log.push(tr("Settings reset to the defaults. The geometry, "
+                      "case name and overall size stayed."))
+        self.statusBar().showMessage(tr("Settings reset to the defaults."), 12000)
 
     def save_session(self):
         """Запамʼятовує сесію: налаштування, геометрію і де що лежало.
@@ -5454,7 +5551,7 @@ class MainWindow(QtWidgets.QMainWindow):
         geometry = ""
         if neutral is not None and neutral.n_cells <= lib.MESH_CACHE_LIMIT:
             try:
-                target = lib.session_stl(APP_DIR)
+                target = lib.session_stl(DATA_DIR)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 geo.write_stl(neutral, str(target), binary=True)
                 geometry = str(target)
@@ -5469,7 +5566,7 @@ class MainWindow(QtWidgets.QMainWindow):
         loaded = [p for p in self.parts if p.loaded and p.enabled]
         if loaded and sum(p.mesh.n_cells for p in loaded) <= lib.MESH_CACHE_LIMIT:
             try:
-                target = lib.session_project(APP_DIR)
+                target = lib.session_project(DATA_DIR)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 lib.write_project(target, self.cfg,
                                   [self._part_row(p) for p in loaded],
@@ -5480,7 +5577,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         backend = self.panel_run.current_backend()
         ui = {
+            # "backend" (the label) stays for older versions of the
+            # program that read the same session file; this version reads
+            # "backend_id", which does not change with the language.
             "backend": backend.label if backend else "",
+            "backend_id": backend.id if backend else "",
             "native": self.panel_run.chk_native.isChecked(),
             "left_tab": self.tabs_left.currentIndex(),
             "target_yplus": self.panel_adv.yplus.value(),
@@ -5491,7 +5592,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ui["project_mesh"] = {"key": self._pmesh.key,
                                   "project": self._pmesh.project}
         lib.write_session(
-            APP_DIR, self.cfg,
+            DATA_DIR, self.cfg,
             stl_source=self.stl_source or self.stl_path, geometry=geometry,
             case_dir=self.case_dir,
             cases_dir=self.panel_run.ed_dir.text().strip(), ui=ui,
@@ -5500,38 +5601,38 @@ class MainWindow(QtWidgets.QMainWindow):
     def _restore_session_if_wanted(self):
         """Прапорець перевіряємо в момент спрацювання, а не при заведенні
         таймера: за ці чверть секунди його могли зняти."""
-        if self.act_session.isChecked():
+        if self.act_session.isChecked() or fs_restart.restore_requested():
             self.restore_session(auto=True)
 
     def restore_session(self, auto: bool = False):
         """Повертає стан, з яким закрили програму."""
-        data = lib.read_session(APP_DIR)
+        data = lib.read_session(DATA_DIR)
         if not data:
             if not auto:
                 QtWidgets.QMessageBox.information(
-                    self, "Сесії ще немає",
-                    tr("Файл {SESSION} зʼявиться, коли ви закриєте "
-                    "програму: у ньому зберігаються налаштування, геометрія "
-                    "й кейс, з якими ви працювали.", SESSION=lib.SESSION))
+                    self, tr("No session yet"),
+                    tr("The file {SESSION} appears when you close the "
+                       "program: it stores the settings, geometry and "
+                       "case you worked with.", SESSION=lib.SESSION))
             return
         if self._load_thread is not None:
             if not auto:
                 self.statusBar().showMessage(
-                    "Зачекайте: ще читається геометрія.", 6000)
+                    tr("Wait: the geometry is still being read."), 6000)
             return
 
         # СПЕРШУ СЦЕНА ПО ДЕТАЛЯХ (сесії з 2026-11-08): ролі, двигуни,
         # диски й ремонт кожної деталі окремо. Сесія старішого формату цього
         # файлу не має — тоді, як і раніше, злитий body.stl.
-        scene = lib.session_scene(APP_DIR, data)
+        scene = lib.session_scene(DATA_DIR, data)
         if scene:
             pack = lib.read_project(scene)
             if pack is not None and self._open_project_data(pack, scene,
                                                             session=data):
                 return
-            self.log.push("Сцену сесії по деталях не прочитано — "
-                          "відновлюю злиту геометрію, як раніше.")
-        geometry = lib.session_geometry(APP_DIR, data)
+            self.log.push(tr("Could not read the per-part session scene — "
+                          "restoring the merged geometry, as before."))
+        geometry = lib.session_geometry(DATA_DIR, data)
         if geometry:
             self._pending_restore = lambda: self._apply_session(data)
             self.load_stl(geometry)
@@ -5553,8 +5654,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # «Скинути» має повертати до відновленого стану (метри, розвороти),
             # а не до файлу в міліметрах, який ще й міг переїхати.
             self.panel_geo.set_file(
-                tr("відновлено з останньої сесії{v}\n«Скинути» повертає "
-                   "до цього ж стану", v=tr("\nвихідний файл: {source}", source=source) if source else ""))
+                tr("restored from the last session{v}\n“Reset” returns to "
+                   "this same state", v=tr("\nsource file: {source}", source=source) if source else ""))
 
         # Каталог кейсів вертаємо як є, навіть якщо його ще немає: «Створити
         # кейс» його й створює, і забирати в людини щойно набраний шлях
@@ -5566,7 +5667,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.case_dir = case_dir if os.path.isdir(case_dir) else ""
 
         ui = data.get("ui") if isinstance(data.get("ui"), dict) else {}
-        self._want_backend = str(ui.get("backend") or "")
+        # An id (this version) or the label of an older version; both
+        # find the backend through be.backend_matches.
+        self._want_backend = str(ui.get("backend_id") or ui.get("backend") or "")
         self._select_backend()
         if isinstance(ui.get("native"), bool):
             self.panel_run.chk_native.setChecked(ui["native"])
@@ -5586,17 +5689,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if isinstance(tab, int) and 0 <= tab < self.tabs_left.count():
             self.tabs_left.setCurrentIndex(tab)
 
-        says = [tr("Відновлено сесію від {get}.", get=data.get('saved', '—'))]
+        says = [tr("Session from {get} restored.", get=data.get('saved', '—'))]
         if self.mesh is None:
-            says.append("Геометрії в сесії немає — відкрийте STL.")
+            says.append(tr("There is no geometry in the session — open an STL."))
         if self.case_dir:
-            says.append(tr("Кейс: {name}.", name=Path(self.case_dir).name))
+            says.append(tr("Case: {name}.", name=Path(self.case_dir).name))
             if post.has_results(self.case_dir):
-                says.append("Результати на місці — «Завантажити результати».")
+                says.append(tr("Results are in place — “Load Results”."))
         elif case_dir:
-            says.append(tr("Каталог кейсу {case_dir} зник.", case_dir=case_dir))
+            says.append(tr("The case folder {case_dir} is gone.", case_dir=case_dir))
         if dropped:
-            says.append(tr("Не прийнято: {join}.", join=", ".join(dropped[:6])))
+            says.append(tr("Not accepted: {join}.", join=", ".join(dropped[:6])))
         self.statusBar().showMessage("  ".join(says), 20000)
 
     def _select_backend(self):
@@ -5606,7 +5709,7 @@ class MainWindow(QtWidgets.QMainWindow):
         combo = self.panel_run.cmb_backend
         for i in range(combo.count()):
             backend = combo.itemData(i)
-            if backend is not None and backend.label == self._want_backend:
+            if be.backend_matches(backend, self._want_backend):
                 combo.setCurrentIndex(i)
                 self._want_backend = ""
                 return
@@ -5638,12 +5741,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not os.path.isdir(self.case_dir):
             self.case_dir = ""
             self.lbl_coeffs.setText(
-                "Кейс видалено з диска. Налаштування лишилися у вкладках — "
-                "можна створити його заново.")
+                "The case was deleted from the disk. The settings stayed "
+                "in the tabs — you can create it again.")
         else:
             self.lbl_coeffs.setText(
-                "Кейс змінився на диску. Натисніть «Завантажити результати», "
-                "щоб перечитати його.")
+                "The case changed on the disk. Click “Load Results” to "
+                "read it again.")
 
     # --- прогін ---------------------------------------------------------
 
@@ -5676,7 +5779,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 chord=float(p["chord"]), centre=centre, axis="x")
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
-                self, "Гвинт не зібрався", str(exc))
+                self, tr("Propeller was not built"), str(exc))
             return
 
         path = os.path.join(
@@ -5684,7 +5787,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"propeller_{int(p['blades'])}x{int(round(d * 1000))}.stl")
         mesh.save(path)
         part = Part(path=path, mesh=mesh, factor=1.0, auto=1.0,
-                    why="зроблено з чисел", enabled=True, pinned=True,
+                    why="made from numbers", enabled=True, pinned=True,
                     role="rotor", rpm=float(p["rpm"]), rotor_axis="x")
         d2 = geo.diagnose(mesh)
         part.open_edges = d2.open_edges
@@ -5696,12 +5799,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.split_patches = True
             self.panel_geo.chk_split.setChecked(True)
         self.log.push(
-            tr("Гвинт із чисел: {int} лопаті, діаметр {d}, крок "
-               "{fmt_len}, {p:.0f} об/хв. Центр {join}. Файл: {path}", int=int(p['blades']), d=phys.fmt_len(d), fmt_len=phys.fmt_len(float(p['pitch'])), p=p['rpm'], join=" ".join(f"{v:+.4g}" for v in centre), path=path))
+            tr("Propeller from numbers: {int} blades, diameter {d}, "
+               "pitch {fmt_len}, {p:.0f} rpm. Center {join}. File: {path}", int=int(p['blades']), d=phys.fmt_len(d), fmt_len=phys.fmt_len(float(p['pitch'])), p=p['rpm'], join=" ".join(f"{v:+.4g}" for v in centre), path=path))
         self.log.push(
-            "Переріз лопаті тут ЕЛІПС, а не профіль: числа з нього беріть "
-            "як порядок, а не як відповідь. Для справжніх потрібна модель "
-            "лопаті з CAD.")
+            tr("The blade section here is an ELLIPSE, not an airfoil: take "
+            "its numbers as an order of magnitude, not as the answer. "
+            "For real numbers you need a blade model from CAD."))
         self.rebuild_geometry(reset=True)
         self.auto_reference()
         self.refresh_all()
@@ -5734,8 +5837,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.split_patches = True
             self.panel_geo.chk_split.setChecked(True)
             self.log.push(
-                "Роздільні патчі ввімкнено: без них ролі не мають сенсу — "
-                "усі моделі були б однією границею.")
+                tr("Separate patches turned on: without them the roles have "
+                "no meaning — all models would be one boundary."))
         self.rebuild_geometry()
         self.refresh_all()
         self.show_part_role(index)
@@ -5790,16 +5893,16 @@ class MainWindow(QtWidgets.QMainWindow):
                             f"propdisk_{int(round(d * 1000))}.stl")
         mesh.save(path)
         part = Part(path=path, mesh=mesh, factor=1.0, auto=1.0,
-                    why="зроблено з чисел", enabled=True, pinned=True,
+                    why="made from numbers", enabled=True, pinned=True,
                     role=fc.DISK_ROLE, rpm=float(p["rpm"]), rotor_axis="x",
                     disk=fc.ActuatorDisk(hub=hub))
         self.parts.append(part)
         if len(self.enabled_parts()) > 1 and not self.cfg.split_patches:
             self.cfg.split_patches = True
             self.panel_geo.chk_split.setChecked(True)
-        self.log.push(tr("Гвинт-диск із чисел: діаметр {d}, кок "
-                      "{hub}. Тягу й момент задайте в блоці "
-                      "ролі.", d=phys.fmt_len(d), hub=phys.fmt_len(hub)))
+        self.log.push(tr("Actuator disk from numbers: diameter {d}, "
+                         "spinner {hub}. Set the thrust and torque in "
+                         "the role block.", d=phys.fmt_len(d), hub=phys.fmt_len(hub)))
         self.rebuild_geometry(reset=True)
         self.auto_reference()
         self.refresh_all()
@@ -5813,21 +5916,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if d is None:
             live = self.enabled_parts()
             if len(live) < 2 or not self.cfg.split_patches:
-                return ("Диска не буде, доки в сцені одна модель: потрібні "
-                        "роздільні патчі й ще хоча б одна модель.")
-            return ("Диска не створено: уздовж вибраної осі модель не тонка, "
-                    "тобто на диск не схожа. Спробуйте іншу вісь обертання.")
-        gas = (tr(" при газі {throttle:.2f} (×{throttle_factor:.2f})", throttle=d.throttle, throttle_factor=d.throttle_factor)
+                return (tr("There will be no disk while the scene has only "
+                        "one model: separate patches and at least one "
+                        "more model are necessary."))
+            return (tr("No disk created: the model is not thin along the "
+                    "selected axis, so it does not look like a disk. Try "
+                    "another rotation axis."))
+        gas = (tr(" at throttle {throttle:.2f} (×{throttle_factor:.2f})", throttle=d.throttle, throttle_factor=d.throttle_factor)
                if d.from_throttle else "")
-        way = "ПРОТИ годинникової" if d.spin >= 0 else "ЗА годинниковою"
-        swirl = (tr(", момент {torque_now:.3g} Н·м, закрутка {way} з вістря "
-                 "стрілки", torque_now=d.torque_now, way=way) if d.torque_now > 0 else ", без закрутки")
-        off = (" На надзвуку диски вимкнено: rhoCentralFoam джерел не чує."
+        way = tr("COUNTERCLOCKWISE") if d.spin >= 0 else tr("CLOCKWISE")
+        swirl = (tr(", torque {torque_now:.3g} N·m, swirl {way} as seen "
+                    "from the arrow tip", torque_now=d.torque_now, way=way) if d.torque_now > 0 else tr(", no swirl"))
+        off = (tr(" At supersonic speed the disks are off: rhoCentralFoam ignores sources.")
                if self.cfg.flow.supersonic else "")
-        return (tr("Гвинт-диск: радіус {radius}, кок "
-                "{hub}, шар {fmt_len}. "
-                "Тяга {thrust_now:.3g} Н{gas}{swirl}. Струмінь — уздовж "
-                "стрілки; модель у сітку не йде.{off}", radius=phys.fmt_len(d.radius), hub=phys.fmt_len(d.hub), fmt_len=phys.fmt_len(self.cfg.disk_thickness(d)), thrust_now=d.thrust_now, gas=gas, swirl=swirl, off=off))
+        return (tr("Actuator disk: radius {radius}, spinner {hub}, "
+                   "thickness {fmt_len}. Thrust {thrust_now:.3g} "
+                   "N{gas}{swirl}. The jet goes along the arrow; the "
+                   "model does not go into the mesh.{off}", radius=phys.fmt_len(d.radius), hub=phys.fmt_len(d.hub), fmt_len=phys.fmt_len(self.cfg.disk_thickness(d)), thrust_now=d.thrust_now, gas=gas, swirl=swirl, off=off))
 
     def part_flip(self, index: int):
         """Перевернути активний бік кришки: обійти трикутники навпаки.
@@ -5842,7 +5947,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         part.mesh = part.mesh.flip_faces()
         part._posed, part._posed_key = None, None
-        self.log.push(tr("«{name}»: активний бік перевернуто.", name=part.name))
+        self.log.push(tr("“{name}”: active side flipped.", name=part.name))
         self.rebuild_geometry()
         self.refresh_all()
         self.show_part_role(index)
@@ -5923,9 +6028,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     if n:
                         meshes[b.name] = cut
                         self.log.push(
-                            tr("Під кришкою {name} з тіла {name2} "
-                            "вирізано {n} трикутників: кришка лежала "
-                            "впритул, у тій самій площині.", name=cap.name, name2=b.name, n=n))
+                            tr("Under cap {name}, {n} triangles were cut "
+                               "from body {name2}: the cap lay flush, in "
+                               "the same plane.", name=cap.name, name2=b.name, n=n))
         for b, _ in pairs:
             geo.write_stl(meshes[b.name], str(tri_dir / b.stl_file),
                           binary=True)
@@ -5949,41 +6054,39 @@ class MainWindow(QtWidgets.QMainWindow):
         """Що з цієї кришки вийде в розрахунку — числами."""
         e = next((x for x in self.cfg.engines if x.name == part.engine), None)
         if e is None or not part.loaded:
-            return ("Кришка ще не в двигуні: потрібні роздільні патчі й "
-                    "щонайменше ще одна модель у сцені.")
+            return (tr("The cap is not in an engine yet: it needs separate "
+                    "patches and at least one more model in the scene."))
         pt = fc.engine_point(e, self.cfg.flow)
-        gas = (tr(" при газі {throttle:.2f} (×{throttle_factor:.2f})", throttle=e.throttle, throttle_factor=e.throttle_factor)
+        gas = (tr(" at throttle {throttle:.2f} (×{throttle_factor:.2f})", throttle=e.throttle, throttle_factor=e.throttle_factor)
                if e.from_throttle else "")
         if part.role == "nozzle":
             missing = "" if e.intakes else (
-                " Повітрозабірника ще немає — позначте кришку входу з тим "
-                "самим імʼям двигуна.")
+                tr(" There is no intake yet — mark an intake cap with the "
+                "same engine name."))
             if e.thrust_mode == "static" and not e.direct:
                 # Статична — це вхід; тяга в польоті — наслідок. Показуємо
                 # обидві, щоб падіння зі швидкістю було видно числом.
-                g = tr("газ {gas:.2f}", gas=e.gas) if e.from_throttle else "повний газ"
-                return (tr("Двигун {name}: максимальна статична "
-                           "{thrust:.1f} Н → {g}: на стенді {v:.1f} Н, у "
-                           "польоті на {u_inf:g} м/с {thrust2:.1f} Н. "
-                           "Сопло {v2:.3g} см² → витрата "
-                           "{mdot_nozzle:.4g} кг/с, струмінь "
-                           "{v_exit:.0f} м/с (M = {mach_exit:.2f}), "
-                           "{v3:.0f} °C. Повітрозабірників: "
+                g = tr("throttle {gas:.2f}", gas=e.gas) if e.from_throttle else tr("full throttle")
+                return (tr("Engine {name}: maximum static {thrust:.1f} N "
+                           "→ {g}: on the test stand {v:.1f} N, in "
+                           "flight at {u_inf:g} m/s {thrust2:.1f} N. "
+                           "Nozzle {v2:.3g} cm² → mass flow "
+                           "{mdot_nozzle:.4g} kg/s, jet {v_exit:.0f} m/s "
+                           "(M = {mach_exit:.2f}), {v3:.0f} °C. Intakes: "
                            "{n_intakes}.{missing}", name=e.name, thrust=e.thrust, g=g, v=e.thrust * e.throttle_factor, u_inf=self.cfg.flow.u_inf, thrust2=pt.thrust, v2=e.nozzle_area * 1e4, mdot_nozzle=pt.mdot_nozzle, v_exit=pt.v_exit, mach_exit=pt.mach_exit, v3=pt.t_exit - 273.15, n_intakes=len(e.intakes), missing=missing))
-            return (tr("Двигун {name}: тяга {thrust:.1f} Н{gas}. Сопло "
-                       "{v:.3g} см² → витрата {mdot_nozzle:.4g} кг/с, "
-                       "струмінь {v_exit:.0f} м/с (M = {mach_exit:.2f}), "
-                       "{v2:.0f} °C. Повітрозабірників: "
+            return (tr("Engine {name}: thrust {thrust:.1f} N{gas}. "
+                       "Nozzle {v:.3g} cm² → mass flow {mdot_nozzle:.4g} "
+                       "kg/s, jet {v_exit:.0f} m/s (M = "
+                       "{mach_exit:.2f}), {v2:.0f} °C. Intakes: "
                        "{n_intakes}.{missing}", name=e.name, thrust=pt.thrust, gas=gas, v=e.nozzle_area * 1e4, mdot_nozzle=pt.mdot_nozzle, v_exit=pt.v_exit, mach_exit=pt.mach_exit, v2=pt.t_exit - 273.15, n_intakes=len(e.intakes), missing=missing))
         mine = self._patch_of(part)
         i = e.intakes.index(mine) if mine in e.intakes else -1
         if i < 0:
-            return tr("Двигун {name}.", name=e.name)
+            return tr("Engine {name}.", name=e.name)
         missing = "" if e.nozzle else (
-            " Сопла ще немає — позначте кришку зрізу з тим самим імʼям "
-            "двигуна.")
-        return (tr("Двигун {name}: сюди йде {mdot_intakes:.4g} кг/с, "
-                   "швидкість у кришці {v_intakes:.0f} м/с (M = "
+            tr(" No nozzle yet — mark an exit cap with the same engine name."))
+        return (tr("Engine {name}: {mdot_intakes:.4g} kg/s goes in here, "
+                   "speed at the cap {v_intakes:.0f} m/s (M = "
                    "{mach_intakes:.2f}).{missing}", name=e.name, mdot_intakes=pt.mdot_intakes[i], v_intakes=pt.v_intakes[i], mach_intakes=pt.mach_intakes[i], missing=missing))
 
     def show_part_role(self, index: int):
@@ -6011,56 +6114,61 @@ class MainWindow(QtWidgets.QMainWindow):
                         "probe", part.mesh.points, part.rpm or 1.0,
                         part.rotor_axis)
                 if len(live) < 2:
-                    note = ("Зони не буде, доки в сцені ОДНА модель: "
-                            "обертова зона потребує роздільних патчів, а "
-                            "вони мають сенс лише коли тіл кілька. "
-                            "Додайте решту моделей — зона збереться сама.")
+                    note = (tr("There will be no zone while the scene has "
+                            "only ONE model: a rotating zone needs "
+                            "separate patches, and they make sense only "
+                            "when there are several bodies. Add the "
+                            "other models — the zone builds itself."))
                 elif not self.cfg.split_patches:
-                    note = ("Зони не буде без роздільних патчів: без них "
-                            "усі моделі — одна границя, і сказати «крутиться "
-                            "оця» нема про що. Увімкніть «Кожна модель — "
-                            "окремий патч».")
+                    note = (tr("There will be no zone without separate "
+                            "patches: without them all models are one "
+                            "boundary, and there is nothing to say “this "
+                            "one spins” about. Turn on “Each model — "
+                            "separate patch”."))
                 elif fits is None:
-                    note = (tr("Зони не створено: уздовж осі "
-                            "{upper} ця модель не тонша "
-                            "за свій радіус, тобто на диск не схожа. "
-                            "Спробуйте іншу вісь: диск тонкий УЗДОВЖ осі "
-                            "обертання й круглий у двох інших напрямках.", upper=part.rotor_axis.upper()))
+                    note = (tr("Zone not created: along axis {upper} "
+                               "this model is not thinner than its "
+                               "radius, so it does not look like a disk. "
+                               "Try another axis: a disk is thin ALONG "
+                               "the rotation axis and round in the two "
+                               "other directions.", upper=part.rotor_axis.upper()))
                 else:
-                    note = ("Зона ще не перебудована під цю модель — "
-                            "перемкніть роль або посуньте деталь, щоб "
-                            "вона зібралася наново.")
+                    note = (tr("The zone is not rebuilt for this model yet "
+                            "— switch the role or move the part so that "
+                            "it builds again."))
             else:
                 ma = phys.mach(zone.tip_speed, self.cfg.flow.sound_speed)
                 # НАПРЯМОК СЛОВАМИ — саме тут, а не у вювпорті: у VTK
                 # немає кирилиці й немає переносу рядка. У вювпорті
                 # напрямок показує зігнута стрілка, тут — називається.
-                way = ("ПРОТИ годинникової" if part.rpm >= 0
-                       else "ЗА годинниковою")
-                note = (tr("Зона: радіус {radius}, товщина "
-                        "{length}. Кінець лопаті "
-                        "{tip_speed:.4g} м/с, M = {ma:.2f}. "
-                        "Обертання {way}, якщо дивитися З ВІСТРЯ стрілки "
-                        "осі на її основу; у вювпорті це та сама дуга. "
-                        "Знак обертів і міняє бік.", radius=phys.fmt_len(zone.radius), length=phys.fmt_len(zone.length), tip_speed=zone.tip_speed, ma=ma, way=way))
+                way = (tr("COUNTERCLOCKWISE") if part.rpm >= 0
+                       else tr("CLOCKWISE"))
+                note = (tr("Zone: radius {radius}, thickness {length}. "
+                           "Blade tip {tip_speed:.4g} m/s, M = {ma:.2f}. "
+                           "Rotation {way}, looking FROM THE TIP of the "
+                           "axis arrow toward its base; in the viewport "
+                           "it is the same arc. The sign of the rpm "
+                           "changes the direction.", radius=phys.fmt_len(zone.radius), length=phys.fmt_len(zone.length), tip_speed=zone.tip_speed, ma=ma, way=way))
         elif part.role == "motion":
-            note = ("Коливається саме ця частина, решта стоїть. Закон руху "
-                    "задається на вкладці «Розвʼязувач»."
+            note = (tr("Only this part oscillates, the rest stays still. "
+                    "The motion law is set on the “Solver” tab.")
                     if self.cfg.motion.on else
-                    "Коливання вимкнене на вкладці «Розвʼязувач» — поки що "
-                    "ця частина стоятиме разом з рештою.")
+                    tr("Oscillation is off on the “Solver” tab — for now "
+                    "this part stays still with the rest."))
         elif part.role == fc.DISK_ROLE:
             note = self._disk_note(part)
         elif part.role in fc.PORT_ROLES:
             note = self._engine_note(part)
             if self.cfg.flow.compressible and not self.cfg.flow.supersonic:
-                note += (" Режим стисливий — це ПОРТАЛ: поверхня проникна, "
-                         "повітря зникає на вході й з'являється на виході. "
-                         "Активний бік — куди стрілка.")
+                note += (tr(" Compressible mode — this is a PORTAL: the "
+                         "surface is permeable, air disappears at the "
+                         "inlet and appears at the outlet. The active "
+                         "side is where the arrow points."))
             else:
-                note += (" Режим нестисливий — це КРИШКА на моторі: вона "
-                         "має закривати торець замкненого тіла, яке ви "
-                         "змоделювали. Портали є лише в стисливому режимі.")
+                note += (tr(" Incompressible mode — this is a CAP on the "
+                         "engine: it must close the end of the closed "
+                         "body that you modeled. Portals exist only in "
+                         "compressible mode."))
         self.panel_geo.show_part_role(part.name, part.role, part.rpm,
                                       note, part.rotor_axis, part.refine)
         self.panel_geo.show_part_engine(part.role, part.engine,
@@ -6071,8 +6179,7 @@ class MainWindow(QtWidgets.QMainWindow):
         hints = [t for _, t in fc.guard_hinges([(part.name, part.hinge)])] \
             if part.hinge is not None else []
         if not hints and part.hinge is not None and part.hinge.on:
-            hints = [tr("Зараз відхилена на "
-                     "{channels:+.1f}°.", channels=part.angle_at(self.channels))]
+            hints = [tr("Now deflected by {channels:+.1f}°.", channels=part.angle_at(self.channels))]
         self.panel_geo.show_part_hinge(part.hinge, " ".join(hints))
 
     def _update_rotor_axis_preview(self, index: int | None = None) -> None:
@@ -6146,19 +6253,19 @@ class MainWindow(QtWidgets.QMainWindow):
         part = self.parts[index]
         if not part.loaded or part.mesh is None:
             QtWidgets.QMessageBox.information(
-                self, "Модель не прочитана",
-                tr("«{name}» ще не в сцені. Поставте галочку в списку.", name=part.name))
+                self, tr("Model not read"),
+                tr("“{name}” is not in the scene yet. Check it in the list.", name=part.name))
             return
         if key in ("x", "y", "z"):
             part.mesh = geo.rotate(part.mesh, key, value,
                                    pivot=part.mesh.center)
-            what = tr("повернуто на {value:g}° навколо {upper}", value=value, upper=key.upper())
+            what = tr("rotated by {value:g}° around {upper}", value=value, upper=key.upper())
         elif len(key) == 2 and key[0] in "+-" and key[1] in "xyz":
             sign = 1.0 if key[0] == "+" else -1.0
             i = "xyz".index(key[1])
             shift = tuple(sign * value if j == i else 0.0 for j in range(3))
             part.mesh = geo.translate(part.mesh, shift)
-            what = tr("зсунуто на {v:+.4g} м по {upper}", v=sign * value, upper=key[1].upper())
+            what = tr("shifted by {v:+.4g} m along {upper}", v=sign * value, upper=key[1].upper())
         else:
             return
         self.log.push(f"«{part.name}»: {what}")
@@ -6198,8 +6305,7 @@ class MainWindow(QtWidgets.QMainWindow):
             label = dict((k, lab) for k, lab, *_ in fc.RC_CHANNELS).get(
                 h.channel, h.channel)
             if h.channel == "throttle":
-                lines.append(tr("{name}: {label} -> "
-                             "{channels:.0f} об/хв", name=part.name, label=label, channels=part.live_rpm(self.channels)))
+                lines.append(tr("{name}: {label} -> {channels:.0f} rpm", name=part.name, label=label, channels=part.live_rpm(self.channels)))
             else:
                 lines.append(f"{part.name}: {label} -> "
                              f"{part.angle_at(self.channels):+.1f}°")
@@ -6207,7 +6313,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for lvl, text in fc.guard_hinges(
                 [(p.name, h) for p, h in self._controlled()]):
             if lvl == "bad":
-                self.log.push(tr("Керування: {text}", text=text))
+                self.log.push(tr("Control: {text}", text=text))
 
     def part_hinge_set(self, index: int, data: dict):
         """Записати завісу вибраної деталі з полів панелі."""
@@ -6234,10 +6340,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # не коливальна частина — вона просто стоїть відхиленою.
         if part.role != "body" and part.hinge.channel != "throttle":
             self.log.push(
-                tr("«{name}» має роль «{role}», а їй призначено "
-                "канал керма. Для відхилюваної поверхні роль має бути "
-                "«тіло»: вона не крутиться й не коливається, вона стоїть "
-                "у заданому положенні.", name=part.name, role=part.role))
+                tr("“{name}” has the role “{role}”, but a "
+                   "control-surface channel is assigned to it. For a "
+                   "deflecting surface the role must be “body”: it does "
+                   "not spin or oscillate, it stays in the set position.", name=part.name, role=part.role))
         self.rebuild_geometry()
         self.refresh_all()
         self._show_controls()
@@ -6259,8 +6365,8 @@ class MainWindow(QtWidgets.QMainWindow):
         part = self.parts[index]
         if not part.loaded:
             QtWidgets.QMessageBox.information(
-                self, "Модель не прочитана",
-                tr("«{name}» ще не в сцені. Поставте галочку в списку.", name=part.name))
+                self, tr("Model not read"),
+                tr("“{name}” is not in the scene yet. Check it in the list.", name=part.name))
             return
         b = part.mesh.bounds
         ext = [(b[1] - b[0], 0), (b[3] - b[2], 1), (b[5] - b[4], 2)]
@@ -6279,10 +6385,10 @@ class MainWindow(QtWidgets.QMainWindow):
             reverse=h.reverse)
         names = "XYZ"
         self.log.push(
-            tr("«{name}»: завіса вздовж {names} у точці "
-            "({pivot:.4g}, {pivot2:.4g}, {pivot3:.4g}) м — "
-            "передня кромка по {names2}. Перевірте у вювпорті: "
-            "здогад працює для прямого керма, для стрілоподібного — ні.", name=part.name, names=names[span_ax], pivot=pivot[0], pivot2=pivot[1], pivot3=pivot[2], names2=names[chord_ax]))
+            tr("“{name}”: hinge along {names} at the point ({pivot:.4g}, "
+               "{pivot2:.4g}, {pivot3:.4g}) m — leading edge along "
+               "{names2}. Check in the viewport: the guess works for a "
+               "straight control surface, not for a swept one.", name=part.name, names=names[span_ax], pivot=pivot[0], pivot2=pivot[1], pivot3=pivot[2], names2=names[chord_ax]))
         self.rebuild_geometry()
         self.refresh_all()
         self._show_controls()
@@ -6304,16 +6410,16 @@ class MainWindow(QtWidgets.QMainWindow):
         row = self.panel_geo.parts.currentRow()
         if not (0 <= row < len(self.parts)):
             QtWidgets.QMessageBox.information(
-                self, "Модель не вибрано",
-                "Виберіть у списку на вкладці «Геометрія» модель гвинта — "
-                "кнопка візьме її габарит.")
+                self, tr("No model selected"),
+                tr("Select the propeller model in the list on the "
+                "“Geometry” tab — the button will use its bounding box."))
             return
         part = self.parts[row]
         if not part.loaded or part.mesh is None:
             QtWidgets.QMessageBox.information(
-                self, "Модель не прочитана",
-                tr("«{name}» ще не в сцені. Поставте галочку в списку, "
-                "щоб її прочитати.", name=part.name))
+                self, tr("Model not read"),
+                tr("“{name}” is not in the scene yet. Check it in the "
+                   "list to read it.", name=part.name))
             return
 
         zone = fc.rotor_zone_from_points("rotor", part.mesh.points,
@@ -6321,12 +6427,12 @@ class MainWindow(QtWidgets.QMainWindow):
                                          part.rotor_axis)
         if zone is None:
             QtWidgets.QMessageBox.warning(
-                self, "Навколо цієї осі це не гвинт",
-                tr("«{name}» уздовж осі {upper} товща, ніж "
-                   "широка.{NEWLINE}{NEWLINE}Гвинт навколо осі тонкий, а "
-                   "в перерізі впоперек неї — широкий. Перевірте вісь у "
-                   "блоці ролі під списком моделей, або задайте зону "
-                   "вручну.", name=part.name, upper=part.rotor_axis.upper(), NEWLINE=NEWLINE))
+                self, tr("Around this axis this is not a propeller"),
+                tr("“{name}” is thicker along axis {upper} than it is "
+                   "wide.{NEWLINE}{NEWLINE}A propeller is thin along its "
+                   "axis and wide in the cross-section across it. Check "
+                   "the axis in the role block below the model list, or "
+                   "set the zone manually.", name=part.name, upper=part.rotor_axis.upper(), NEWLINE=NEWLINE))
             return
 
         centre, radius, length = zone.centre, zone.radius, zone.length
@@ -6335,28 +6441,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.panel_flow.set_rotating_zone(tuple(centre), radius, length)
         self.log.push(
-            tr("Зона гвинта з «{name}»: центр {join}, радіус {radius}, "
-               "товщина {length}, вісь {upper}", name=part.name, join=" ".join(f"{v:+.4g}" for v in centre), radius=phys.fmt_len(radius), length=phys.fmt_len(length), upper=part.rotor_axis.upper()))
+            tr("Propeller zone from “{name}”: center {join}, radius "
+               "{radius}, thickness {length}, axis {upper}", name=part.name, join=" ".join(f"{v:+.4g}" for v in centre), radius=phys.fmt_len(radius), length=phys.fmt_len(length), upper=part.rotor_axis.upper()))
         if coarse:
             # Сказати вголос, а не роздути зону. Роздута зона крутила б
             # повітря там, де лопатей немає, і це саме той різновид
             # «поправки», після якої число виглядає правдоподібно й бреше.
             self.log.push(
-                tr("УВАГА: комірка тут {cell}, а зона завтовшки "
-                "{length} — у неї не потрапить жодного шару "
-                "комірок. Згустіть сітку навколо гвинта, інакше MRF не "
-                "зробить нічого.", cell=phys.fmt_len(cell), length=phys.fmt_len(length)))
+                tr("WARNING: the cell here is {cell}, but the zone is "
+                   "{length} thick — not one layer of cells fits in it. "
+                   "Refine the mesh around the propeller, or MRF does "
+                   "nothing.", cell=phys.fmt_len(cell), length=phys.fmt_len(length)))
             QtWidgets.QMessageBox.warning(
-                self, "Сітка завгруба для цього гвинта",
-                tr("Зона завтовшки {length}, а комірка в цьому місці "
-                   "{cell}.{NEWLINE}{NEWLINE}У таку зону не потрапить "
-                   "жодного повного шару комірок, і MRF не зробить "
-                   "нічого — мовчки, без помилки.{NEWLINE}{NEWLINE}Зону "
-                   "поставлено правильно. Згустіть сітку навколо гвинта: "
-                   "коробка згущення на вкладці «Сітка» або вищий рівень "
-                   "поверхні.", length=phys.fmt_len(length), cell=phys.fmt_len(cell), NEWLINE=NEWLINE))
+                self, tr("The mesh is too coarse for this propeller"),
+                tr("The zone is {length} thick, but the cell at this "
+                   "place is {cell}.{NEWLINE}{NEWLINE}Not one full layer "
+                   "of cells fits in such a zone, and MRF does nothing — "
+                   "silently, with no error.{NEWLINE}{NEWLINE}The zone "
+                   "is placed correctly. Refine the mesh around the "
+                   "propeller: a refinement box on the “Mesh” tab or a "
+                   "higher surface level.", length=phys.fmt_len(length), cell=phys.fmt_len(cell), NEWLINE=NEWLINE))
         self.statusBar().showMessage(
-            tr("Зону підігнано до «{name}»: радіус {radius}, вісь {upper}.{v}", name=part.name, radius=phys.fmt_len(radius), upper=part.rotor_axis.upper(), v=" Сітка завгруба — див. журнал." if coarse else ""), 15000)
+            tr("Zone fitted to “{name}”: radius {radius}, axis {upper}.{v}", name=part.name, radius=phys.fmt_len(radius), upper=part.rotor_axis.upper(), v=" The mesh is too coarse — see the log." if coarse else ""), 15000)
         self.refresh_all()
 
     def start_run_on_server(self):
@@ -6373,11 +6479,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not host:
             self.panel_run.ed_server.setFocus()
             QtWidgets.QMessageBox.information(
-                self, "Сервер не вказано",
-                tr("Впишіть сервер у поле «Сервер» на цій вкладці — імʼя "
-                   "з ~/.ssh/config або "
-                   "user@host.{NEWLINE}{NEWLINE}Потрібен вхід по ключу "
-                   "без пароля і встановлений там OpenFOAM.", NEWLINE=NEWLINE))
+                self, tr("No server specified"),
+                tr("Enter the server in the “Server” field on this tab — "
+                   "a name from ~/.ssh/config or "
+                   "user@host.{NEWLINE}{NEWLINE}You need key login "
+                   "without a password and OpenFOAM installed there.", NEWLINE=NEWLINE))
             return
         if not self.panel_run.select_ssh_backend():
             # Сервера ще немає серед бекендів: перевіряємо його зараз.
@@ -6386,7 +6492,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self.panel_run.select_ssh_backend():
                 return
         b = self.panel_run.current_backend()
-        self.log.push(tr("Рахуємо на сервері: {label}", label=b.label))
+        self.log.push(tr("Running on the server: {label}", label=b.label))
         self.start_run()
 
     def start_run(self):
@@ -6421,16 +6527,16 @@ class MainWindow(QtWidgets.QMainWindow):
             why = lib.series_problem(self.cfg)
         if why:
             QtWidgets.QMessageBox.warning(
-                self, "Серію не запущено", why[0].upper() + why[1:] + ".")
+                self, tr("Series not started"), why[0].upper() + why[1:] + ".")
             return
         f = self.cfg.flow
         self._series = AngleSeries(base_name=self.cfg.name or "case",
                                    base_aoa=f.aoa_deg, angles=list(angles))
         self.log.push(
-            tr("Серія для нейтральної точки: {runs_word}, кути {join}. "
-               "Кейси {base_name} … {base_name2}.", runs_word=lib.runs_word(len(angles)), join=", ".join(f"{a:g}°" for a in angles), base_name=lib.series_case_name(self._series.base_name, angles[0]), base_name2=lib.series_case_name(self._series.base_name, angles[-1])))
+            tr("Series for the neutral point: {runs_word}, angles "
+               "{join}. Cases {base_name} … {base_name2}.", runs_word=lib.runs_word(len(angles)), join=", ".join(f"{a:g}°" for a in angles), base_name=lib.series_case_name(self._series.base_name, angles[0]), base_name2=lib.series_case_name(self._series.base_name, angles[-1])))
         for note in lib.series_notes(angles):
-            self.log.push(tr("Увага: {note}.", note=note))
+            self.log.push(tr("Warning: {note}.", note=note))
         self._series_next()
 
     def _set_angle(self, name: str, aoa: float) -> None:
@@ -6456,7 +6562,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._start_one_run():
             # Прогін навіть не стартував: немає бекенда, кейс не зібрався,
             # людина відмовилась на питанні. Далі буде те саме — зупиняємось.
-            s.failed.append((angle, "прогін не запустився"))
+            s.failed.append((angle, tr("the run did not start")))
             s.stopped = True
             self._finish_series()
             return
@@ -6464,8 +6570,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # рядок, написаний раніше, зник би разом зі старим.
         done = ", ".join(f"{a:g}°" for a, _ in s.done)
         self.log.push(
-            tr("— Серія для нейтральної точки: кут {angle:g}° ({v} з "
-               "{n_angles}), кейс {name}.{v2} —", angle=angle, v=s.at + 1, n_angles=len(s.angles), name=self.cfg.name, v2=tr(" Уже пораховано: {done}.", done=done) if done else ""))
+            tr("— Series for the neutral point: angle {angle:g}° ({v} of "
+               "{n_angles}), case {name}.{v2} —", angle=angle, v=s.at + 1, n_angles=len(s.angles), name=self.cfg.name, v2=tr(" Already computed: {done}.", done=done) if done else ""))
 
     def _series_after_run(self, ok: bool, msg: str, case_dir: str) -> None:
         """Прогін серії скінчився: записати й узяти наступний кут.
@@ -6482,7 +6588,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s.done.append((angle, case_dir))
         else:
             last = (msg or "").strip().splitlines()
-            s.failed.append((angle, last[-1][:160] if last else "помилка"))
+            s.failed.append((angle, last[-1][:160] if last else tr("error")))
         # Наступний — уже з циклу подій: on_done ще доробляє цей прогін
         # (результати, бібліотека), і новий потік поверх нього не потрібен.
         QtCore.QTimer.singleShot(0, self._series_next)
@@ -6494,13 +6600,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._set_angle(s.base_name, s.base_aoa)
         for angle, why in s.failed:
-            self.log.push(tr("Серія: кут {angle:g}° не порахувався — {why}", angle=angle, why=why))
+            self.log.push(tr("Series: angle {angle:g}° did not compute — {why}", angle=angle, why=why))
         cases = [lib.read_case(d) for _, d in s.done if os.path.isdir(d)]
-        head = ("Серію зупинено" if s.stopped else "Серію завершено")
-        head += tr(": пораховано {n_cases} з {n_angles} кутів.", n_cases=len(cases), n_angles=len(s.angles))
+        head = (tr("Series stopped") if s.stopped else tr("Series complete"))
+        head += tr(": {n_cases} of {n_angles} angles computed.", n_cases=len(cases), n_angles=len(s.angles))
         if len(cases) < 2:
-            text = (tr("{head} Для нейтральної точки потрібно щонайменше "
-                       "два пораховані кути.", head=head))
+            text = (tr("{head} The neutral point needs at least two "
+                       "computed angles.", head=head))
             self.log.push(text)
             self.panel_run.lbl_status.setText(text)
             return
@@ -6509,15 +6615,14 @@ class MainWindow(QtWidgets.QMainWindow):
             p = st.point
             where = ""
             if st.nose_x is not None and st.length:
-                where = (tr(", {v:.0f} мм від носа "
-                         "({v2:.1f}% довжини)", v=1000 * (p.x - st.nose_x), v2=100 * (p.x - st.nose_x) / st.length))
+                where = (tr(", {v:.0f} mm from the nose ({v2:.1f}% of "
+                            "the length)", v=1000 * (p.x - st.nose_x), v2=100 * (p.x - st.nose_x) / st.length))
             cg = st.cg_range()
-            text = (tr("{head} Нейтральна точка x = {x:.4f} м{where}. "
-                    "Центр ваги — між x = {cg:.4f} і {cg2:.4f} м "
-                    "(запас {v:.0f}–"
-                    "{v2:.0f}% Lref).", head=head, x=p.x, where=where, cg=cg[0], cg2=cg[1], v=100 * lib.MARGIN_LOW, v2=100 * lib.MARGIN_HIGH))
+            text = (tr("{head} Neutral point x = {x:.4f} m{where}. "
+                       "Center of gravity — between x = {cg:.4f} and "
+                       "{cg2:.4f} m (margin {v:.0f}–{v2:.0f}% Lref).", head=head, x=p.x, where=where, cg=cg[0], cg2=cg[1], v=100 * lib.MARGIN_LOW, v2=100 * lib.MARGIN_HIGH))
         else:
-            text = tr("{head} Нейтральну точку не порахувати: {problem}.", head=head, problem=st.problem)
+            text = tr("{head} Cannot compute the neutral point: {problem}.", head=head, problem=st.problem)
         self.log.push(text)
         for note in st.notes:
             self.log.push(f"  · {note}")
@@ -6553,22 +6658,22 @@ class MainWindow(QtWidgets.QMainWindow):
             # підміняти бінарник посеред чужої роботи над ним не варто.
             # Кладемо, тільки якщо його там немає зовсім.
             if not be.has_foamdist(backend):
-                err = self._off_thread("Кладу foamdist на сервер…",
+                err = self._off_thread(tr("Putting foamdist on the server…"),
                                        lambda: be.ensure_foamdist(backend))
                 if err:
                     pr.lbl_dist.setText(err)
                     return
             found = self._off_thread(
-                "Шукаю машини в мережі сервера…",
+                tr("Looking for machines in the server network…"),
                 lambda: be.scan_dist(backend, key, user))
         except Exception as exc:                          # noqa: BLE001
-            pr.lbl_dist.setText(tr("пошук не вдався: {exc}", exc=exc))
+            pr.lbl_dist.setText(tr("search failed: {exc}", exc=exc))
             return
         have = pr.machines()
         rows = be.scan_to_machines(found, have)
         if not rows:
-            pr.lbl_dist.setText("У мережі сервера не знайдено жодної машини з "
-                                "відкритим ssh.")
+            pr.lbl_dist.setText("No machine with open ssh found in the "
+                                "server network.")
             return
         dlg = panels.ScanDialog(rows, self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
@@ -6582,11 +6687,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not pr.box_dist.isChecked():
             pr.box_dist.setChecked(True)
         pr.lbl_dist.setText(
-            tr("Додано: {join}{v}.", join=", ".join(m.label() for m in new), v=tr(". "
-                                                                                        "Без "
-                                                                                        "галочки "
-                                                                                        "(не "
-                                                                                        "готові) "
+            tr("Added: {join}{v}.", join=", ".join(m.label() for m in new), v=tr(". "
+                                                                                        "Unchecked "
+                                                                                        "(not "
+                                                                                        "ready) "
                                                                                         "— "
                                                                                         "{join}", join=", ".join(m.label() for m in new if not m.on))
                if any(not m.on for m in new) else ""))
@@ -6603,18 +6707,18 @@ class MainWindow(QtWidgets.QMainWindow):
         key, user = pr.ed_dist_key.text().strip(), pr.ed_dist_user.text().strip()
         rebench = pr.chk_dist_rebench.isChecked()
         try:
-            err = self._off_thread("Кладу foamdist на сервер…",
+            err = self._off_thread(tr("Putting foamdist on the server…"),
                                    lambda: be.ensure_foamdist(backend))
             if err:
                 pr.lbl_dist.setText(err)
                 return
-            got = self._off_thread("Перевіряю машини…",
+            got = self._off_thread(tr("Checking the machines…"),
                                    lambda: be.probe_dist(backend, hosts, key, user))
             plan = self._off_thread(
-                "Міряю швидкість машин (перший раз — до хвилини)…",
+                tr("Measuring the machine speed (the first time — up to a minute)…"),
                 lambda: be.dist_weights(backend, hosts, key, user, rebench))
         except Exception as exc:                          # noqa: BLE001
-            pr.lbl_dist.setText(tr("не вдалося: {exc}", exc=exc))
+            pr.lbl_dist.setText(tr("failed: {exc}", exc=exc))
             return
         if rebench:
             pr.chk_dist_rebench.setChecked(False)
@@ -6629,17 +6733,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _plan_report(plan: dict, hosts=()) -> str:
         """Як сітка поділиться між машинами — за швидкістю й вільними ядрами."""
         if plan.get("error"):
-            return tr("Швидкість не поміряно: {plan}", plan=plan['error'])
-        lines = ["Частки сітки (за швидкістю й тим, наскільки машина вільна):"]
+            return tr("Speed not measured: {plan}", plan=plan['error'])
+        lines = [tr("Mesh shares (by speed and by how free each machine is):")]
         names = {m.addr: m.name for m in hosts if getattr(m, "name", "")}
         for h in plan.get("hosts", []):
-            src = {"cached": "збережений замір", "measured": "щойно поміряно"}.get(
+            src = {"cached": "saved measurement", "measured": "just measured"}.get(
                 h.get("bench", ""), str(h.get("bench", "")))
             lines.append(
-                tr("  {get}: "
-                "{v:.1f}% — "
-                "{v2:.0f} тис. комірок/с на процес "
-                "({src}), вільно {v3:.0f}%", get=names.get(h.get('host'), h.get('host')), v=100 * float(h.get('share', 0)), v2=float(h.get('speed', 0)) / 1000, src=src, v3=100 * float(h.get('factor', 1))))
+                tr("  {get}: {v:.1f}% — {v2:.0f}k cells/s per process "
+                   "({src}), {v3:.0f}% free", get=names.get(h.get('host'), h.get('host')), v=100 * float(h.get('share', 0)), v2=float(h.get('speed', 0)) / 1000, src=src, v3=100 * float(h.get('factor', 1))))
         return "\n".join(lines)
 
     @staticmethod
@@ -6652,26 +6754,26 @@ class MainWindow(QtWidgets.QMainWindow):
             g = by.get(addr)
             if g is None or not g.get("ok"):
                 lines.append(f"✗ {who}: " + (str(g.get("error", "")) if g
-                                             else "не відповіла"))
+                                             else tr("did not answer")))
                 continue
             head = head or g.get("head") == "yes"
             cores = int(g.get("cores", 0) or 0)
-            bits = [tr("{cores} ядер", cores=cores), tr("навантаження {get}", get=g.get('load')),
-                    "образ є" if g.get("image") == "yes" else "ОБРАЗУ НЕМАЄ"]
+            bits = [tr("{cores} cores", cores=cores), tr("load {get}", get=g.get('load')),
+                    tr("image present") if g.get("image") == "yes" else tr("NO IMAGE")]
             ram = be.probe_ram_gb(g)
             if ram > 0:
-                bits.insert(1, tr("{ram} ГБ памʼяті", ram=memfit.fmt_gb(ram)))
+                bits.insert(1, tr("{ram} GB memory", ram=memfit.fmt_gb(ram)))
             if n > cores > 0:
-                bits.append(tr("процесів {n} > ядер {cores}", n=n, cores=cores))
+                bits.append(tr("processes {n} > cores {cores}", n=n, cores=cores))
             if g.get("head") == "yes":
-                bits.append("сервер (тут кейс)")
+                bits.append(tr("server (case is here)"))
             ok = g.get("image") == "yes" and not (n > cores > 0)
             lines.append(f"{'✓' if ok else '!'} {who}: " + ", ".join(bits))
         if not head:
-            lines.append("✗ Серед машин немає самого сервера — впишіть його "
-                         "адресу в локальній мережі першою.")
+            lines.append(tr("✗ The server itself is not among the machines "
+                         "— enter its local network address first."))
         total = sum(m.procs for m in be._as_machines(hosts))
-        lines.append(tr("Разом процесів: {total}.", total=total))
+        lines.append(tr("Total processes: {total}.", total=total))
         return "\n".join(lines)
 
     def _project_mesh_for_run(self, case_key: str) -> "str | None":
@@ -6687,29 +6789,31 @@ class MainWindow(QtWidgets.QMainWindow):
         # кейсу triSurface може тримати старі STL від минулих збирань.
         now = self.mesh_inputs_key()
         if case_key == pm.key or now == pm.baseline:
-            self.log.push(tr("Сітка з проєкту {key}: snappyHexMesh не буде.", key=pm.key))
+            self.log.push(tr("Mesh from project {key}: snappyHexMesh will not run.", key=pm.key))
             return pm.key
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setWindowTitle("Сітка з проєкту")
+        box.setWindowTitle("Mesh from Project")
         box.setText(
-            "Налаштування сітки чи геометрія вже не ті, з якими відкрито "
-            "проєкт, хоча поля були замкнені (так буває після змін, які "
-            "робить сама програма).")
+            "The mesh settings or the geometry are no longer the same as "
+            "when the project was opened, although the fields were "
+            "locked (this happens after changes the program makes "
+            "itself).")
         box.setInformativeText(
-            tr("Ключ зараз {now}, після відкриття був {baseline}. "
-            "Перебудувати сітку (~{snappy_minutes} хв на сервері) чи "
-            "однаково взяти сітку з проєкту?", now=now, baseline=pm.baseline, snappy_minutes=self._snappy_minutes()))
-        cancel = box.addButton("Скасувати", QtWidgets.QMessageBox.RejectRole)
-        rebuild = box.addButton("Перебудувати", QtWidgets.QMessageBox.AcceptRole)
-        use = box.addButton("Взяти сітку проєкту", QtWidgets.QMessageBox.ActionRole)
+            tr("The key is now {now}, after opening it was {baseline}. "
+               "Rebuild the mesh (~{snappy_minutes} min on the server) "
+               "or use the mesh from the project anyway?", now=now, baseline=pm.baseline, snappy_minutes=self._snappy_minutes()))
+        cancel = box.addButton(tr("Cancel"), QtWidgets.QMessageBox.RejectRole)
+        rebuild = box.addButton(tr("Rebuild"), QtWidgets.QMessageBox.AcceptRole)
+        use = box.addButton(tr("Use Project Mesh"), QtWidgets.QMessageBox.ActionRole)
         box.setDefaultButton(cancel)
         box.setEscapeButton(cancel)
         box.exec()
         hit = box.clickedButton()
         if hit is use:
-            self.log.push(tr("Сітка з проєкту {key} — за вибором, хоч ключ "
-                          "налаштувань інший ({case_key}).", key=pm.key, case_key=case_key))
+            self.log.push(tr("Mesh from project {key} — by choice, "
+                             "although the settings key is different "
+                             "({case_key}).", key=pm.key, case_key=case_key))
             return pm.key
         if hit is rebuild:
             self._release_project_mesh()
@@ -6721,29 +6825,28 @@ class MainWindow(QtWidgets.QMainWindow):
         backend = self.panel_run.current_backend()
         if backend is None or not backend.ready:
             QtWidgets.QMessageBox.warning(
-                self, "Бекенд не готовий",
-                "OpenFOAM не знайдено. Скористайтеся кнопкою встановлення "
-                "на вкладці «Запуск».")
+                self, tr("Backend not ready"),
+                tr("OpenFOAM not found. Use the install button on the “Run” tab."))
             return False
         dist_hosts, why = self._dist_hosts()
         if self.panel_run.box_dist.isChecked():
             if why:
                 QtWidgets.QMessageBox.warning(
-                    self, "Розподіл між машинами", why)
+                    self, tr("Distribution across machines"), why)
                 return False
             if backend.kind != "ssh":
                 QtWidgets.QMessageBox.information(
-                    self, "Розподіл між машинами",
-                    "Розподіл працює лише для прогону на сервері: кнопка "
-                    "«Запустити на сервері». Зніміть галочку, щоб рахувати "
-                    "тут.")
+                    self, tr("Distribution across machines"),
+                    tr("Distribution works only for a run on the server: "
+                    "the “Run on server” button. Clear the check box to "
+                    "run here."))
                 return False
             total = sum(m.procs for m in dist_hosts)
             if self.cfg.solver.n_procs != total:
                 # Сітка ріжеться на стільки шматків, скільки разом процесів.
-                self.log.push(tr("Розподіл між машинами: процесів "
-                              "{n_procs} → {total} (сума по "
-                              "машинах).", n_procs=self.cfg.solver.n_procs, total=total))
+                self.log.push(tr("Distribution across machines: "
+                                 "processes {n_procs} → {total} (sum "
+                                 "over the machines).", n_procs=self.cfg.solver.n_procs, total=total))
                 self.cfg.solver.n_procs = total
                 self.panel_solve.load_cfg()
             # Шматки за швидкістю машин: ваги в decomposeParDict ще до
@@ -6751,10 +6854,10 @@ class MainWindow(QtWidgets.QMainWindow):
             pr = self.panel_run
             key, user = pr.ed_dist_key.text().strip(), pr.ed_dist_user.text().strip()
             try:
-                err = self._off_thread("Кладу foamdist на сервер…",
+                err = self._off_thread(tr("Putting foamdist on the server…"),
                                        lambda: be.ensure_foamdist(backend))
                 plan = {"error": err} if err else self._off_thread(
-                    "Міряю швидкість машин…",
+                    tr("Measuring the speed of the machines…"),
                     lambda: be.dist_weights(backend, dist_hosts, key, user))
             except Exception as exc:                      # noqa: BLE001
                 plan = {"error": str(exc)}
@@ -6764,7 +6867,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log.push(self._plan_report(plan, dist_hosts))
             else:
                 self.cfg.solver.proc_weights = []
-                self.log.push(tr("Шматки однакові: {plan}", plan=self._plan_report(plan, dist_hosts)))
+                self.log.push(tr("Equal pieces: {plan}", plan=self._plan_report(plan, dist_hosts)))
         else:
             self.cfg.solver.proc_weights = []
         if self.create_case(report=False) is None:
@@ -6786,35 +6889,35 @@ class MainWindow(QtWidgets.QMainWindow):
         native_dir = None
         if backend.kind == "wsl" and self.panel_run.chk_native.isChecked():
             try:
-                self.log.push("Копіюю кейс у рідну ФС WSL…")
+                self.log.push(tr("Copying the case to the native WSL file system…"))
                 native_dir = be.sync_to_wsl(backend, self.case_dir, self.cfg.name)
                 self.log.push(f"→ {native_dir}")
             except Exception as exc:
-                QtWidgets.QMessageBox.critical(self, "Копіювання не вдалося", str(exc))
+                QtWidgets.QMessageBox.critical(self, tr("Copy failed"), str(exc))
                 return
         elif backend.kind == "ssh":
             # Для сервера це не вибір, а обовʼязок: шляху Windows на тому
             # боці не існує, тож рахувати «на місці» там нема де.
             try:
-                self.log.push(tr("Вивантажую кейс на {host}…", host=backend.host))
+                self.log.push(tr("Uploading the case to {host}…", host=backend.host))
                 self._laptop("upload")
                 case_dir, name = self.case_dir, self.cfg.name
                 # Поза потоком вікна: інакше вікно завмирало на весь час
                 # вивантаження і індикатор «не вимикайте» навіть не
                 # встигав намалюватися.
                 native_dir = self._off_thread(
-                    tr("Вивантажую кейс на {host}…", host=backend.host),
+                    tr("Uploading the case to {host}…", host=backend.host),
                     lambda: be.sync_to_ssh(backend, case_dir, name))
                 self.log.push(f"→ {backend.host}:{native_dir}")
                 if dist_hosts:
-                    err = self._off_thread("Кладу foamdist на сервер…",
+                    err = self._off_thread(tr("Putting foamdist on the server…"),
                                            lambda: be.ensure_foamdist(backend))
                     if err:
                         raise RuntimeError(err)
             except Exception as exc:
                 self._laptop("")
                 QtWidgets.QMessageBox.critical(
-                    self, "Не вдалося вивантажити на сервер", str(exc))
+                    self, tr("Could not upload to the server"), str(exc))
                 return False
 
         # Збережена сітка: ключ — з файлів кейсу, щойно записаних.
@@ -6832,12 +6935,12 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 if not be.remote_mesh_exists(backend, mkey):
                     err = self._off_thread(
-                        "Вивантажую збережену сітку…",
+                        tr("Uploading the saved mesh…"),
                         lambda: be.push_mesh(backend, mkey))
-                    self.log.push(err or tr("Сітку {mkey} вивантажено — "
-                                         "будувати не доведеться.", mkey=mkey))
+                    self.log.push(err or tr("Mesh {mkey} uploaded — no "
+                                            "need to build it.", mkey=mkey))
             except Exception as exc:                      # noqa: BLE001
-                self.log.push(tr("Сітку не вивантажено, збудую: {exc}", exc=exc))
+                self.log.push(tr("Mesh not uploaded, building it: {exc}", exc=exc))
         steps = be.build_steps(
             self.cfg.solver.n_procs, backend,
             # Не solver.potential_init, а похідне від нього: у стисливому
@@ -6861,13 +6964,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.log.clear_log()
         if mkey:
-            self.log.push(tr("Ключ сітки: {mkey}{v}", mkey=mkey, v=" (перебудувати)" if remesh else ""))
+            self.log.push(tr("Mesh key: {mkey}{v}", mkey=mkey, v=" (rebuild)" if remesh else ""))
         self.log.push(mem_fit.details())
         if mem_fit.verdict == "unknown":
             # Памʼяті не знаємо — запуску не заважаємо здогадкою, але кажемо.
             self.log.push(mem_fit.warning().lstrip("ℹ ") + ".")
         if dist_hosts:
-            self.log.push(tr("Розподіл між машинами (експериментально): {join}", join=", ".join(f"{m.label()} × {m.procs}"
+            self.log.push(tr("Distribution across machines (experimental): {join}", join=", ".join(f"{m.label()} × {m.procs}"
                                       for m in dist_hosts)))
         self.plots.set_steady(self.cfg.solver.steady)
         self.plots.update_plots({}, {})
@@ -6883,9 +6986,11 @@ class MainWindow(QtWidgets.QMainWindow):
                                 stop_on_bad_mesh=self.cfg.solver.stop_on_bad_mesh,
                                 mesh_key=mkey)
         self.thread = QtCore.QThread(self)
+        self.thread.setObjectName("run")
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.line.connect(self._run_line)
+        self.worker.event.connect(self._run_event)
         self.worker.step.connect(self.on_step)
         self.worker.done.connect(self.on_done)
         if self.panel_run.laptop_state() != "upload":
@@ -6900,20 +7005,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_run.set_laptop_state(state)
         got = self.panel_run.LAPTOP_STATES.get(state)
         if got:
-            text, _bg, fg = got
-            self.lbl_detached.setText(text.split(". Потім")[0])
+            _text, _bg, fg, short = got
+            self.lbl_detached.setText(short)
             self.lbl_detached.setStyleSheet(f"color:{fg}; font-weight:600;")
         self.lbl_detached.setVisible(bool(got))
         QtWidgets.QApplication.processEvents()
 
     def _run_line(self, text: str) -> None:
         self.log.push(text)
-        if text.startswith(be.DETACHED_MARK):
+
+    def _run_event(self, name: str, value: str = "") -> None:
+        """An event of the run (RunWorker.event): no log text to compare."""
+        if name == "detached":
             self._laptop("free")
             self.statusBar().showMessage(
-                "Прогін відчеплено на сервері — ноут можна вимикати.", 15000)
-        elif text.startswith(FETCH_MARK) and \
-                self.panel_run.laptop_state() == "free":
+                tr("The run is detached on the server — you can turn off the laptop."), 15000)
+        elif name == "fetch" and self.panel_run.laptop_state() == "free":
             self._laptop("fetch")
 
     def _memory_gate(self) -> bool:
@@ -6938,33 +7045,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setWindowTitle("Сітка не влізе в памʼять")
-        what = ("snappyHexMesh (будує сітку)" if w.stage == "snappy"
-                else tr("розвʼязувач ({ranks} проц.)", ranks=w.host.ranks))
+        box.setWindowTitle("The mesh will not fit in memory")
+        what = (tr("snappyHexMesh (builds the mesh)") if w.stage == "snappy"
+                else tr("solver ({ranks} proc.)", ranks=w.host.ranks))
         box.setText(
-            tr("{what} на {name}: {cells} комірок, "
-            "це близько {need_gb:.1f} ГБ.\n"
-            "Памʼяті там {ram_gb} ГБ, з них під "
-            "задачу {budget} ГБ.", what=what, name=w.host.name, cells=phys.fmt_cells(w.cells), need_gb=w.need_gb, ram_gb=memfit.fmt_gb(w.host.ram_gb), budget=memfit.fmt_gb(budget)))
+            tr("{what} on {name}: {cells} cells, that is about "
+               "{need_gb:.1f} GB.\nMemory there is {ram_gb} GB, of which "
+               "{budget} GB is for the job.", what=what, name=w.host.name, cells=phys.fmt_cells(w.cells), need_gb=w.need_gb, ram_gb=memfit.fmt_gb(w.host.ram_gb), budget=memfit.fmt_gb(budget)))
         detail = fit.details() + "\n\n" + why + "\n\n"
         if fit.saved:
-            detail += ("Сітка вже збережена, але розвʼязувачу на ній тісно: "
-                       "допоможе лише менша сітка (її доведеться будувати). ")
+            detail += (tr("The mesh is already saved, but the solver does "
+                       "not have enough memory for it: only a smaller "
+                       "mesh will help (it must be built). "))
         if level < self.cfg.mesh.surface_level_max:
-            detail += (tr("Щоб влізти, рівень рефайнменту поверхні має бути "
-                       "{level} або нижче (зараз "
-                       "{surface_level_max}). Кожен рівень "
-                       "нижче зменшує сітку приблизно вчетверо.", level=level, surface_level_max=self.cfg.mesh.surface_level_max))
+            detail += (tr("To fit, the surface refinement level must be "
+                          "{level} or lower (now {surface_level_max}). "
+                          "Each level lower makes the mesh about four "
+                          "times smaller.", level=level, surface_level_max=self.cfg.mesh.surface_level_max))
         else:
-            detail += ("Рівень рефайнменту тут ні до чого — роздуває домен "
-                       "або коробка згущення. Перегляньте вкладку «Домен».")
+            detail += (tr("The refinement level is not the cause here — the "
+                       "domain or the refinement box makes it grow. "
+                       "Check the “Domain” tab."))
         box.setInformativeText(detail)
 
-        fix = box.addButton("Підібрати автоматично",
+        fix = box.addButton(tr("Fit Automatically"),
                             QtWidgets.QMessageBox.AcceptRole)
-        anyway = box.addButton("Запустити попри це",
+        anyway = box.addButton(tr("Run Anyway"),
                                QtWidgets.QMessageBox.DestructiveRole)
-        box.addButton("Скасувати", QtWidgets.QMessageBox.RejectRole)
+        box.addButton(tr("Cancel"), QtWidgets.QMessageBox.RejectRole)
         box.setDefaultButton(fix)
         box.exec()
 
@@ -6992,11 +7100,9 @@ class MainWindow(QtWidgets.QMainWindow):
         new_est = self.cfg.estimate()
         peak = max((r.need_gb for r in self._mem_fit().rows), default=0.0)
         QtWidgets.QMessageBox.information(
-            self, "Підібрано",
-            tr("Рівень поверхні {surface_level_max}, "
-            "комірок {total}, "
-            "памʼять до {peak:.1f} ГБ на машину.\n\n"
-            "Натисніть «Запустити» ще раз.", surface_level_max=self.cfg.mesh.surface_level_max, total=phys.fmt_cells(new_est.total), peak=peak))
+            self, tr("Fitted"),
+            tr("Surface level {surface_level_max}, cells {total}, memory "
+               "up to {peak:.1f} GB per machine.\n\nClick “Run” again.", surface_level_max=self.cfg.mesh.surface_level_max, total=phys.fmt_cells(new_est.total), peak=peak))
         return False
 
     @QtCore.Slot(str, int, int)
@@ -7005,39 +7111,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_run.progress.setValue(index)
         # Котрий кут серії зараз — видно з самої смужки, а не лише з журналу.
         s = self._series
-        lead = (tr("кут {angles:g}° ({v}/{n_angles}) · ", angles=s.angles[s.at], v=s.at + 1, n_angles=len(s.angles))
+        lead = (tr("angle {angles:g}° ({v}/{n_angles}) · ", angles=s.angles[s.at], v=s.at + 1, n_angles=len(s.angles))
                 if s is not None and 0 <= s.at < len(s.angles) else "")
+        title = be.step_title(name)
         self.panel_run.progress.setFormat(
-            f"{lead}{tr(name)}  ({index + 1}/{total})")
-        self.panel_run.lbl_status.setText(tr("Виконується: {name}", name=name))
+            f"{lead}{title}  ({index + 1}/{total})")
+        self.panel_run.lbl_status.setText(tr("Running: {name}", name=title))
 
     @QtCore.Slot(bool, str)
     def on_done(self, ok: bool, msg: str):
+        if getattr(self, "_closing", False):
+            # The window closes and let the run go (leave()): the end of the
+            # reading is not the end of the run. Do not record it, do not
+            # load results.
+            return
         self._laptop("")
         self.live_bar.set_source(None)
         self.timer.stop()
         self.log.flush()
         self.panel_run.set_running(False)
         self.panel_run.progress.setValue(self.panel_run.progress.maximum())
-        self.panel_run.progress.setFormat("готово" if ok else "помилка")
+        self.panel_run.progress.setFormat(tr("done") if ok else tr("error"))
 
-        if ok and msg.startswith("зупинено зі зрізом"):
+        runner = self.worker.runner if self.worker else None
+        soft = getattr(runner, "soft_result", "") if ok else ""
+        if soft:
             # Мʼяка зупинка: зріз записано, зібрано й перевірено.
-            parts = [tr("Зупинено зі зрізом: {strip}. Його видно в "
-                        "«Результатах».", strip=msg.split("—", 1)[-1].strip())]
+            # soft_result: the slice for the person, already translated.
+            parts = [tr("Stopped with a time step written: {strip}. You "
+                        "can see it in “Results”.", strip=soft)]
         else:
-            parts = ["Розрахунок завершено." if ok else tr("Зупинено: {msg}", msg=msg)]
+            parts = [tr("Run finished.") if ok else tr("Stopped: {msg}", msg=msg)]
         st = self.worker.runner.state if (self.worker and self.worker.runner) else None
         if st:
             if st.cells:
-                parts.append(tr("Комірок: {cells}", cells=phys.fmt_cells(st.cells)))
+                parts.append(tr("Cells: {cells}", cells=phys.fmt_cells(st.cells)))
             level, why = st.mesh_severity()
             if level == "fatal":
-                parts.append(tr("⚠ Сітка непридатна: {why}.", why=why))
+                parts.append(tr("⚠ The mesh is unusable: {why}.", why=why))
             elif level == "warn":
-                parts.append(tr("checkMesh: {why} — у межах норми.", why=why))
+                parts.append(tr("checkMesh: {why} — within normal limits.", why=why))
             elif st.mesh_ok:
-                parts.append("checkMesh: без зауважень.")
+                parts.append(tr("checkMesh: no issues."))
             if st.layer_coverage >= 0:
                 # Не просто «замало»: розбір каже, чого саме замало, чим це
                 # погано для результату і що підкрутити — а кнопка нижче
@@ -7047,10 +7162,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 parts.append(self._layer_fix.report())
                 self.panel_run.show_layer_fix(self._layer_fix)
             if ok and not st.converged:
-                parts.append("⚠ Резидуали не впали нижче порога — "
-                             "збіжність не досягнута, це не фінальний результат.")
+                parts.append(tr("⚠ The residuals did not drop below the "
+                                "threshold — convergence is not reached, "
+                                "this is not the final result."))
         # Окремими рядками: суцільний абзац на десять рядків ніхто не читає.
-        self.panel_run.lbl_status.setText("\n".join(parts))
+        self.panel_run.lbl_status.setText(fs_i18n.join("\n", parts))
         if self.thread:
             self.thread.quit()
             self.thread.wait(4000)
@@ -7099,6 +7215,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 converged=bool(st and st.converged),
                 coeffs=coeffs,
                 backend=f"{backend.label} {backend.version}" if backend else "",
+                backend_id=backend.id if backend else "",
                 layers=st.layer_coverage if st else -1.0,
                 note="" if ok else msg.strip().splitlines()[-1][:200])
         except (OSError, IndexError):
@@ -7111,7 +7228,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._series is not None:
             self._series.stopped = True
         if self.worker:
-            self.panel_run.lbl_status.setText("Зупиняю…")
+            self.panel_run.lbl_status.setText("Stopping…")
             self.worker.stop()
 
     def soft_stop_run(self):
@@ -7124,12 +7241,12 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
         if not ok:
-            QtWidgets.QMessageBox.warning(self, "Стоп зі зрізом", why)
+            QtWidgets.QMessageBox.warning(self, tr("Stop with Time Step"), why)
             return
         if self._series is not None:
             self._series.stopped = True
         self.panel_run.btn_soft_stop.setEnabled(False)
-        self.panel_run.lbl_status.setText(tr("Зупиняю зі зрізом: {why}.", why=why))
+        self.panel_run.lbl_status.setText(tr("Stopping with time step: {why}.", why=why))
 
     def fix_layers(self):
         """Застосовує правки шарів із розбору минулого прогону."""
@@ -7146,12 +7263,12 @@ class MainWindow(QtWidgets.QMainWindow):
         changed = ", ".join(f"{t.what} {t.current} → {t.suggested}"
                             for t in diagnosis.tips)
         self.panel_run.lbl_status.setText(
-            tr("Змінено: {changed}. Сітку треба перебудувати — натисніть "
-            "«Запустити», кейс перезапишеться і snappy пройде заново. "
-            "Якщо покриття не підніметься, причина в геометрії, а не в "
-            "налаштуваннях.", changed=changed))
+            tr("Changed: {changed}. The mesh must be rebuilt — click "
+               "“Run”, the case will be overwritten and snappy will run "
+               "again. If the coverage does not go up, the cause is in "
+               "the geometry, not in the settings.", changed=changed))
         self.statusBar().showMessage(
-            "Шари переналаштовано. Потрібен новий прогін.", 12000)
+            tr("Layers reconfigured. A new run is necessary."), 12000)
 
     # --- результати ------------------------------------------------------
 
@@ -7166,19 +7283,19 @@ class MainWindow(QtWidgets.QMainWindow):
         case = Path(self.case_dir)
         procs = sorted(case.glob("processor*"))
         if procs and fa.time_dirs(str(procs[0])):
-            return ("Результати лежать у processor*/ і ще не зібрані. "
-                    "Зберіть їх: reconstructPar (або смуга «Анімація» → "
-                    "«Зібрати…»).")
+            return (tr("The results are in processor*/ and are not "
+                    "reconstructed yet. Reconstruct them: reconstructPar "
+                    "(or the “Animation” bar → “Reconstruct…”)."))
         runs = (lib.read_manifest(self.case_dir) or {}).get("runs") or []
         last = runs[-1] if runs else None
         if last and not last.get("ok"):
             note = " ".join(str(last.get("note") or "").split())[:300]
             note = (note.rstrip(".") + ".") if note else ""
-            return (tr("Результатів немає: останній прогін ({get}) упав, "
-                       "не записавши жодного моменту.{v} Дивіться "
-                       "«Журнал», виправте й запустіть знову.", get=last.get('finished', '?'), v=tr(" Причина: {note}", note=note[:300]) if note else ""))
-        return ("Результатів ще немає: кейс не рахувався або прогін не "
-                "дійшов до першого запису.")
+            return (tr("No results: the last run ({get}) crashed without "
+                       "writing a single time step.{v} See the “Log”, "
+                       "fix the problem and run again.", get=last.get('finished', '?'), v=tr(" Reason: {note}", note=note[:300]) if note else ""))
+        return (tr("No results yet: the case was not run, or the run did "
+                "not reach the first write."))
 
     def load_results(self):
         if not self.case_dir or not os.path.isdir(self.case_dir):
@@ -7201,7 +7318,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._seeding.forget_place()
                 self._slice_case = here
         except Exception as exc:
-            self.lbl_coeffs.setText(tr("Не вдалося прочитати кейс: {exc}", exc=exc))
+            self.lbl_coeffs.setText(tr("Could not read the case: {exc}", exc=exc))
             return
 
         # Зрізи від попередніх прогонів сітці вже не відповідають: читач
@@ -7237,8 +7354,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for name in ("Cd", "Cl", "CmPitch"):
                 if name in stats:
                     mean, spread = stats[name]
-                    txt.append(tr("{name} = {mean:+.5f}  (розкид на останніх "
-                               "50 ітераціях {spread:.2e})", name=name, mean=mean, spread=spread))
+                    txt.append(tr("{name} = {mean:+.5f}  (spread over "
+                                  "the last 50 iterations {spread:.2e})", name=name, mean=mean, spread=spread))
                     # Саме число «0.35» нічого не каже: це може бути й
                     # недобіглий прогін, і коливання, і лікуються вони
                     # протилежно. Тому поряд із розкидом пишемо, ЩО ЦЕ.
@@ -7259,17 +7376,18 @@ class MainWindow(QtWidgets.QMainWindow):
                             for n in ("Cd", "Cl") if n in part]
                     txt.append(f"    {body}:  " + ",  ".join(bits))
             txt.extend(self._engine_report(stats))
-            self.lbl_coeffs.setText("\n".join(txt))
+            self.lbl_coeffs.setText(fs_i18n.join("\n", txt))
         else:
-            self.lbl_coeffs.setText("Коефіцієнтів не знайдено в postProcessing.")
+            self.lbl_coeffs.setText("No coefficients found in postProcessing.")
         if stale:
             cells = post.mesh_cells(self.case_dir)
             self.lbl_coeffs.setText(
-                tr("{text}\n⚠ Зрізи {join} не відповідають сітці ({cells} "
-                   "комірок): це поля попередніх прогонів, у них інша "
-                   "кількість комірок. ParaView на таких зрізах сипле "
-                   "«cells/points do not match». Приберіть їх кнопкою "
-                   "«Звільнити місце» на вкладці «Збережені».", text=self.lbl_coeffs.text(), join=", ".join("%g" % t for t in stale), cells=phys.fmt_cells(cells)))
+                tr("{text}\n⚠ Time directories {join} do not match the "
+                   "mesh ({cells} cells): these are fields from earlier "
+                   "runs, with a different cell count. ParaView shows "
+                   "“cells/points do not match” on such time "
+                   "directories. Remove them with the “Free up space” "
+                   "button on the “Saved” tab.", text=fs_i18n.shown(self.lbl_coeffs), join=", ".join("%g" % t for t in stale), cells=phys.fmt_cells(cells)))
         self._anim_fill()
         self.draw_results()
 
@@ -7294,7 +7412,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 str(self.case_dir or "")):
             self.live_bar.mark_final()
             self.statusBar().showMessage(
-                tr("Проміжний результат належить іншому кейсу: {case}",
+                tr("The intermediate result belongs to a different case: {case}",
                    case=case_dir), 10000)
             return
         if self._anim is not None:
@@ -7339,15 +7457,15 @@ class MainWindow(QtWidgets.QMainWindow):
         times = d["times"]
         if len(times) < 2:
             QtWidgets.QMessageBox.information(
-                self, "Замало кадрів",
-                "Для анімації потрібно хоча б два моменти часу.")
+                self, tr("Too few frames"),
+                tr("The animation needs at least two time steps."))
             return
         if not (d["body_fields"] and d["body"]) and not (
                 d["slice_fields"] and d["slice"]) and not d["streams"]:
             QtWidgets.QMessageBox.information(
-                self, "Нічого анімувати",
-                "Позначте, що анімувати (тіло, зріз, лінії) і хоча б одне "
-                "поле для них.")
+                self, tr("Nothing to animate"),
+                tr("Select what to animate (body, slice, lines) and at "
+                "least one field for them."))
             return
         import fs_fast
         plan = fa.Plan(
@@ -7362,10 +7480,11 @@ class MainWindow(QtWidgets.QMainWindow):
                                 int(n_cells ** (2 / 3)))
         if est > 2e9:
             answer = QtWidgets.QMessageBox.question(
-                self, "Багато памʼяті",
-                tr("Кадри займуть приблизно {v:.1f} ГБ памʼяті "
-                "({n_times} кадрів). Зменште проміжок, візьміть кожен "
-                "другий кадр або зніміть «рухомий зріз».\n\nВсе одно готувати?", v=est / 1e9, n_times=len(times)))
+                self, tr("A lot of memory"),
+                tr("The frames will take about {v:.1f} GB of memory "
+                   "({n_times} frames). Make the interval shorter, take "
+                   "every second frame, or clear “moving "
+                   "slice”.\n\nPrepare them anyway?", v=est / 1e9, n_times=len(times)))
             if answer != QtWidgets.QMessageBox.Yes:
                 return
         self._anim_stop(redraw=False)
@@ -7374,11 +7493,11 @@ class MainWindow(QtWidgets.QMainWindow):
         results = self.results
         try:
             frames = self._off_thread(
-                tr("Готую {n_times} кадрів анімації…", n_times=len(times)),
+                tr("Preparing {n_times} animation frames…", n_times=len(times)),
                 lambda: fa.prepare(plan, results, fs, rotors=rotors),
                 n_cells * len(times))
         except Exception as exc:                          # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "Кадри не підготовлено",
+            QtWidgets.QMessageBox.critical(self, tr("Frames not prepared"),
                                            str(exc))
             return
         self._anim = frames
@@ -7389,8 +7508,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._anim_build(keep_camera=True)
         self._anim_show(0)
         self.log.push(
-            tr("Анімація: {n} кадрів ({times:g}…{times2:g} с), {v:.0f} "
-               "МБ, {v2}.", n=frames.n, times=frames.times[0], times2=frames.times[-1], v=frames.nbytes() / 1e6, v2="напряму з файлів" if frames.fast else "через VTK"))
+            tr("Animation: {n} frames ({times:g}…{times2:g} s), {v:.0f} "
+               "MB, {v2}.", n=frames.n, times=frames.times[0], times2=frames.times[-1], v=frames.nbytes() / 1e6, v2="directly from files" if frames.fast else "via VTK"))
 
     def _anim_build(self, keep_camera: bool = True) -> None:
         """Актори анімації з першого кадру. Далі кадри лише міняють масиви."""
@@ -7414,7 +7533,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     cmap=fv.diverging_cmap() if sym else "viridis",
                     clim=fr.limits["body:" + bkey], smooth_shading=False,
                     scalar_bar_args=dict(
-                        title=title, vertical=True, position_x=0.92,
+                        title=tr(title), vertical=True, position_x=0.92,
                         position_y=0.22, width=0.05, height=0.56,
                         color=fv.INK, n_labels=5, fmt="%.3g"))
                 bars = pl.scalar_bars
@@ -7429,7 +7548,7 @@ class MainWindow(QtWidgets.QMainWindow):
             act = pl.add_mesh(
                 sl, scalars=fa.ANIM, preference="cell",
                 cmap=fv.get_cmap(spec.cmap), clim=fr.limits["slice:" + skey],
-                scalar_bar_args=dict(title=spec.label, position_x=0.25,
+                scalar_bar_args=dict(title=tr(spec.label), position_x=0.25,
                                      position_y=0.04, width=0.5, height=0.06,
                                      color=fv.INK, n_labels=5, fmt="%.3g"))
             bars = pl.scalar_bars
@@ -7536,7 +7655,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if fr is None:
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Зберегти анімацію", str(Path(self.case_dir or ".")
+            self, tr("Save Animation"), str(Path(self.case_dir or ".")
                                            / "animation.gif"),
             "GIF (*.gif)")
         if not path:
@@ -7545,7 +7664,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.anim_bar.btn_play.setChecked(False)
         keep = self._anim_i
         shots = []
-        progress = QtWidgets.QProgressDialog("Записую кадри…", "", 0, fr.n, self)
+        progress = QtWidgets.QProgressDialog("Writing frames…", "", 0, fr.n, self)
         progress.setCancelButton(None)
         progress.setWindowModality(QtCore.Qt.WindowModal)
         for i in range(fr.n):
@@ -7560,8 +7679,8 @@ class MainWindow(QtWidgets.QMainWindow):
         shots[0].save(path, save_all=True, append_images=shots[1:],
                       duration=delay, loop=0, optimize=False)
         self._anim_show(keep)
-        self.log.push(tr("Анімацію збережено: {path} ({n} кадрів)", path=path, n=fr.n))
-        self.statusBar().showMessage(tr("GIF збережено: {name}", name=Path(path).name), 8000)
+        self.log.push(tr("Animation saved: {path} ({n} frames)", path=path, n=fr.n))
+        self.statusBar().showMessage(tr("GIF saved: {name}", name=Path(path).name), 8000)
 
     def _anim_stop(self, redraw: bool = True) -> None:
         self._anim_timer.stop()
@@ -7579,17 +7698,18 @@ class MainWindow(QtWidgets.QMainWindow):
         backend = self.panel_run.current_backend()
         if backend is None or backend.kind == "ssh":
             QtWidgets.QMessageBox.information(
-                self, "Немає де зібрати",
-                "Моменти паралельного прогону збираються там, де лежать "
-                "processor*/ цього кейсу, — на локальному бекенді (WSL, "
-                "Docker). Для сервера зберіть їх там: reconstructPar -time …")
+                self, tr("No place to reconstruct"),
+                tr("The time steps of a parallel run are reconstructed "
+                "where the processor*/ folders of this case are — on a "
+                "local backend (WSL, Docker). For a server, reconstruct "
+                "them there: reconstructPar -time …"))
             return
         import subprocess
         cmd = "reconstructPar -time '" + ",".join(times) + "'"
         argv = backend.shell(self.case_dir, cmd)
         try:
             proc = self._off_thread(
-                tr("Збираю {n_times} моментів (reconstructPar)…", n_times=len(times)),
+                tr("Assembling {n_times} times (reconstructPar)…", n_times=len(times)),
                 lambda: subprocess.run(argv, capture_output=True,
                                        timeout=6 * 3600,
                                        creationflags=getattr(
@@ -7598,8 +7718,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "reconstructPar", str(exc))
             return
         tail = (proc.stdout or b"")[-600:].decode("utf-8", "replace")
-        self.log.push(tr("reconstructPar ({n_times} моментів): код "
-                      "{returncode}. {strip}", n_times=len(times), returncode=proc.returncode, strip=tail.strip()[-300:]))
+        self.log.push(tr("reconstructPar ({n_times} time steps): code "
+                         "{returncode}. {strip}", n_times=len(times), returncode=proc.returncode, strip=tail.strip()[-300:]))
         self._anim_fill()
 
     def _engine_report(self, stats) -> list[str]:
@@ -7617,20 +7737,21 @@ class MainWindow(QtWidgets.QMainWindow):
         lines = []
         for d in self.cfg.disks_on:
             # Сила диска задана самим диском — її не міряють, а ставлять.
-            lines.append(tr("Гвинт-диск {name}: тяга {thrust_now:.2f} Н, "
-                         "момент {torque_now:.3g} Н·м (задано).", name=d.name, thrust_now=d.thrust_now, torque_now=d.torque_now))
+            lines.append(tr("Actuator disk {name}: thrust "
+                            "{thrust_now:.2f} N, torque {torque_now:.3g} "
+                            "N·m (set).", name=d.name, thrust_now=d.thrust_now, torque_now=d.torque_now))
         for e in self.cfg.engines:
             want = fc.engine_point(e, self.cfg.flow)
             m = got.get(e.name)
             if m is None:
-                lines.append(tr("Двигун {name}: вимірів на кришках немає "
-                             "(задано {thrust:.2f} Н).", name=e.name, thrust=want.thrust))
+                lines.append(tr("Engine {name}: no measurements on the "
+                                "caps (set {thrust:.2f} N).", name=e.name, thrust=want.thrust))
                 continue
-            mdot = (tr(", витрата {m:.4g} кг/с", m=m['mdot'])
+            mdot = (tr(", mass flow {m:.4g} kg/s", m=m['mdot'])
                     if m["mdot"] is not None else "")
             lines.append(
-                tr("Двигун {name}: сила на апарат {m:.2f} Н{mdot}. "
-                "За паспортом (ṁ·Vₑ − ṁ·V∞) — {thrust:.2f} Н.", name=e.name, m=m['thrust'], mdot=mdot, thrust=want.thrust))
+                tr("Engine {name}: force on the vehicle {m:.2f} N{mdot}. "
+                   "Nominal (ṁ·Vₑ − ṁ·V∞) — {thrust:.2f} N.", name=e.name, m=m['thrust'], mdot=mdot, thrust=want.thrust))
             if abs(m["thrust"] - want.thrust) > 0.05 * max(abs(want.thrust),
                                                            1e-9):
                 # РОЗБІЖНІСТЬ ТУТ — НЕ ПОМИЛКА, і сказати це треба прямо.
@@ -7640,9 +7761,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 # вхід забирає менше імпульсу. Різницю віддає тиск на
                 # корпус, тому сенс має лише сума — чиста сила нижче.
                 lines.append(
-                    "    Різниця — від того, що повітря перед входом рухається "
-                    "не з набігаючою швидкістю. Її забирає тиск на корпус, "
-                    "тож порівнюйте чисту силу, а не цей рядок.")
+                    tr("    The difference comes from the air in front of "
+                    "the intake not moving at freestream speed. The "
+                    "pressure on the body takes it up, so compare the "
+                    "net force, not this line."))
         cd = stats.get("Cd", (None, 0.0))[0] if stats else None
         net = post.net_force_line(self.cfg, cd, got, post.disks_thrust(self.cfg))
         if net:
@@ -7662,23 +7784,24 @@ class MainWindow(QtWidgets.QMainWindow):
         case_dir = str(case_dir or self.case_dir)
         if not case_dir or not os.path.isdir(case_dir):
             QtWidgets.QMessageBox.information(
-                self, "Немає кейсу", "Спершу створіть кейс і прорахуйте його.")
+                self, tr("No case"), tr("First create the case and run it."))
             return
 
         foam = post.ensure_foam_file(case_dir, name or self.cfg.name)
         exe = be.find_paraview()
         if not exe:
             box = QtWidgets.QMessageBox(self)
-            box.setWindowTitle("ParaView не знайдено")
+            box.setWindowTitle("ParaView not found")
             box.setTextFormat(QtCore.Qt.RichText)
             box.setText(
-                tr("ParaView не встановлено.<br><br>"
-                "Потрібен саме нативний Windows-білд: paraFoam усередині WSL "
-                "вимагає X-сервера, а WSLg є лише у Windows 11.<br><br>"
-                "<a href=\"{PARAVIEW_URL}\">{PARAVIEW_URL}</a><br><br>"
-                "Після встановлення відкрийте в ньому файл:<br>"
-                "<code>{foam}</code>", PARAVIEW_URL=be.PARAVIEW_URL, foam=foam))
-            copy = box.addButton("Копіювати шлях", QtWidgets.QMessageBox.ActionRole)
+                tr("ParaView is not installed.<br><br>You need the "
+                   "native Windows build: paraFoam inside WSL needs an X "
+                   "server, and WSLg exists only in Windows "
+                   "11.<br><br><a "
+                   "href=\"{PARAVIEW_URL}\">{PARAVIEW_URL}</a><br><br>After "
+                   "you install it, open this file in "
+                   "it:<br><code>{foam}</code>", PARAVIEW_URL=be.PARAVIEW_URL, foam=foam))
+            copy = box.addButton(tr("Copy Path"), QtWidgets.QMessageBox.ActionRole)
             box.addButton(QtWidgets.QMessageBox.Close)
             box.exec()
             if box.clickedButton() is copy:
@@ -7690,18 +7813,18 @@ class MainWindow(QtWidgets.QMainWindow):
             subprocess.Popen([exe, foam])
             self.statusBar().showMessage(f"ParaView: {foam}", 8000)
         except OSError as exc:
-            QtWidgets.QMessageBox.critical(self, "Не вдалося запустити", str(exc))
+            QtWidgets.QMessageBox.critical(self, tr("Could not start"), str(exc))
 
     def _set_no_fields_note(self, t) -> None:
         """Рядок під екраном про момент, у якому на тілі немає полів. `None` —
         прибрати його. Одна примітка, а не купа: її кожен раз пишуть наново."""
-        mark = "на тілі немає полів"
-        lines = [ln for ln in self.lbl_coeffs.text().split(NEWLINE)
+        mark = tr("no fields on the body")
+        lines = [ln for ln in fs_i18n.lines(fs_i18n.shown(self.lbl_coeffs))
                  if mark not in ln and tr(mark) not in ln]
         if t is not None:
-            lines.append(tr("У моменті {t:g} {mark} (там лише сітка) — малювати "
-                         "нічого. Виберіть інший момент.", t=t, mark=mark))
-        self.lbl_coeffs.setText(NEWLINE.join(lines))
+            lines.append(tr("At time {t:g} {mark} (only the mesh is "
+                            "there) — nothing to draw. Pick another time.", t=t, mark=mark))
+        self.lbl_coeffs.setText(fs_i18n.join(NEWLINE, lines))
 
     @property
     def _rcfg(self):
@@ -7739,7 +7862,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not found:
             names = ", ".join(b.name for b in cfg.body_patches)
             self.lbl_coeffs.setText(
-                tr("{text}\nУ результатах немає патчів: {names}.", text=self.lbl_coeffs.text(), names=names))
+                tr("{text}\nThe results have no patches: {names}.", text=fs_i18n.shown(self.lbl_coeffs), names=names))
             return
         fs = fv.Freestream.from_flow(cfg.flow)
         rotors = [fv.Rotor.from_zone(z) for z in cfg.rotating]
@@ -7765,7 +7888,7 @@ class MainWindow(QtWidgets.QMainWindow):
         current = self.cmb_field.currentText()
         self.cmb_field.blockSignals(True)
         self.cmb_field.clear()
-        self.cmb_field.addItems(fields)
+        self.cmb_field.add_values(fields)
         if current in fields:
             self.cmb_field.setCurrentText(current)
         elif "Cp" in fields:
@@ -7801,7 +7924,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # світле — сюди підуть комірки».
         cmap = ("coolwarm" if field in ("Cp", "p")
                 else "magma" if field == "adaptErr" else "viridis")
-        bar_args = dict(title=field, n_labels=5, fmt="%.3g")
+        bar_args = dict(title=tr(field), n_labels=5, fmt="%.3g")
         if dark:
             # Низ кадру займає шкала зрізу чи ліній, тож шкала тіла йде
             # вертикально праворуч. І в кольорі тексту: типовий чорний на
@@ -7833,7 +7956,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if slice_on:
             self._draw_slice(t, parts)
         if streams_on:
-            self._draw_streams(t, parts, beside_slice=slice_on)
+            notes += self._draw_streams(t, parts, beside_slice=slice_on) or []
         if layers:
             notes += self._draw_layers(t, parts, body, fs, rotors, layers)
         self._set_layer_notes(notes)
@@ -7869,9 +7992,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_layer_notes(self, lines: list) -> None:
         """Рядки про шари під екраном: старі прибрати, нові дописати. Свої
         рядки позначені, і решту тексту (Cd, Cl, попередження) не чіпаємо."""
-        keep = [ln for ln in self.lbl_coeffs.text().split(NEWLINE)
+        keep = [ln for ln in fs_i18n.lines(fs_i18n.shown(self.lbl_coeffs))
                 if not ln.startswith(self.LAYER_MARK)]
-        self.lbl_coeffs.setText(NEWLINE.join(
+        self.lbl_coeffs.setText(fs_i18n.join(NEWLINE,
             keep + [self.LAYER_MARK + ln for ln in lines]))
 
     def _wall_fields(self, t: float, parts: dict, fs, rotors):
@@ -7903,8 +8026,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if need_volume:
                 volume = self.results.internal(t)
                 if volume is None or "U" not in volume.point_data:
-                    notes.append("у результатах немає швидкості в обʼємі — "
-                                 "зворотної течії, сліду й обдуву не показати")
+                    notes.append(tr("the results have no velocity in the "
+                                 "volume — cannot show reverse flow, "
+                                 "wake or slipstream"))
                     volume = None
             if "reverse" in layers and volume is not None:
                 blobs = fv.reverse_flow(volume, fs)
@@ -7915,19 +8039,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     wake = fv.loss_blobs(volume, fs, bodies=parts)
                     self._overlay.blobs(wake, fv.LOSS_COLOR, 0.2, "fs_loss")
                 else:
-                    notes.append("в обʼємі немає тиску — сліду втрат не "
-                                 "порахувати")
+                    notes.append(tr("no pressure in the volume — cannot "
+                                 "compute the loss wake"))
             if "wall" in layers:
                 if fv.NEAR in body.point_data:
                     self._overlay.lines(fv.wall_lines(body), fv.WALL_LINE_COLOR,
                                         1.5, "fs_wall")
                 else:
-                    notes.append("ліній на тілі не буде: у моменті немає "
-                                 "wallShearStress")
+                    notes.append(tr("no lines on the body: this time has no "
+                                 "wallShearStress"))
             if "wash" in layers and volume is not None:
                 if not rotors:
-                    notes.append("обдуву нема звідки пускати: у кейсі немає "
-                                 "гвинтів")
+                    notes.append(tr("no source for the slipstream: the case "
+                                 "has no propellers"))
                 else:
                     wash = fv.prop_wash(volume, parts, fs, rotors)
                     zones, _ = fv.wash_zones(parts, rotors, fs)
@@ -7935,10 +8059,11 @@ class MainWindow(QtWidgets.QMainWindow):
                               if m is not None and n not in zones}
                     self._wash = fv.WashScene(self.res_plotter, wash,
                                               {**zones, **others})
-                    notes.append(tr("обдув: {seeds} ліній від дисків; "
-                                 "частки — у легенді у вікні", seeds=wash.seeds))
+                    notes.append(tr("slipstream: {seeds} lines from the "
+                                    "disks; shares — in the legend in "
+                                    "the window", seeds=wash.seeds))
         except Exception as exc:
-            notes.append(tr("шар не вдалося побудувати: {exc}", exc=exc))
+            notes.append(tr("could not build the layer: {exc}", exc=exc))
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
         return notes
@@ -7957,6 +8082,15 @@ class MainWindow(QtWidgets.QMainWindow):
             p.view_isometric()
             self._restore_face_prev()
         self.draw_results()
+        plane = self._streams_ctx.get("plane") if on and not other_on else None
+        if plane is not None and self._scene is None:
+            # Лінії лише в одній площині (проміжний результат): у косому
+            # вигляді вони злипаються в одну смугу — дивимося рівно на неї.
+            p = self.res_plotter
+            fv.face_on(p, plane[0])
+            if self._view_box is not None:
+                p.reset_camera(bounds=self._view_box)
+            p.render()
 
     def _drop_scene(self) -> None:
         """Прибрати зріз і відпустити його віджет. Робити ДО `clear()`: віджет
@@ -7968,6 +8102,7 @@ class MainWindow(QtWidgets.QMainWindow):
         seed, self._seed_widget = self._seed_widget, None
         self._stream_timer.stop()
         self._streams_ctx = {}
+        self.lbl_view_note.hide()
         for item in (scene, streams, overlay, wash, seed):
             if item is not None:
                 try:
@@ -7992,8 +8127,8 @@ class MainWindow(QtWidgets.QMainWindow):
         fields = fv.available_fields(volume) if volume is not None else []
         if not fields:
             self.lbl_coeffs.setText(
-                tr("{text}\nУ результатах немає обʼєму з U чи p — зрізу "
-                   "показати нічого.", text=self.lbl_coeffs.text()))
+                tr("{text}\nThe results have no volume with U or p — no "
+                   "slice to show.", text=fs_i18n.shown(self.lbl_coeffs)))
             return
         bar.set_fields([(s.key, s.title) for s in fields], bar.field())
         axis, key = bar.axis(), bar.field()
@@ -8020,13 +8155,13 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.set_position(scene.pos)
         bar.set_limits(scene.limits[0], scene.limits[1],
                        scene.spec.kind == "diverging")
-        stops = [("Центр моделі", scene.centre())]
+        stops = [(tr("Model Center"), scene.centre())]
         span = scene.body_range()
         if span:
-            stops += [("Межа тіла: мінімум", span[0]),
-                      ("Межа тіла: максимум", span[1])]
+            stops += [(tr("Body limit: minimum"), span[0]),
+                      (tr("Body limit: maximum"), span[1])]
         for zone in self._rcfg.rotating:
-            stops.append((tr("Гвинт «{name}»", name=zone.name), zone.centre[scene.axis]))
+            stops.append((tr("Propeller “{name}”", name=zone.name), zone.centre[scene.axis]))
         bar.set_stops(stops)
 
     def _apply_body_visibility(self) -> None:
@@ -8136,13 +8271,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.viewport.fit_body()
             framed.append("3D")
         if self._results_to_model():
-            framed.append("результати")
+            framed.append(tr("results"))
         if framed:
             self.statusBar().showMessage(
-                tr("Камера — до моделі: {framed}.", framed=", ".join(framed)), 5000)
+                tr("Camera — fit to model: {framed}.", framed=", ".join(framed)), 5000)
         else:
             self.statusBar().showMessage(
-                "Моделі ще немає — камері нема до чого підлітати.", 6000)
+                tr("There is no model yet — the camera has nothing to fly to."), 6000)
 
     def _results_to_model(self) -> bool:
         """«До моделі» у вкладці результатів. False — тіла там ще немає."""
@@ -8217,21 +8352,54 @@ class MainWindow(QtWidgets.QMainWindow):
         Рахуються кілька секунд, тож курсор — «очікування». Обʼєм той самий,
         що й для зрізу, і читається один раз.
         """
-        volume = self.results.internal(t)
+        volume, step = self._stream_volume(t)
         if volume is None or "U" not in volume.point_data:
             self.lbl_coeffs.setText(
-                tr("{text}\nУ результатах немає швидкості в обʼємі — "
-                   "ліній потоку не буде.", text=self.lbl_coeffs.text()))
-            return
+                tr("{text}\nThe results have no velocity in the volume — "
+                   "there will be no streamlines.", text=fs_i18n.shown(self.lbl_coeffs)))
+            return []
+        notes = []
+        plane = fv.stream_plane(volume)
+        if plane is not None:
+            notes.append(tr(
+                "streamlines: the intermediate result has the velocity only in "
+                "the plane {axis} = {pos:.0f} mm, so the lines are in this "
+                "plane and follow its in-plane velocity (the seeds are moved "
+                "onto it)",
+                axis=fv.AXES[plane[0]].upper(),
+                pos=round(plane[1] * 1000) + 0.0))
+            self.lbl_view_note.setText(tr(
+                "⚠ Streamlines only in the plane {axis} = {pos:.0f} mm: this "
+                "intermediate result has no 3D velocity. 3D lines come with a "
+                "later intermediate result (when the run writes the 3D "
+                "velocity sample) or with the final result.",
+                axis=fv.AXES[plane[0]].upper(),
+                pos=round(plane[1] * 1000) + 0.0))
+            self.lbl_view_note.show()
+        elif step > 0:
+            notes.append(tr(
+                "streamlines: intermediate result, a coarse 3D sample of the "
+                "velocity with a step of {step:.0f} mm, not the full mesh",
+                step=step * 1000))
         fs = fv.Freestream.from_flow(self._rcfg.flow)
         rotors = [fv.Rotor.from_zone(z) for z in self._rcfg.rotating]
         # Обʼєм тут НЕ тримаємо: він гігабайтний, а живе й так у Results
         # рівно один. Кадр ліній бере вже пораховані лінії.
         self._streams_ctx = dict(t=t, bodies=parts, fs=fs, rotors=rotors,
                                  beside_slice=beside_slice,
-                                 bounds=fv.bodies_bounds(volume, parts))
+                                 bounds=fv.bodies_bounds(volume, parts),
+                                 plane=plane)
         self._trace_streams(volume)
         self._place_seed_widget()
+        return notes
+
+    def _stream_volume(self, t: float):
+        """(обʼєм для ліній, крок вибірки в м). У проміжного результату свій
+        (fs_live.LiveResults.stream_volume); в остаточного — повна сітка."""
+        get = getattr(self.results, "stream_volume", None)
+        if get is not None:
+            return get(t)
+        return self.results.internal(t), 0.0
 
     def _current_seeding(self) -> fv.Seeding:
         """Вибір зі смуги + те, що памʼятає вікно (куди потягли)."""
@@ -8259,14 +8427,24 @@ class MainWindow(QtWidgets.QMainWindow):
             lines = fv.case_streamlines(volume, ctx["bodies"], ctx["fs"],
                                         ctx["rotors"], seeding=seeding)
         except ValueError as exc:
-            self.statusBar().showMessage(tr("Лінії потоку: {exc}", exc=exc), 10000)
+            self.statusBar().showMessage(tr("Streamlines: {exc}", exc=exc), 10000)
             return
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
+        seeds = int(np.asarray(lines.field_data[fv.SEED_COUNT_KEY])[0]) \
+            if fv.SEED_COUNT_KEY in lines.field_data else 0
+        started = fv.started_lines(lines)
         if not lines.n_points:
             self.statusBar().showMessage(
-                "Лінії потоку: з цього місця не вийшло жодної лінії — "
-                "насінини поза доменом або в тілі.", 10000)
+                tr("Streamlines: no line came out of this place — the seeds "
+                   "are outside the domain or inside the body."), 10000)
+        elif seeds and started < seeds:
+            # «Ліній 1000», а на екрані менше — людина мусить знати чому.
+            self.statusBar().showMessage(
+                tr("Streamlines: {started} of {seeds} seeds; the other seeds "
+                   "are outside the domain, in the body or outside the "
+                   "velocity data.",
+                   started=started, seeds=seeds), 10000)
         self._streams = fv.StreamScene(self.res_plotter, lines,
                                        vertical=ctx["beside_slice"])
         ctx["label"] = fv.seed_label(seeding, ctx["rotors"])
@@ -8314,7 +8492,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ctx = self._streams_ctx
         if not ctx or self.results is None or not self.slice_bar.streams_on():
             return
-        volume = self.results.internal(ctx["t"])
+        volume = self._stream_volume(ctx["t"])[0]
         if volume is None:
             return
         self._trace_streams(volume)
@@ -8385,8 +8563,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 report = "stall"
         if scene is None and streams is None and not report:
             self.statusBar().showMessage(
-                "Увімкніть зріз, лінії потоку або шар (зворотна течія, слід, "
-                "лінії на тілі, обдув) — кадр робиться з них.", 8000)
+                tr("Turn on a slice, streamlines or a layer (reverse flow, "
+                "wake, surface lines on the body, airflow over the body) "
+                "— the frame is made from them."), 8000)
             return
         if scene is not None:
             name = (f"{self.cfg.name}_{scene.spec.key}_"
@@ -8397,7 +8576,7 @@ class MainWindow(QtWidgets.QMainWindow):
             name = f"{self.cfg.name}_{report}.png"
         start = str(Path(self.case_dir or ".") / name)
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Зберегти кадр", start, "PNG (*.png)")
+            self, tr("Save Frame"), start, "PNG (*.png)")
         if not path:
             return
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
@@ -8419,11 +8598,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     seeding=ctx.get("seeding"))
         except Exception as exc:
             QtWidgets.QApplication.restoreOverrideCursor()
-            QtWidgets.QMessageBox.critical(self, "Не вдалося зберегти кадр",
+            QtWidgets.QMessageBox.critical(self, tr("Could not save the frame"),
                                            str(exc))
             return
         QtWidgets.QApplication.restoreOverrideCursor()
-        self.statusBar().showMessage(tr("Кадр збережено: {path}", path=path), 10000)
+        self.statusBar().showMessage(tr("Frame saved: {path}", path=path), 10000)
 
     def _save_layers_report(self, report: str, path: str) -> None:
         """Кадр шарів: той самий розбір, що й у вікні, але згори й у 3D."""
@@ -8444,13 +8623,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- закриття --------------------------------------------------------
 
+    def tell_last_crash(self, what: str) -> None:
+        """The previous start ended with a fatal record in crash.log."""
+        path = str(crashlog.log_path())
+        self.log.push(tr("Last time the program closed with a crash "
+                         "({what}). The record of it: {path}", what=what, path=path))
+        self.statusBar().showMessage(
+            tr("Last time the program closed with a crash. Record: {path}",
+               path=path), 30000)
+
     def closeEvent(self, event):
         # Пошук машин ще йде (цикл подій крутиться між перевірками, і
         # закриття могло б прийти посеред нього). Закриємо після.
         if getattr(self, "_detecting", False):
             event.ignore()
             self.statusBar().showMessage(
-                "Зачекайте: ще перевіряю машини, тоді можна закрити.", 5000)
+                tr("Wait: still checking the machines, then you can close."), 5000)
             return
         # ПИТАЄМО ПРО ПРОЄКТ ПЕРШИМ — доки нічого не зупинено й не записано.
         #
@@ -8459,10 +8647,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # іншого, і на відмову вікно просто лишається жити.
         if self.ask_save_on_close and self.project_is_dirty():
             answer = QtWidgets.QMessageBox.question(
-                self, "Зберегти проєкт?",
-                tr("У сцені є незбережені зміни.{NEWLINE}{NEWLINE}Проєкт "
-                   "— це геометрія кожної деталі, ролі, завіси й усі "
-                   "налаштування одним файлом.", NEWLINE=NEWLINE),
+                self, tr("Save the project?"),
+                tr("The scene has unsaved changes.{NEWLINE}{NEWLINE}A "
+                   "project is the geometry of each part, the roles, the "
+                   "hinges and all settings in one file.", NEWLINE=NEWLINE),
                 QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Discard
                 | QtWidgets.QMessageBox.Cancel,
                 QtWidgets.QMessageBox.Save)
@@ -8478,6 +8666,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     event.ignore()
                     return
 
+        # From here the window closes (no way back): on_done must not treat
+        # the end of the log reading as the end of the run.
+        self._closing = True
         # Сесію пишемо першою: далі йде зупинка потоків, і якщо щось там
         # піде не так, стан уже на диску.
         try:
@@ -8530,15 +8721,68 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
+def end_process(win, rc: int, grace_ms: int = 5000) -> None:
+    """End the process after app.exec() without a qFatal.
+
+    closeEvent waits a limited time for each worker thread. A thread that
+    still runs after that is a child of the window, and the end of Python
+    destroys the window and its children: QThread::~QThread on a running
+    thread is qFatal("QThread: Destroyed while thread ... is still running"),
+    then abort() (c0000409 in Qt6Core.dll, T26). So: wait a short time more,
+    and if a thread still runs, write it to crash.log and end the process
+    with os._exit, without the destruction of the window. The session and
+    the settings are already on the disk (closeEvent).
+    """
+    running = [t for t in win.findChildren(QtCore.QThread) if t.isRunning()]
+    deadline = time.monotonic() + grace_ms / 1000.0
+    for t in running:
+        t.quit()
+        t.wait(max(0, int((deadline - time.monotonic()) * 1000)))
+    still = [t for t in running if t.isRunning()]
+    if still:
+        names = ", ".join(t.objectName() or type(t).__name__ for t in still)
+        crashlog.note(f"exit: QThread still running ({names}); "
+                      "os._exit instead of a qFatal")
+        crashlog.finish()
+        try:
+            QtCore.QSettings(SETTINGS_ORG, SETTINGS_APP).sync()
+        except Exception:                                    # noqa: BLE001
+            pass
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream is not None:
+                    stream.flush()
+            except Exception:                                # noqa: BLE001
+                pass
+        os._exit(rc)
+    crashlog.finish()
+    sys.exit(rc)
+
+
+SERVER_WIZARD_FLAG = "--server-wizard"
+
+
 def main():
+    crashed = crashlog.last_crash()     # before install() starts a new record
+    crashlog.install()
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_ShareOpenGLContexts)
+    fs_icons.own_taskbar_button(fs_icons.OFS_APP_ID)
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setWindowIcon(fs_icons.icon(fs_icons.OFS))
     win = MainWindow()
     win.show()
+    if crashed:
+        win.tell_last_crash(crashed)
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
         win.load_stl(sys.argv[1])
-    sys.exit(app.exec())
+    if SERVER_WIZARD_FLAG in sys.argv[1:]:
+        # The installer starts the program with this flag (its last page).
+        QtCore.QTimer.singleShot(800, win.open_server_wizard)
+    elif (fs_paths.FROZEN and not fset.get("server_wizard_offered")
+          and not fset.get("ssh_host")):
+        QtCore.QTimer.singleShot(2500, win.offer_server_wizard)
+    end_process(win, app.exec())
 
 
 if __name__ == "__main__":

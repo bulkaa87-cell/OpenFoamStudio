@@ -1,7 +1,0 @@
-{
- "3D недоступне: {v}": "3D is not available: {v}",
- "3D: {backend} не дав поверхню вікна ({error}); малює {adapter}": "3D: {backend} did not give a window surface ({error}); drawing with {adapter}",
- "GPU відмовив двічі: {error}": "GPU failed twice: {error}",
- "{text} не створився: {error}": "{text} was not created: {error}",
- "немає foamview": "no foamview"
-}

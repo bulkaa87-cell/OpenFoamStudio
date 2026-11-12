@@ -1,0 +1,15 @@
+{
+ "Degenerate faces": "Вироджені грані",
+ "Flipped faces": "Вивернуті грані",
+ "For very dirty models: the model is rebuilt from zero on a cell grid, the face orientation does not matter. The result is always closed, but details thinner than ~0.7 mm disappear. All models become one body": "Для дуже брудних моделей: модель перебудовується наново по сітці комірок, напрямок граней не має значення. Результат завжди замкнений, але деталі, тонші за ~0.7 мм, зникають. Усі моделі стають одним тілом",
+ "Holes (open edges)": "Дірки (відкриті ребра)",
+ "Non-manifold edges": "Non-manifold ребер",
+ "Our own repair in Rust (rust/meshfix), without the Windows service: stitch gaps up to 0.01 mm, remove duplicates, make normals consistent, close all holes, merge bodies that cut into each other, remove nested and tiny shells. The surface stays in place. If the mesh still did not close, it uses alpha wrap by itself, and then the volume rebuild.": "Наш ремонт на Rust (rust/meshfix), без служби Windows: зшити щілини до 0.01 мм, прибрати дублі, узгодити нормалі, закрити всі дірки, обʼєднати тіла, що врізаються одне в одне, прибрати вкладені й крихітні оболонки. Поверхня лишається на місці. Якщо сітка все одно не замкнулася, сам бере alpha wrap, а тоді обʼємну перебудову.",
+ "Repair service built into Windows (Netfabb) — the same as “Fix model” in Bambu Studio, Orca and PrusaSlicer. Refines the mesh and moves vertices slightly. It takes long: about a minute per 250k triangles": "Служба ремонту, вбудована у Windows (Netfabb) — те саме, що «Fix model» у Bambu Studio, Orca й PrusaSlicer. Згущує сітку й трохи зсуває вершини. Іде довго: близько хвилини на 250 тис. трикутників",
+ "Windows": "Windows",
+ "Wrap the whole assembly in one shell (alpha wrap in Rust, in the program itself) and shrink it onto the surface. The shell is closed, edges stay edges. Cost: narrow cavities (the gap between a nacelle and the skin) are filled, all models become one body": "Обгорнути всю збірку однією оболонкою (alpha wrap на Rust, у самій програмі) і стиснути її на поверхню. Оболонка замкнена, кромки лишаються кромками. Ціна: вузькі порожнини (щілина між гондолою й обшивкою) заповнюються, усі моделі стають одним тілом",
+ "alpha wrap": "alpha wrap",
+ "meshfix": "meshfix",
+ "model {i} of {n_meshes}: ": "модель {i} з {n_meshes}: ",
+ "volume rebuild": "обʼємна перебудова"
+}

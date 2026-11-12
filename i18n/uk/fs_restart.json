@@ -1,0 +1,10 @@
+{
+ "Before the restart, the program saves the session. Then it opens the session again.": "Перед перезапуском програма збереже сесію і потім відкриє її знову.",
+ "Interface language": "Мова інтерфейсу",
+ "Later": "Пізніше",
+ "Restart now": "Перезапустити зараз",
+ "The environment variable FS_LANG={value} has priority over the setting. To change the language, remove this variable and restart the program.": "Змінна оточення FS_LANG={value} має перевагу над налаштуванням. Щоб мова змінилася, видаліть цю змінну і перезапустіть програму.",
+ "The language changes after you restart the program.": "Мову буде змінено після перезапуску програми.",
+ "The program did not start again. Start it manually.": "Не вдалося запустити програму знову. Запустіть її вручну.",
+ "The restart is cancelled.": "Перезапуск скасовано."
+}

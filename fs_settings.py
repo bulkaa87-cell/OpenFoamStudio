@@ -51,9 +51,18 @@ MIGRATED = "_migrated"          # marker: the one-time migration is done
 LANGUAGES = ("uk", "en")
 VIEW3D_LEVELS = ("auto", "gpu", "soft", "vtk", "cpu")
 
+def _system_language() -> str:
+    try:
+        from fs_i18n import system_language
+        return system_language()
+    except Exception:                                      # noqa: BLE001
+        return "en"
+
+
 DEFAULTS: dict = {
     # Загальне
-    "ui_language": "uk",
+    # Without a setting: the language of the operating system (T28).
+    "ui_language": _system_language(),
     "rookie": True,
     "restore_session": True,
     "cases_dir": "",            # "" = <program folder>/cases
@@ -61,10 +70,14 @@ DEFAULTS: dict = {
     # Машини
     "ssh_host": "",
     "check_machines_on_start": True,
+    "server_wizard_offered": False,     # installed copy: asked once (T34)
+    # {ssh host: "docker|image" or "podman|image"} as JSON: the servers that
+    # run OpenFOAM in a container (the server wizard writes it).
+    "ssh_containers": "",
     "dist_on": False,
     "dist_machines": "",        # JSON text of fs_backend.machines_to_json
     "dist_key": "~/.ssh/id_ed25519",
-    "dist_user": "",
+    "dist_user": "",            # "" = the user of the server login
     "dist_net": "",
     # 3D
     "view3d_backend": "auto",

@@ -518,9 +518,9 @@ def net_force_line(cfg, cd: float | None, engines: dict,
     drag = cd * q * float(cfg.flow.a_ref)
     thrust = sum(v["thrust"] for v in engines.values()) + disks_thrust
     net = thrust - drag
-    how = "розганяється" if net > 0 else "гальмує"
-    return (tr("Чиста сила вперед: тяга {thrust:.2f} Н − опір планера "
-            "{drag:.2f} Н = {net:+.2f} Н ({how}).", thrust=thrust, drag=drag, net=net, how=how))
+    how = tr("accelerates") if net > 0 else tr("decelerates")
+    return (tr("Net forward force: thrust {thrust:.2f} N − airframe drag "
+               "{drag:.2f} N = {net:+.2f} N ({how}).", thrust=thrust, drag=drag, net=net, how=how))
 
 
 def summarise_coeffs(series: dict[str, list[tuple[float, float]]],
@@ -582,7 +582,7 @@ def coeff_verdict(pts: list[tuple[float, float]],
     "few".
     """
     if len(pts) < 20:
-        return "few", "записів замало, щоб судити про збіжність"
+        return "few", tr("too few records to judge convergence")
     arr = np.array(pts, dtype=float)
     it, vals = arr[:, 0], arr[:, 1]
     cut = max(len(vals) - max(50, len(vals) // 4), 0)
@@ -624,8 +624,8 @@ def coeff_verdict(pts: list[tuple[float, float]],
 
     marching = drift > DRIFT_LIMIT and steady_march >= MARCH_LIMIT
     oscillating = rng > RANGE_LIMIT
-    moving = (tr("середнє повзе в один бік ({v:.1f}% за хвіст, "
-              "{v2:.0f}% кроків туди само)", v=drift * 100, v2=steady_march * 100))
+    moving = (tr("the mean drifts one way ({v:.1f}% over the tail, "
+                 "{v2:.0f}% of steps in the same direction)", v=drift * 100, v2=steady_march * 100))
 
     # ХІД питається першим, і це важливо. Ранній прогін, який ще
     # розганяється, гуляє не менше за зірваний: той самий кейс на 90-й
@@ -638,16 +638,16 @@ def coeff_verdict(pts: list[tuple[float, float]],
     # так у мене й вийшло, поки цієї умови не було.
     if marching:
         if steady:
-            return "drift", tr("{moving} — прогін не добіг, дайте більше ітерацій", moving=moving)
-        return "drift", (tr("{moving} — пусковий перехідний процес ще не згас, "
-                         "усереднювати рано", moving=moving))
+            return "drift", tr("{moving} — the run did not finish, give it more iterations", moving=moving)
+        return "drift", (tr("{moving} — the start-up transient has not "
+                            "died out yet, too early to average", moving=moving))
     if oscillating:
         if steady:
             return "osc", (
-                tr("розмах {v:.0f}% від значення — стаціонарний "
-                "розвʼязувач дійшов до своєї межі: точки розвʼязку тут уже "
-                "немає, потрібен нестаціонарний", v=rng * 100))
+                tr("spread {v:.0f}% of the value — the steady solver has "
+                   "reached its limit: there is no solution point here, "
+                   "you need a transient one", v=rng * 100))
         return "osc", (
-            tr("розмах {v:.0f}% — це коливання самої течії; "
-            "усереднюйте по цілих періодах", v=rng * 100))
-    return "ok", tr("усталилося (розмах {v:.1f}% від значення)", v=rng * 100)
+            tr("spread {v:.0f}% — this is the oscillation of the flow "
+               "itself; average over whole periods", v=rng * 100))
+    return "ok", tr("settled (spread {v:.1f}% of the value)", v=rng * 100)

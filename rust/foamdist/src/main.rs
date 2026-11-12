@@ -109,6 +109,12 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The user that runs foamdist: the default user for the other machines.
+fn own_user() -> String {
+    env::var("USER").or_else(|_| env::var("LOGNAME"))
+        .ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "root".into())
+}
+
 fn home() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
 }
@@ -855,7 +861,7 @@ fn main() -> ExitCode {
         }
         i += 1;
     }
-    let user = opt.get("user").cloned().unwrap_or_else(|| "".into());
+    let user = opt.get("user").cloned().unwrap_or_else(own_user);
     let key = PathBuf::from(opt.get("key").cloned().unwrap_or_else(|| {
         home().join(".ssh/foamdist_ed25519").display().to_string()
     }));

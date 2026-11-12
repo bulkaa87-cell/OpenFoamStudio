@@ -140,19 +140,19 @@ def load_case(case_dir: str | Path, *, time: float | None = None,
     good, stale = post.matching_times(str(case_dir))
     times = good or list(res.times)
     if not times:
-        raise ValueError(tr("У кейсі {name} немає часових каталогів з результатами.", name=name))
+        raise ValueError(tr("Case {name} has no time directories with results.", name=name))
     t = float(time) if time is not None else float(times[-1])
     if t not in times:
-        why = (tr(" (зрізи {join} — від іншої сітки)", join=', '.join('%g' % x for x in stale))
+        why = (tr(" (time directories {join} are from another mesh)", join=', '.join('%g' % x for x in stale))
                if stale else "")
-        raise ValueError(tr("Моменту {t:g} у кейсі {name} нема; є: {join}{why}.", t=t, name=name, join=", ".join(f"{x:g}" for x in times[-5:]), why=why))
+        raise ValueError(tr("Time {t:g} is not in case {name}; available: {join}{why}.", t=t, name=name, join=", ".join(f"{x:g}" for x in times[-5:]), why=why))
     volume = res.internal(t)
     if volume is None:
-        raise ValueError(tr("У кейсі {name} не читається обʼєм сітки.", name=name))
+        raise ValueError(tr("Cannot read the mesh volume in case {name}.", name=name))
 
     notes: list = []
     if stale:
-        notes.append(tr("зрізи {join} від іншої сітки — пропущено", join=", ".join("%g" % x for x in stale)))
+        notes.append(tr("time directories {join} are from another mesh — skipped", join=", ".join("%g" % x for x in stale)))
     manifest = lib.read_manifest(case_dir)
     cfg = lib.cfg_from_dict(manifest.get("cfg")) if manifest else None
     facts = control_facts(case_dir)
@@ -164,8 +164,9 @@ def load_case(case_dir: str | Path, *, time: float | None = None,
         speed = u_inf if u_inf is not None else facts.get("u_inf")
         if speed is None:
             raise ValueError(
-                tr("Кейс {name} не каже швидкості потоку (немає studio.json, у "
-                "controlDict нема magUInf). Задайте її: --u-inf.", name=name))
+                tr("Case {name} does not give the flow speed (no "
+                   "studio.json, no magUInf in controlDict). Set it: "
+                   "--u-inf.", name=name))
         nu = kinematic_viscosity(case_dir) or 1.47e-5
         # Густинні розвʼязувачі (rhoSimpleFoam, rhoPimpleFoam, rhoCentralFoam)
         # тримають АБСОЛЮТНИЙ тиск у паскалях, а не кінематичний. Без цього
@@ -173,7 +174,7 @@ def load_case(case_dir: str | Path, *, time: float | None = None,
         # Відлік тиску в словниках не записано — беремо стандартний.
         comp = str(facts.get("application", "")).startswith("rho")
         if comp:
-            notes.append("стисливий розвʼязувач: p∞ = 101325 Па (припущено)")
+            notes.append(tr("compressible solver: p∞ = 101325 Pa (assumed)"))
         fs = fv.Freestream(u_inf=float(speed),
                            direction=facts.get("direction", (1.0, 0.0, 0.0)),
                            rho=facts.get("rho", 1.225), nu=nu,
@@ -192,7 +193,7 @@ def load_case(case_dir: str | Path, *, time: float | None = None,
     unknown = [n for n in wanted if n not in present]
     wanted = [n for n in wanted if n in present]
     if unknown:
-        notes.append(tr("немає такої границі: {unknown}", unknown=", ".join(unknown)))
+        notes.append(tr("no such boundary: {unknown}", unknown=", ".join(unknown)))
     if not wanted:
         wanted = [n for n in present if n not in NOT_BODIES]
     bodies = {n: res.patch(t, n) for n in wanted}
@@ -216,8 +217,9 @@ def load_history(case_dir: str | Path, label: str = "") -> fv.HistoryCase:
     series = be.read_force_coeffs(str(case_dir))
     parts = be.read_body_coeffs(str(case_dir))
     if not series and not parts:
-        raise ValueError(tr("У кейсі {name} немає postProcessing з "
-                         "коефіцієнтами: він не рахувався або їх прибрали.", name=case_dir.name))
+        raise ValueError(tr("Case {name} has no postProcessing with "
+                            "coefficients: it was not run, or they were "
+                            "removed.", name=case_dir.name))
     manifest = lib.read_manifest(case_dir)
     if manifest and manifest.get("cfg"):
         steady = bool(lib.cfg_from_dict(manifest["cfg"]).solver.steady)

@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+from fs_i18n import tr
 
 try:                                       # pragma: no cover - залежить від збірки
     import foamrs as _rs
@@ -49,8 +50,8 @@ def surface_lines(points, tris, vectors, normals, seeds, max_length: float,
     vtkStreamTracer), бо numpy-версія вийшла б повільнішою за обидва.
     """
     if not has("surface_lines"):
-        raise RuntimeError(why_not() or "foamrs без surface_lines — "
-                           "перезберіть tools\\build_rust.ps1")
+        raise RuntimeError(why_not() or tr("foamrs has no surface_lines — "
+                                        "rebuild tools\\build_rust.ps1"))
     return _rs.surface_lines(
         np.ascontiguousarray(points, dtype=np.float64),
         np.ascontiguousarray(tris, dtype=np.int64),
@@ -78,8 +79,9 @@ def parse_log(text: str, state: dict) -> "dict | None":
 def why_not() -> str:
     if _rs is not None:
         return ""
-    return ("Модуль foamrs (Rust) не зібрано — поля читаються запасним "
-            "способом, повільніше. Зібрати: tools\\build_rust.ps1.")
+    return (tr("The foamrs module (Rust) is not built — fields are read by "
+            "the fallback method, which is slower. To build: "
+            "tools\\build_rust.ps1."))
 
 
 # --------------------------------------------------------------------------

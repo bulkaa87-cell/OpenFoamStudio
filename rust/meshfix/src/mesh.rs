@@ -66,6 +66,13 @@ impl Grid {
         let k = self.key(p);
         self.cells.entry(k).or_default().push(id);
     }
+    /// Remove id from the cell of p (p: the position it was inserted with).
+    pub fn remove(&mut self, id: u32, p: Vec3) {
+        let k = self.key(p);
+        if let Some(v) = self.cells.get_mut(&k) {
+            v.retain(|&x| x != id);
+        }
+    }
     /// Ids in the 27 cells around p. The caller measures the distance.
     pub fn near(&self, p: Vec3, out: &mut Vec<u32>) {
         let (x, y, z) = self.key(p);
