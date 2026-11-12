@@ -12,6 +12,8 @@ use rayon::prelude::*;
 
 pub mod field;
 pub mod logparse;
+pub mod meshpy;
+pub mod polymesh;
 pub mod surface;
 pub mod topo;
 
@@ -274,6 +276,8 @@ fn foamrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(shell_projections, m)?)?;
     m.add_function(wrap_pyfunction!(threads, m)?)?;
     m.add_function(wrap_pyfunction!(logparse::parse_log, m)?)?;
+    m.add_function(wrap_pyfunction!(meshpy::read_mesh, m)?)?;
+    m.add_class::<meshpy::PolyMesh>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

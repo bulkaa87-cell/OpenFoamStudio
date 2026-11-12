@@ -2,24 +2,27 @@
 #
 #   powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 `
 #       -Python C:\path\to\venv\Scripts\python.exe -Out X:\some\build `
-#       [-Version 0.1.1] [-Iscc C:\path\to\ISCC.exe] [-CargoTarget X:\some\target] `
+#       [-Version 0.2.0] [-Iscc C:\path\to\ISCC.exe] [-CargoTarget X:\some\target] `
 #       [-SkipRust] [-SkipInstaller]
 #
 # Steps:
-#   1. Rust: foamrs, foamview, meshfix (.pyd in the repository root) and the
-#      Linux binary foamdist (rust\foamdist\target\x86_64-unknown-linux-musl).
+#   1. Rust: foamrs (.pyd in the repository root) and the Linux binary
+#      foamdist (rust\foamdist\target\x86_64-unknown-linux-musl). The repair
+#      (meshfix) and the 3D view (foamview) are the shared packages of
+#      MeshFix Studio: requirements.txt installs them (fs_shared.py).
 #   2. PyInstaller: <Out>\dist\OpenFOAM Studio\OpenFOAM Studio.exe
 #   3. Inno Setup: <Out>\installer\OpenFOAM-Studio-<Version>-windows-x64-setup.exe
 # Then test: python tests\test_installer.py <setup.exe>
 #
-# The Python must have requirements.txt and pyinstaller installed. Use a
-# separate venv for the build, not the .venv of the program.
+# The Python must have requirements.txt (with meshfix-core and foamview) and
+# pyinstaller installed. Use a separate venv for the build, not the .venv of
+# the program.
 # This file is ASCII only (Windows PowerShell 5.1 reads it without a BOM).
 
 param(
     [string]$Python = "",
     [string]$Out = "",
-    [string]$Version = "0.1.1",
+    [string]$Version = "0.2.0",
     [string]$Iscc = "",
     [string]$CargoTarget = "",
     [switch]$SkipRust,
@@ -49,7 +52,7 @@ if (-not $SkipRust) {
         if ($CargoTarget) { $remap = "--remap-path-prefix=$CargoTarget=target $remap" }
         $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = $remap
     }
-    foreach ($crate in @("foamrs", "foamview", "meshfix")) {
+    foreach ($crate in @("foamrs")) {
         Push-Location (Join-Path $root "rust\$crate")
         try {
             if ($CargoTarget) { $env:CARGO_TARGET_DIR = $CargoTarget; $tdir = $CargoTarget }

@@ -584,6 +584,7 @@ class LayerDiagnosis:
     tips: list[Tip] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     cfg: fc.CaseCfg | None = None       # конфіг із застосованими правками
+    wall_resolved: bool = False         # y+ ≈ 1 case: coverage tips only
     source: fc.CaseCfg | None = None    # конфіг прогону, з якого розбір
 
     @property
@@ -711,6 +712,15 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
                            "cells grew — the boundary layer is in fact not "
                            "resolved.", pct=pct))
 
+    new = copy.deepcopy(cfg)
+    if wall_resolved(cfg):
+        # y+ ≈ 1 is a hard target here: never fewer layers, never "turn the
+        # layers off". Only how snappy grows the stack changes (T38, the
+        # user's decision 2026-11-12).
+        out.wall_resolved = True
+        _wall_resolved_tips(out, cfg, new, stack, yp_layers, diag)
+        return out
+
     # ---- правки ----
     #
     # Ключове: просто зменшити кількість шарів — погана порада. Перший шар
@@ -719,7 +729,6 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
     # якраз наросли. Тому разом із кількістю перераховуємо
     # finalLayerThickness так, щоб перший шар лишився тим самим: стек стає
     # коротшим (це й дає покриття), а роздільність біля стінки не страдає.
-    new = copy.deepcopy(cfg)
     tips: list[Tip] = []
     first_before = stack.first_abs
 
@@ -795,22 +804,7 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
                    "out thinner than {min_thickness_rel:g} of a cell and "
                    "so did not appear at all will now get a thin layer.", min_thickness_rel=m.min_thickness_rel))
 
-    # ---- причини, яких ручками не полагодити ----
-    if _is_assembly(diag):
-        out.notes.append(
-            tr("The main cause here is not the settings: the geometry "
-               "has {parts} parts and {non_manifold_edges} non-manifold "
-               "edges. Along the lines where the shells cut into each "
-               "other, there is no place to grow a layer. A/B tested: "
-               "featureAngle 60→130 and medialRatio 0.3→0.6 gave 36.7% "
-               "vs 36.4% — these knobs do not fix it. What fixes it is "
-               "joining the parts into one body (Boolean union in CAD or "
-               "shrink wrap).", parts=diag.parts, non_manifold_edges=diag.non_manifold_edges))
-    if diag is not None and not diag.closed and diag.largest_hole > cfg.surface_cell:
-        out.notes.append(
-            tr("The surface leaks through holes larger than a cell — while "
-            "this is so, layers will not grow at all. Start with the "
-            "“Geometry” tab."))
+    _geometry_notes(out, cfg, diag)
     if not tips:
         out.notes.append(
             tr("Nothing is left to adjust: {n_layers} layers, "
@@ -835,12 +829,142 @@ def layer_diagnosis(cfg: fc.CaseCfg, coverage: float,
     return out
 
 
+def wall_resolved(cfg: fc.CaseCfg) -> bool:
+    """True: the case needs y+ ≈ 1 on the wall, without a wall function.
+
+    The model needs it (transition, low-Re, LES), or the wall treatment is
+    low-Re: fs_yplus.good_range ends at 2 or lower. Then the layer advice
+    never proposes fewer layers, a shorter stack with a thicker first
+    layer, or no layers. A y+ target alone does not count: a typed layer
+    count turns auto y+ off and leaves its target, also with Spalding,
+    which is valid for each y+.
+    """
+    return fy.good_range(cfg.flow.turbulence, fy.cfg_treatment(cfg))[1] <= 2.0
+
+
+# Coverage knobs for a wall-resolved case: (field, name in the dictionary,
+# advised value). Each one changes how snappy grows the stack, none of them
+# changes the first layer. Values: the usual ones for y+ ≈ 1 stacks in
+# OpenFOAM practice; nGrow stays 0 (a larger value takes the layers away
+# around each failed face).
+_COVERAGE_KNOBS = (
+    ("max_thickness_medial", "maxThicknessToMedialRatio", 0.6,
+     "snappy makes the stack thinner where it is thicker than this share "
+     "of the distance to the medial axis (in the snappy log: “Reducing "
+     "layer thickness at … nodes”). A y+ ≈ 1 stack is long, so this rule "
+     "cuts it often. With 0.6 the stack stays in narrower places. Cost: "
+     "more squeezed cells in narrow gaps, checkMesh can show more skew "
+     "faces"),
+    ("layer_min_medial_angle", "minMedialAxisAngle", 130,
+     "a point counts as the medial axis when the directions to the walls "
+     "differ by more than this angle. With 130 fewer points count, so the "
+     "stack is made thinner in fewer places. Cost: in a narrow gap the two "
+     "stacks can meet, and the layer cells there fail the quality check"),
+    ("layer_feature_angle", "featureAngle", 130,
+     "snappy stops the layer at an edge sharper than this angle. With 130 "
+     "the layer goes on around the trailing edge, the nose and the joints. "
+     "Cost: on a very sharp edge the layer cells are more distorted "
+     "(skewness)"),
+    ("n_smooth_surface_normals", "nSmoothSurfaceNormals", 3,
+     "smoother normals on the surface: fewer folded layer cells at curved "
+     "edges, so fewer faces fail the quality check and lose their layer. "
+     "Cost: a few seconds of the layer stage"),
+    ("n_smooth_normals", "nSmoothNormals", 5,
+     "the same inside the stack: the direction of growth changes smoothly "
+     "from the wall outwards. Cost: a few seconds of the layer stage"),
+    ("layer_n_smooth_thickness", "nSmoothThickness", 20,
+     "smooths the thickness between faces with a full stack and faces "
+     "with a cut stack: no steep step where the stack ends, so fewer faces "
+     "fail. Cost: a few seconds of the layer stage"),
+    ("layer_n_relax_iter", "nRelaxIter", 10,
+     "the number of relaxation steps before snappy takes the layer away "
+     "from a face that fails the quality check. More steps keep more "
+     "faces. Cost: each layer iteration takes longer"),
+)
+
+# The layer fields that "Repair Layers" can change (both modes).
+LAYER_FIX_FIELDS = ("add_layers", "n_layers", "expansion", "final_layer_rel",
+                    "min_thickness_rel") + tuple(k[0] for k in _COVERAGE_KNOBS)
+
+
+def _wall_resolved_tips(out: LayerDiagnosis, cfg: fc.CaseCfg,
+                        new: fc.CaseCfg, stack, yp_layers: float,
+                        diag) -> None:
+    """The advice for a case that needs y+ ≈ 1: only coverage changes."""
+    m = cfg.mesh
+    tips: list[Tip] = []
+    for name, title, value, reason in _COVERAGE_KNOBS:
+        now = getattr(m, name)
+        if now < value:
+            setattr(new.mesh, name, type(now)(value))
+            _add(tips, "Mesh", title, now, value, reason)
+    if m.min_thickness_rel > 0.02:
+        new.mesh.min_thickness_rel = 0.02
+        _add(tips, "Mesh", "minThickness", m.min_thickness_rel, 0.02,
+             "a face where the layer comes out thinner than this "
+             "threshold, snappy leaves with no layer at all. A lower "
+             "threshold gives a thin layer instead of none — at the cost "
+             "of more stretched cells, so checkMesh can start to complain")
+    out.tips = tips
+    out.cfg = new if tips else None
+    out.notes.append(
+        tr("This case resolves the wall ({model}, y+ ≈ 1), so the advice "
+           "keeps the number of layers, expansionRatio and "
+           "finalLayerThickness (first layer {first_abs}, y+ ≈ "
+           "{yp:.1f}) and changes only how snappy grows the stack. "
+           "Fewer layers or no layers would raise y+ above the range of "
+           "the model. nGrow stays 0: a larger value takes the layers "
+           "away around each failed face.",
+           model=cfg.flow.turbulence, first_abs=phys.fmt_len(stack.first_abs),
+           yp=yp_layers))
+    if tips:
+        out.notes.append(
+            tr("These changes do not change the first layer, so y+ stays "
+               "the same. Each change needs a new snappyHexMesh run (the "
+               "layer stage takes longer)."))
+    _geometry_notes(out, cfg, diag)
+    out.notes.append(
+        tr("The relaxed quality set that snappy uses for the layers "
+           "(meshQualityControls/relaxed) already allows maxNonOrtho 75. "
+           "This program calls a mesh with non-orthogonality 75 or more "
+           "unusable, so the advice does not relax it further."))
+    if not tips or out.level == "bad":
+        out.notes.append(
+            tr("Where the layers still do not grow: raise the surface "
+               "level {lv} → {v} there (a refinement region or the level of "
+               "that part on the “Mesh” tab). The cell becomes {c2} "
+               "instead of {c1}, so the same first layer needs a shorter "
+               "stack, and it fits into narrower places. The cost: about "
+               "four times as many cells on that surface.",
+               lv=m.surface_level_max, v=m.surface_level_max + 1,
+               c2=phys.fmt_len(cfg.surface_cell / 2),
+               c1=phys.fmt_len(cfg.surface_cell)))
+
+
+def _geometry_notes(out: LayerDiagnosis, cfg: fc.CaseCfg, diag) -> None:
+    """Causes that no layer setting repairs."""
+    if _is_assembly(diag):
+        out.notes.append(
+            tr("The main cause here is not the settings: the geometry "
+               "has {parts} parts and {non_manifold_edges} non-manifold "
+               "edges. Along the lines where the shells cut into each "
+               "other, there is no place to grow a layer. A/B tested: "
+               "featureAngle 60→130 and medialRatio 0.3→0.6 gave 36.7% "
+               "vs 36.4% — these knobs do not fix it. What fixes it is "
+               "joining the parts into one body (Boolean union in CAD or "
+               "shrink wrap).", parts=diag.parts, non_manifold_edges=diag.non_manifold_edges))
+    if diag is not None and not diag.closed and diag.largest_hole > cfg.surface_cell:
+        out.notes.append(
+            tr("The surface leaks through holes larger than a cell — while "
+            "this is so, layers will not grow at all. Start with the "
+            "“Geometry” tab."))
+
+
 def apply_layer_fix(target: fc.CaseCfg, diagnosis: LayerDiagnosis) -> None:
     """Переносить лише правки шарів — решти конфігу не чіпає."""
     if diagnosis.cfg is None:
         return
-    for name in ("add_layers", "n_layers", "expansion", "final_layer_rel",
-                 "min_thickness_rel"):
+    for name in LAYER_FIX_FIELDS:
         setattr(target.mesh, name, getattr(diagnosis.cfg.mesh, name))
 
 

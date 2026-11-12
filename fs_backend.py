@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from fs_i18n import tr
+import fs_caseguard as guard
+import fs_coeffs as coeffs
 import fs_paths
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -119,7 +121,9 @@ def ssh_argv(host: str, command: str) -> list[str]:
 # - HOME stays the home folder of the user (foamdist uses /tmp).
 
 CONTAINER_ENGINES = ("docker", "podman")
-CONTAINER_ROOT = "$HOME/openfoam-studio"
+# The folder of the program on a server and in WSL (fs_paths.REMOTE_ROOT).
+REMOTE_ROOT = fs_paths.REMOTE_ROOT
+CONTAINER_ROOT = REMOTE_ROOT
 CONTAINER_BASHRC = "/usr/lib/openfoam/openfoam*/etc/bashrc"
 CONTAINER_LABEL = "openfoam-studio=1"
 # hwloc in the image looks for GPUs through X and hangs without a display
@@ -341,16 +345,11 @@ def soft_stop_file(case_dir: str) -> str:
 def soft_check_local(case_dir: str) -> tuple[bool, str]:
     """`soft_check_command` Python-ом — для BlueCFD, де немає bash."""
     root = Path(case_dir)
-    times = []
-    for d in root.iterdir() if root.is_dir() else []:
-        try:
-            if d.is_dir() and float(d.name) > 0:
-                times.append((float(d.name), d))
-        except ValueError:
-            pass
+    import fs_timeline as ftl                 # the rule of a time folder (T51)
+    times = ftl.time_folders(root)
     if not times:
         return (False, tr("no time directory in the case root"))
-    t, d = max(times)
+    d = root / times[-1][1]
     if not any((d / f).is_file() and (d / f).stat().st_size
                for f in ("U", "U.gz")):
         return (False, tr("time directory {name} has no U field", name=d.name))
@@ -405,10 +404,25 @@ class Backend:
 
     # --- побудова команди ------------------------------------------------
 
+    def work_dir(self, case_dir: str, native_dir: str | None = None) -> str:
+        """The case folder as the shell of this backend sees it.
+
+        WSL: `native_dir` (the copy in the native file system) or the
+        Windows folder through /mnt. ssh: `native_dir` (the folder on the
+        server); without it the folder of the same name in REMOTE_ROOT, so
+        that the probes can make a command without a case. Other kinds: the
+        case folder itself.
+        """
+        if self.kind == "wsl":
+            return native_dir or win_to_wsl(case_dir)
+        if self.kind == "ssh":
+            return native_dir or remote_dir_for(Path(case_dir).name)
+        return os.path.abspath(case_dir)
+
     def shell(self, case_dir: str, command: str, native_dir: str | None = None) -> list[str]:
         """Повертає argv для subprocess, що виконає `command` у каталозі кейсу."""
         if self.kind == "wsl":
-            wd = native_dir or win_to_wsl(case_dir)
+            wd = self.work_dir(case_dir, native_dir)
             inner = f'source "{self.bashrc}" && cd "{wd}" && {command}'
             return wsl_argv(self.distro, inner)
 
@@ -416,7 +430,7 @@ class Backend:
             # Каталог на СЕРВЕРІ. Шлях Windows там не існує, тому native_dir
             # тут не зручність, а обовʼязок; запасний варіант потрібен лише
             # щоб розпізнавання й перевірки могли скласти команду без кейсу.
-            wd = native_dir or f"$HOME/openfoam-studio/{Path(case_dir).name}"
+            wd = self.work_dir(case_dir, native_dir)
             if self.engine:
                 inner = (f'cd "{wd}" && '
                          + container_run(self.engine, self.image, command))
@@ -452,16 +466,16 @@ class Backend:
         """
         sig = "CONT" if resume else "STOP"
         if self.kind == "wsl":
-            target = native_dir or win_to_wsl(case_dir)
-            return wsl_argv(self.distro, signal_script(target, sig))
+            return wsl_argv(self.distro, signal_script(
+                self.work_dir(case_dir, native_dir), sig))
         if self.kind == "docker":
             verb = "unpause" if resume else "pause"
             return ["docker", verb, container_name(case_dir)]
         if self.kind == "ssh":
-            target = native_dir or f"$HOME/openfoam-studio/{Path(case_dir).name}"
-            return ssh_argv(self.host, signal_script(target, sig))
+            return ssh_argv(self.host, signal_script(
+                self.work_dir(case_dir, native_dir), sig))
         if self.kind == "native":
-            return ["bash", "-c", signal_script(os.path.abspath(case_dir), sig)]
+            return ["bash", "-c", signal_script(self.work_dir(case_dir), sig)]
         # BlueCFD — це Windows-збірка, і сигналів STOP/CONT там немає.
         return None
 
@@ -473,14 +487,13 @@ class Backend:
         """argv мʼякої зупинки (див. `soft_stop_script`). None — кейс лежить
         тут же, і правити словник треба Python-ом (`soft_stop_file`)."""
         if self.kind == "wsl":
-            target = native_dir or win_to_wsl(case_dir)
-            return wsl_argv(self.distro, soft_stop_script(target))
+            return wsl_argv(self.distro, soft_stop_script(
+                self.work_dir(case_dir, native_dir)))
         if self.kind == "ssh":
-            target = native_dir or f"$HOME/openfoam-studio/{Path(case_dir).name}"
-            return ssh_argv(self.host, soft_stop_script(target))
+            return ssh_argv(self.host, soft_stop_script(
+                self.work_dir(case_dir, native_dir)))
         if self.kind == "native":
-            return ["bash", "-c",
-                    soft_stop_script(os.path.abspath(case_dir))]
+            return ["bash", "-c", soft_stop_script(self.work_dir(case_dir))]
         return None
 
     def mpi(self, n: int, app: str, args: str = "") -> str:
@@ -1131,7 +1144,7 @@ def promote_latest_command(backend: Backend, parallel: bool) -> str:
 # збирає шматки назад. Далі reconstructPar іде звичайно.
 # --------------------------------------------------------------------------
 
-FOAMDIST_REMOTE = "$HOME/openfoam-studio/bin/foamdist"
+FOAMDIST_REMOTE = fs_paths.REMOTE_ROOT + "/bin/foamdist"
 FOAMDIST_LOCAL = (Path(__file__).resolve().parent / "rust" / "foamdist" / "target"
                   / "x86_64-unknown-linux-musl" / "release" / "foamdist")
 
@@ -1500,7 +1513,7 @@ def dist_weights(backend: Backend, hosts, key: str,
 # `reconstructPar -constant -no-fields`; decomposePar потім розносить їх
 # по шматках сам.
 
-MESH_STORE = "$HOME/openfoam-studio/meshes"
+MESH_STORE = fs_paths.REMOTE_ROOT + "/meshes"
 MESH_KEEP = 12              # стільки останніх сіток лишаємо, решту прибираємо
 MESH_INPUTS = ("system/blockMeshDict", "system/snappyHexMeshDict",
                "system/surfaceFeatureExtractDict", "system/meshQualityDict")
@@ -1681,6 +1694,24 @@ def push_mesh(backend: Backend, key: str) -> str:
         return ""
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def ensure_remote_mesh(backend: Backend, key: str) -> "str | None":
+    """Put the saved mesh `key` of this computer into the mesh store of
+    `backend`, if the store does not have it yet. One rule for «Run», the
+    queue and `ofs` (T51): uploading a mesh takes minutes, building it again
+    takes tens of minutes.
+
+    None: nothing to do (this computer has no such mesh, or the store has it
+    already). "": uploaded now. Other text: why the upload failed (the run
+    then builds the mesh). An error of ssh comes to the caller as an
+    exception.
+    """
+    if not key or local_mesh_dir(key) is None:
+        return None
+    if remote_mesh_exists(backend, key):
+        return None
+    return push_mesh(backend, key)
 
 
 def build_steps(n_procs: int, backend: Backend, potential_init: bool,
@@ -2174,54 +2205,12 @@ def read_force_coeffs(case_dir: str,
     `name` — імʼя функції з controlDict. Типове читає СУМАРНІ сили; з
     роздільними патчами поряд лежать `forceCoeffs_<патч>` на кожну частину.
     """
-    root = Path(case_dir) / "postProcessing" / name
-    if not root.is_dir():
-        return {}
-    files = sorted(root.glob("*/*.dat"), key=lambda p: p.stat().st_mtime)
-    if not files:
-        return {}
+    # One reader for the program: fs_coeffs (T51; fs_polars uses it too).
+    return coeffs.read_series(case_dir, name)
 
-    series: dict[str, list[tuple[float, float]]] = {}
-    header: list[str] = []
-    for f in files:
-        try:
-            text = f.read_text(errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("#"):
-                cols = line.lstrip("#").split()
-                if cols and cols[0].lower() in ("time", "time(s)"):
-                    header = cols
-                continue
-            if not header:
-                continue
-            parts = line.split()
-            if len(parts) != len(header):
-                continue
-            try:
-                vals = [float(x) for x in parts]
-            except ValueError:
-                continue
-            t = vals[0]
-            for name, v in zip(header[1:], vals[1:]):
-                if name in ("Cd", "Cl", "CmPitch", "Cs"):
-                    series.setdefault(name, []).append((t, v))
 
-    # Один момент часу може трапитися двічі: при рестарті OpenFOAM відкладає
-    # старий файл у coefficient_0.dat, а прогін продовжується з того самого
-    # часу. Лишаємо останній запис — він із найсвіжішого прогону, бо файли
-    # читаються за часом зміни.
-    out: dict[str, list[tuple[float, float]]] = {}
-    for name, pts in series.items():
-        by_time: dict[float, float] = {}
-        for t, v in pts:
-            by_time[t] = v
-        out[name] = sorted(by_time.items())
-    return out
+# T45 rule, now in fs_coeffs (fs_polars and the tests take it from here).
+warm_start_files = coeffs.warm_start_files
 
 
 def read_series(case_dir: str, name: str,
@@ -2539,7 +2528,7 @@ def read_blocks(stream, chunk: int = 1 << 20):
         yield text[:cut]
 
 STUDIO = "studio"
-SESSION_ROOT = "$HOME/openfoam-studio"
+SESSION_ROOT = fs_paths.REMOTE_ROOT
 # Скільки секунд чекати між опитуваннями стану, поки читаємо журнал.
 ATTACH_POLL = 2
 
@@ -2564,6 +2553,9 @@ class RemoteSession:
     # "ok" after a soft stop: the slice that was written, for the person.
     # "" for any other end.
     soft: str = ""
+    # T44: the results of this session are on the laptop (studio/fetched,
+    # T43). False also for a session from an older probe.
+    fetched: bool = False
 
     @property
     def step_text(self) -> str:
@@ -2617,6 +2609,10 @@ def _sh_name(name: str) -> str:
     return re.sub(r"[^\w.-]+", "_", name, flags=re.UNICODE).strip("_") or "step"
 
 
+# meta["started"] of a script that the queue starts later (T46).
+START_LATER = "@@start@@"
+
+
 def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
                     meta: dict, stop_on_bad_mesh: bool = True,
                     engine: str = "", image: str = "") -> str:
@@ -2650,6 +2646,10 @@ def detached_script(steps: "list[Step]", remote_dir: str, bashrc: str,
         # сесії до того ще може не існувати, і запис мовчки пропадав би.
         f"cat > \"$S/meta.json\" <<'OFSMETA'\n"
         f"{json.dumps(meta, ensure_ascii=False)}\nOFSMETA",
+        # A queued script (T46) starts later than it was made: the real
+        # start time goes in place of START_LATER.
+        *([f'sed -i "s/{START_LATER}/$(date "+%Y-%m-%d %H:%M:%S")/" '
+           '"$S/meta.json"'] if meta.get("started") == START_LATER else []),
         'echo $$ > "$S/pid"',
         ': > "$S/run.log"',
         'echo running > "$S/status"',
@@ -2794,12 +2794,69 @@ def launch_detached(backend: Backend, remote_dir: str, script: str) -> int:
     # раніше, ніж `cat` устиг щось прочитати. На сервері лишався run.sh
     # нульового розміру, `echo $!` слухняно віддавав номер процесу, і
     # запуск виглядав успішним. Порожня тека сесії зʼявлялася аж потім.
+    put_script(backend, remote_dir, script)
+    rc, out = _run(ssh_argv(backend.host, detached_launch_command(remote_dir)),
+                   timeout=60)
+    if rc != 0:
+        raise RuntimeError(tr("cannot start the run: {strip}", strip=out.strip()[:200]))
+    for token in reversed(out.split()):
+        if token.isdigit():
+            return int(token)
+    return 0
+
+
+def detached_launch_command(remote_dir: str) -> str:
+    """bash: start studio/run.sh detached (setsid nohup), print its pid.
+
+    The one start command of a server run, for «Run on Server» and for the
+    queue (T46). fs_queue_runner.detached_launch is the same text (the
+    runner has no other module of the program); tests/test_queue.py
+    compares them.
+    """
+    return (f'cd "{remote_dir}" && {{ setsid nohup bash '
+            f'"{remote_dir}/{STUDIO}/run.sh" '
+            f'> "{remote_dir}/{STUDIO}/boot.log" 2>&1 < /dev/null & echo $!; }}')
+
+
+def queue_launch_command(remote_dir: str, script: str, job: str = "") -> str:
+    """bash for the queue (T46): first the T43 guard (no live run uses the
+    folder), then studio/<script> becomes studio/run.sh and starts detached.
+    `job` (the queue id) goes to studio/queue_job."""
+    s = f"{remote_dir}/{STUDIO}"
+    return guard.guarded(remote_dir, (
+        f'cd "{remote_dir}" && cp -f "{s}/{script}" "{s}/run.sh" && '
+        f'rm -f "{s}/status" "{s}/pid" && '
+        f'printf "%s\\n" "{job}" > "{s}/queue_job" && '
+        + detached_launch_command(remote_dir)), own=True)
+
+
+def stop_command(target: str) -> str:
+    """bash: stop the detached run in `target`: the head script with its
+    process group, and the OpenFOAM processes of the folder. «Stop» and the
+    queue (T46) use it."""
+    return (f'p=$(cat "{target}/{STUDIO}/pid" 2>/dev/null); '
+            '[ -n "$p" ] && kill -TERM -"$p" 2>/dev/null; '
+            f'printf "stop\\tзупинено з програми\\n" '
+            f'> "{target}/{STUDIO}/status" 2>/dev/null; '
+            + signal_script(target, "TERM"))
+
+
+def put_script(backend: Backend, remote_dir: str, script: str,
+               name: str = "run.sh") -> None:
+    """Put a run script in <remote_dir>/studio/<name> and check its size.
+
+    «Run on Server» puts studio/run.sh and starts it at once. The queue
+    (T46) puts studio/q_<token>.sh; the queue copies it to run.sh when the
+    job starts.
+    """
+    if not re.fullmatch(r"[\w.-]+\.sh", name):
+        raise ValueError(name)
     up = subprocess.run(
         ssh_argv(backend.host,
                  f'mkdir -p "{remote_dir}/{STUDIO}" "{remote_dir}/logs" && '
-                 f'cat > "{remote_dir}/{STUDIO}/run.sh" && '
-                 f'chmod +x "{remote_dir}/{STUDIO}/run.sh" && '
-                 f'wc -c < "{remote_dir}/{STUDIO}/run.sh"'),
+                 f'cat > "{remote_dir}/{STUDIO}/{name}" && '
+                 f'chmod +x "{remote_dir}/{STUDIO}/{name}" && '
+                 f'wc -c < "{remote_dir}/{STUDIO}/{name}"'),
         input=script.encode("utf-8"), stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=120,
         creationflags=CREATE_NO_WINDOW)
@@ -2813,18 +2870,6 @@ def launch_detached(backend: Backend, remote_dir: str, script: str) -> int:
     if got != want:
         raise RuntimeError(
             tr("the script arrived incomplete: {got} bytes instead of {want}", got=got, want=want))
-
-    rc, out = _run(ssh_argv(backend.host, (
-        f'cd "{remote_dir}" && {{ setsid nohup bash '
-        f'"{remote_dir}/{STUDIO}/run.sh" '
-        f'> "{remote_dir}/{STUDIO}/boot.log" 2>&1 < /dev/null & echo $!; }}'
-    )), timeout=60)
-    if rc != 0:
-        raise RuntimeError(tr("cannot start the run: {strip}", strip=out.strip()[:200]))
-    for token in reversed(out.split()):
-        if token.isdigit():
-            return int(token)
-    return 0
 
 
 # Роздільник полів у `studio/status` і у відповіді `read_session`.
@@ -2846,15 +2891,22 @@ def _session_probe(dirs: str) -> str:
         'st=$(head -c 200 "$d/' + STUDIO + '/step" 2>/dev/null); '
         'm=$(tr -d "\\n" < "$d/' + STUDIO + '/meta.json" 2>/dev/null); '
         'n=$(wc -l < "$d/' + STUDIO + '/run.log" 2>/dev/null || echo 0); '
-        'a=0; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && a=1; '
+        # The head lives: the rule of fs_caseguard (kill -0 and the command
+        # line studio/run.sh). Only kill -0 took a reused pid after a reboot
+        # of the server for a live run (T44).
+        'a=0; ' + guard.head_alive("$p") + ' && a=1; '
+        # T44: the results are on the laptop (studio/fetched of T43 is not
+        # older than studio/status).
+        'f=0; [ -f "$d/' + STUDIO + '/fetched" ] && ! [ "$d/' + STUDIO
+        + '/status" -nt "$d/' + STUDIO + '/fetched" ] && f=1; '
         # Коли стан востаннє змінювався — це і є час, коли прогін
         # скінчився. Окремої позначки про це не заводимо: mtime файлу
         # стану каже те саме й не може розійтися з ним.
         'g=$(( $(date +%s) - $(stat -c %Y "$d/' + STUDIO + '/status" '
         '2>/dev/null || date +%s) )); '
-        f'printf "%s{_FS}%s{_FS}%s{_FS}%s{_FS}%s{_FS}%s{_FS}%s\\n" '
+        f'printf "%s{_FS}%s{_FS}%s{_FS}%s{_FS}%s{_FS}%s{_FS}%s{_FS}%s\\n" '
         '"$d" "$(printf "%s" "$s" | tr "\\n" " ")" "$p$a" "$st" "$n" "$g" '
-        '"$m"; '
+        '"$m" "$f"; '
         'done'
     )
 
@@ -2879,6 +2931,8 @@ def _parse_session(line: str, host: str) -> "RemoteSession | None":
     # Сьоме поле — вік стану. Його могло й не бути (сесія з давнішої
     # версії), і тоді це не привід відкинути весь рядок: без віку сесія
     # просто не потрапить у вітання при запуску.
+    # The eighth field (T44): "1" when the results are on the laptop.
+    fetched = len(parts) >= 8 and parts[7].strip() == "1"
     if len(parts) >= 7:
         path, status_raw, pid_alive, step, nlines, age_raw, meta_raw = parts[:7]
     else:
@@ -2918,7 +2972,8 @@ def _parse_session(line: str, host: str) -> "RemoteSession | None":
               if status == "ok" and "".join(bits[1:]).strip() else ""),
         started=str(meta.get("started", "")),
         case_dir=str(meta.get("case_dir", "")),
-        host=host, pid=pid, alive=alive, log_lines=lines, age=age)
+        host=host, pid=pid, alive=alive, log_lines=lines, age=age,
+        fetched=fetched)
 
 
 def list_sessions(backend: Backend) -> list[RemoteSession]:
@@ -2939,13 +2994,23 @@ def list_sessions(backend: Backend) -> list[RemoteSession]:
     return found
 
 
-def read_session(backend: Backend, remote_dir: str) -> "RemoteSession | None":
-    """Стан однієї сесії просто зараз."""
+def read_session(backend: Backend, remote_dir: str,
+                 strict: bool = False) -> "RemoteSession | None":
+    """Стан однієї сесії просто зараз.
+
+    None: no session in this folder, or (strict=False) no answer from the
+    server. With strict=True, no answer from the server raises
+    ConnectionError: the attach must not take a lost network for the end
+    of the run (T44).
+    """
     if backend.kind != "ssh":
         return None
     rc, out = _run(ssh_argv(backend.host, _session_probe(f'"{remote_dir}"')),
                    timeout=30)
     if rc != 0:
+        if strict:
+            raise ConnectionError(out.strip()[:300]
+                                  or tr("the server did not reply"))
         return None
     for ln in out.splitlines():
         if _FS in ln:
@@ -3008,6 +3073,13 @@ class Runner:
         self.state = RunState()
         self._proc: subprocess.Popen | None = None
         self._stop = threading.Event()
+        # Ends the pause between two tries to connect again (stop, detach,
+        # reconnect_now). T44.
+        self._wake = threading.Event()
+        # How the run ended, as an ASCII id, for the window and the
+        # notifications: "ok", "fail", "stop", "aborted", "gone" (no
+        # session), "" (not known or not ended).
+        self.final_status = ""
         # Мʼяка зупинка: розвʼязувач пише зріз і виходить, далі — лише збирання.
         self._soft = threading.Event()
         self.current_step = ""
@@ -3061,6 +3133,7 @@ class Runner:
         """
         self.left = True
         self._stop.set()
+        self._wake.set()
         self._kill_local()
 
     def _kill_local(self) -> None:
@@ -3109,12 +3182,9 @@ class Runner:
                       "(up to one step), then the time step will be "
                       "collected and checked"))
 
-    @property
-    def soft_stopped(self) -> bool:
-        return self._soft.is_set()
-
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         self._kill_local()
         # ВІДЧЕПЛЕНИЙ ПРОГІН УБИТИ МІСЦЕВИМИ ЗАСОБАМИ НЕМОЖЛИВО, і це не
         # вада, а те, заради чого він відчеплений. Обірвати трубу ssh
@@ -3126,12 +3196,8 @@ class Runner:
         if self.backend.kind == "ssh":
             target = self.remote_dir or self.native_dir
             if target:
-                _run(ssh_argv(self.backend.host, (
-                    f'p=$(cat "{target}/{STUDIO}/pid" 2>/dev/null); '
-                    '[ -n "$p" ] && kill -TERM -"$p" 2>/dev/null; '
-                    f'printf "stop\\tзупинено з програми\\n" '
-                    f'> "{target}/{STUDIO}/status" 2>/dev/null; '
-                    + signal_script(target, "TERM"))), timeout=30)
+                _run(ssh_argv(self.backend.host, stop_command(target)),
+                     timeout=30)
         # У WSL процеси не належать дереву wsl.exe, тому глушимо їх окремо.
         # Але саме СВОЇ: pkill за іменем прибив би й сусідній прогін, якщо
         # користувач рахує два кейси паралельно або має щось своє в тому ж
@@ -3180,6 +3246,24 @@ class Runner:
                      "button."))
         self.attach(target, steps=steps)
 
+    # Pauses (s) between the tries to connect again after the connection to
+    # the server is lost (sleep of the laptop, a new network, Tailscale that
+    # is not ready yet). The last value repeats (T44).
+    RECONNECT_DELAYS = (2, 5, 10, 20, 40, 60)
+
+    def reconnect_now(self) -> None:
+        """Connect to the session again now (after the laptop wakes up).
+
+        After a sleep the ssh of the log can be dead without an error: ssh
+        sees the lost connection only after 3 x ServerAliveInterval. Close
+        it; attach() then reads the state of the run and connects again
+        from the next log line. The run on the server does not change.
+        """
+        if not self.remote_dir or self._stop.is_set():
+            return
+        self._wake.set()
+        self._kill_local()
+
     def attach(self, remote_dir: str, from_line: int = 1,
                steps: "list[Step] | None" = None) -> None:
         """Читати журнал сесії з сервера, поки вона не скінчиться.
@@ -3187,21 +3271,22 @@ class Runner:
         Поновлює й стан: кожен рядок іде крізь той самий розбирач, що й при
         звичайному прогоні, тож підключення до прогону, який іде вже годину,
         відновлює і графіки, і кількість комірок, і фазу.
+
+        A lost connection is not the end of the run (T44). When the ssh of
+        the log stops and the server does not reply, or replies that the run
+        continues, attach() waits (RECONNECT_DELAYS) and connects again from
+        the next log line. on_event("link", "lost") and ("link", "back")
+        tell the window. Only stop() or detach() end the wait.
         """
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.remote_dir = remote_dir
+        self.final_status = ""
         names = [step_id(s.name) for s in steps] if steps else []
         total = len(names)
-        argv = ssh_argv(self.backend.host,
-                        attach_command(remote_dir, from_line))
-        try:
-            self._proc = subprocess.Popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                bufsize=0, creationflags=CREATE_NO_WINDOW,
-            )
-        except OSError as exc:
-            self.on_done(False, str(exc))
-            return
+        got = 0            # lines of run.log that came in
+        tries = 0          # tries in a row without a reply
+        lost = False
+        final = None
 
         # Журнал розкладаємо по файлах кроків на льоту: вікно посилає людину
         # саме в logs/<крок>.log, і при підключенні ці файли мають бути.
@@ -3213,36 +3298,85 @@ class Runner:
         # сигнал. Далі блоки дрібні, і рядки йдуть так само одразу.
         self._attach_fh = None
         try:
-            assert self._proc.stdout is not None
-            for block in read_blocks(self._proc.stdout):
-                self._attach_block(block, names, total)
+            while True:
+                argv = ssh_argv(self.backend.host,
+                                attach_command(remote_dir, from_line + got))
+                # stderr separately: the messages of ssh ("Broken pipe",
+                # "Network is unreachable") are not lines of run.log. In the
+                # log they would also move the line count of a reconnect.
+                try:
+                    self._proc = subprocess.Popen(
+                        argv, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, bufsize=0,
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                except OSError as exc:
+                    self.on_done(False, str(exc))
+                    return
+                assert self._proc.stdout is not None
+                for block in read_blocks(self._proc.stdout):
+                    got += block.count("\n") + 1
+                    if lost:
+                        lost, tries = False, 0
+                        self.on_event("link", "back")
+                    self._attach_block(block, names, total)
+                    if self._stop.is_set():
+                        break
+                self._proc.wait()
+                if self._stop.is_set():
+                    break
+                # Вирок беремо з файлу стану, а не з коду виходу ssh: ssh
+                # каже лише про звʼязок, а не про те, чим скінчився прогін.
+                try:
+                    final = read_session(self.backend, remote_dir,
+                                         strict=True)
+                    reached = True
+                except ConnectionError:
+                    final, reached = None, False
+                if reached and not (final is not None and final.running
+                                    and final.alive):
+                    break
+                if reached and lost:
+                    # The server replies again: connect at once.
+                    lost, tries = False, 0
+                    self.on_event("link", "back")
+                elif not reached and not lost:
+                    lost = True
+                    self.on_event("link", "lost")
+                delay = self.RECONNECT_DELAYS[
+                    min(tries, len(self.RECONNECT_DELAYS) - 1)]
+                tries += 1
+                self._wake.clear()
+                if not self._stop.is_set():
+                    self._wake.wait(delay)
                 if self._stop.is_set():
                     break
         finally:
             if self._attach_fh is not None:
                 self._attach_fh.close()
                 self._attach_fh = None
-        self._proc.wait()
 
         if self._stop.is_set():
             self.on_done(False, tr("log reading stopped"))
             return
-        # Вирок беремо з файлу стану, а не з коду виходу ssh: ssh каже лише
-        # про звʼязок, а не про те, чим скінчився прогін.
-        final = read_session(self.backend, remote_dir)
         if final is None:
+            self.final_status = "gone"
             self.on_done(False, tr("the server did not tell how the run ended"))
         elif final.status == "ok":
+            self.final_status = "ok"
             if final.soft:
                 self._soft.set()
                 self.soft_result = final.soft
             self.on_done(True, final.message or tr("done"))
         elif final.stale:
+            self.final_status = "aborted"
             self.on_done(False, (
                 tr("the run broke off: the state says “running”, but there "
                 "is no process on the server. This is how a run killed "
                 "by a reboot or by lack of memory looks.")))
         else:
+            self.final_status = (final.status if final.status in
+                                 ("fail", "stop") else "fail")
             what = final.message or tr("no explanation")
             self.on_done(False, f"{final.step_text or tr('run')}: {what}")
 
@@ -3459,10 +3593,43 @@ def _pipe(argv: list[str], stdin_path=None, stdout_path=None,
 
 
 def remote_dir_for(name: str) -> str:
-    return f"$HOME/openfoam-studio/{name}"
+    """The folder of the run `name` on a server or in WSL (bash text)."""
+    return f"{fs_paths.REMOTE_ROOT}/{name}"
 
 
-def sync_to_ssh(backend: Backend, case_dir: str, name: str) -> str:
+def remote_shown(name: str) -> str:
+    """The folder of the run `name` in a text for the person."""
+    return f"{fs_paths.REMOTE_SHOWN}/{name}"
+
+
+def server_case_names(backend: Backend) -> set[str]:
+    """Names in ~/openfoam-studio on the server (ssh) or in WSL (T43).
+
+    A new run must not take one of them (fs_caseguard.new_run_name).
+    Exception: the server did not answer.
+    """
+    cmd = f'ls -1A "{SESSION_ROOT}" 2>/dev/null; echo "@@FS names-end"'
+    if backend.kind == "ssh":
+        rc, out = _run(ssh_argv(backend.host, cmd), timeout=45)
+    elif backend.kind == "wsl":
+        rc, out = _run(wsl_argv(backend.distro, cmd), timeout=45)
+    else:
+        return set()
+    if rc != 0 or "@@FS names-end" not in out:
+        raise RuntimeError(out.strip()[:200] or tr("the server did not reply"))
+    return {ln.strip() for ln in out.splitlines()
+            if ln.strip() and not ln.startswith("@@FS")}
+
+
+def _guard_refused(rc: int, err: str, folder: str, where: str) -> None:
+    """Raise fs_caseguard.CaseBusy if the guard refused the upload."""
+    got = guard.parse_guard(err) if rc == guard.GUARD_EXIT else None
+    if got:
+        raise guard.CaseBusy(got[0], got[1], folder, where)
+
+
+def sync_to_ssh(backend: Backend, case_dir: str, name: str,
+                own: bool = False) -> str:
     """Кладе вхідні дані кейсу на сервер і повертає тамтешній шлях.
 
     Тар в один потік, а не scp пофайлово: у кейсі тисячі дрібних файлів, і
@@ -3470,7 +3637,12 @@ def sync_to_ssh(backend: Backend, case_dir: str, name: str) -> str:
 
     Їде лише вхідне. Сітку сервер збудує сам — гнати півмільйона комірок по
     мережі, щоб потім там-таки їх перерахувати, безглуздо.
+
+    The old folder is deleted only when fs_caseguard lets it (T43): no live
+    run in it, and no results that were not downloaded. `own`: the main
+    run after the pre-run of the program (T39) replaces the pre-run results.
     """
+    guard.check_name(name)
     src = Path(case_dir)
     items = [i for i in SYNC_INPUTS if (src / i).exists()]
     if not items:
@@ -3485,10 +3657,12 @@ def sync_to_ssh(backend: Backend, case_dir: str, name: str) -> str:
                     None if ti.name.startswith("constant/polyMesh") else ti))
         rc, err = _pipe(ssh_argv(
             backend.host,
-            f'rm -rf "{remote}" && mkdir -p "{remote}" && '
-            f'tar xf - -C "{remote}"'), stdin_path=tmp)
+            guard.guarded(remote, (
+                f'rm -rf -- "{remote}" && mkdir -p "{remote}" && '
+                f'tar xf - -C "{remote}"'), own=own)), stdin_path=tmp)
     finally:
         tmp.unlink(missing_ok=True)
+    _guard_refused(rc, err, remote_shown(name), backend.host)
     if rc != 0:
         raise RuntimeError(tr("cannot put the case on the server: {strip}", strip=err.strip()[:200]))
     return remote
@@ -3520,10 +3694,17 @@ def sync_from_ssh(backend: Backend, remote_dir: str, case_dir: str) -> None:
     tmp = Path(tempfile.gettempdir()) / f"ofs-back-{Path(case_dir).name}.tar"
     # Часові каталоги перелічує сам сервер: імена наперед невідомі, а
     # шаблон [0-9]* збігся б і з чимось на кшталт «3d_model».
+    # Only time 0 and the LAST time: the run reconstructs only the last one,
+    # and the other times that the «Times from Server» dialog reconstructed
+    # on the server (T40) are 0.5 GB each — the person downloads them there,
+    # on request.
     listing = (
-        f'cd "{remote_dir}" || exit 1; shopt -s nullglob; out=""; '
+        f'cd "{remote_dir}" || exit 1; shopt -s nullglob; out=""; ts=""; '
         'for d in [0-9]*/; do n=${d%/}; '
-        'case "$n" in ""|*[!0-9.]*) continue;; esac; out="$out $n"; done; '
+        'case "$n" in ""|*[!0-9.]*) continue;; esac; '
+        'if [ "$n" = 0 ]; then out="$out 0"; else ts="$ts $n"; fi; done; '
+        'last=$(printf "%s\\n" $ts | sort -g | tail -1); '
+        '[ -n "$last" ] && out="$out $last"; '
         + "".join(f'[ -e "{r}" ] && out="$out {r}"; ' for r in SYNC_OUTPUTS)
         # Проміжні поверхні (fs_live) лишаються на сервері: це десятки МБ на
         # кожен запис, а після прогону є повні зрізи.
@@ -3541,19 +3722,59 @@ def sync_from_ssh(backend: Backend, remote_dir: str, case_dir: str) -> None:
             tar.extractall(dst)
     finally:
         tmp.unlink(missing_ok=True)
+    mark_fetched(backend, remote_dir)
 
 
-def sync_to_wsl(backend: Backend, case_dir: str, name: str) -> str:
+def mark_fetched(backend: Backend, remote_dir: str) -> None:
+    """Note on the server: the results of this folder are on the laptop.
+
+    fs_caseguard lets a later upload replace such a folder; a folder with
+    results that nobody downloaded stays. A failure here only makes the
+    guard more careful, so it is not an error.
+    """
+    cmd = (f'[ -d "{remote_dir}/{STUDIO}" ] || mkdir -p "{remote_dir}/{STUDIO}"; '
+           f'touch "{remote_dir}/{guard.FETCHED}"')
+    try:
+        if backend.kind == "ssh":
+            _run(ssh_argv(backend.host, cmd), timeout=30)
+        elif backend.kind == "wsl":
+            _run(wsl_argv(backend.distro, cmd), timeout=30)
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+def run_server_dir(case_dir: str, run: "dict | None" = None) -> tuple[str, str]:
+    """(host, folder) on the server of a run of this local case (T43).
+
+    `run`: one entry of the «runs» list of the manifest (studio.json); None:
+    the last upload of the case. The folder is the one the program used,
+    also for «<name>_r2». A case from before T43 has no record: then
+    ("", remote_dir_for(<folder name>)), the old rule.
+    """
+    got = run.get("server") if isinstance(run, dict) else None
+    if not isinstance(got, dict):
+        import fs_library as lib               # lib imports this module
+        data = lib.read_manifest(case_dir) or {}
+        got = data.get("server") if run is None else None
+    if isinstance(got, dict) and got.get("dir"):
+        return (str(got.get("host", "")), str(got["dir"]))
+    return ("", remote_dir_for(Path(case_dir).name))
+
+
+def sync_to_wsl(backend: Backend, case_dir: str, name: str,
+                own: bool = False) -> str:
     """Копіює вхідні дані кейсу в ~/openfoam-studio/<name> і повертає шлях.
 
     Робота через /mnt/x іде по 9p і на файлових операціях втрачає в рази,
     тому для реальних прогонів кейс варто тримати в рідній ФС.
     """
+    guard.check_name(name)
     src = win_to_wsl(case_dir)
-    dst = f"$HOME/openfoam-studio/{name}"
+    dst = remote_dir_for(name)
     items = " ".join(f'"{src}/{item}"' for item in SYNC_INPUTS)
-    cmd = (
-        f'mkdir -p "$HOME/openfoam-studio" && rm -rf "{dst}" && '
+    # T43: the old folder goes only when fs_caseguard lets it.
+    cmd = f'mkdir -p "{fs_paths.REMOTE_ROOT}"; ' + guard.guarded(dst, (
+        f'rm -rf "{dst}" && '
         f'mkdir -p "{dst}" && '
         # Наявні елементи копіюємо, відсутніх не вимагаємо: Allclean чи
         # 0.orig у чужому кейсі може й не бути.
@@ -3562,8 +3783,9 @@ def sync_to_wsl(backend: Backend, case_dir: str, name: str) -> str:
         # Реконструйована сітка з попереднього прогону в constant/ теж
         # непотрібна — blockMesh і snappy зроблять свою.
         f'rm -rf "{dst}/constant/polyMesh" && '
-        f'echo "$HOME/openfoam-studio/{name}"')
+        f'echo "{dst}"'), own=own)
     rc, out = _run(wsl_argv(backend.distro, cmd), timeout=600)
+    _guard_refused(rc, out, remote_shown(name), f"WSL {backend.distro}")
     if rc != 0:
         raise RuntimeError(tr("cannot copy the case to WSL: {strip}", strip=out.strip()))
     return out.strip().splitlines()[-1].strip()
@@ -3593,7 +3815,9 @@ def sync_from_wsl(backend: Backend, native_dir: str, case_dir: str) -> None:
         f'for d in [0-9]*/; do n=${{d%/}}; '
         f'case "$n" in ""|*[!0-9.]*) continue;; esac; rm -rf "$d"; done; '
         f'rm -rf processor* postProcessing constant/polyMesh; '
-        f'cp -r "{native_dir}/." "{dst}/"')
+        f'cp -r "{native_dir}/." "{dst}/" && '
+        # T43: the results are here now (mark_fetched, in one command).
+        f'mkdir -p "{native_dir}/{STUDIO}" && touch "{native_dir}/{guard.FETCHED}"')
     rc, out = _run(wsl_argv(backend.distro, cmd), timeout=900)
     if rc != 0:
         # Раніше помилки тут глушилися через 2>/dev/null, і провалена копія

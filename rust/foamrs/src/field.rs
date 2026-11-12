@@ -222,6 +222,11 @@ fn parse_entry(
     }
 }
 
+/// `parse_entry` for polymesh.rs: the value at `at` (after its keyword).
+pub fn parse_entry_pub(buf: &[u8], at: usize, binary: bool, n_uniform: usize) -> Result<Values, FieldError> {
+    parse_entry(buf, at, if binary { Format::Binary } else { Format::Ascii }, n_uniform)
+}
+
 /// Internal field values. `n_cells` is needed only for `uniform`.
 pub fn internal_field(buf: &[u8], n_cells: usize) -> Result<Values, FieldError> {
     let fmt = header_format(buf)?;

@@ -80,9 +80,6 @@ class StatusText(QtWidgets.QLabel):
         self._fit()
         self.updateGeometry()
 
-    def is_elided(self) -> bool:
-        return super().text() != self._full
-
     # --- розмір ----------------------------------------------------------
     def _extra(self) -> int:
         m = self.contentsMargins()

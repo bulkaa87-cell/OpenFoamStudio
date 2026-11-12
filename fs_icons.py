@@ -5,7 +5,8 @@ The files are in icons/ (next to this module):
 - <name>-<n>.png          16 .. 256 px (OpenFOAM Studio: to 1024 px), the window icon
 - <name>.ico, <name>.icns  for a shortcut, an installer, an exe or a macOS app
 
-tools/make_icons.py makes the OpenFOAM Studio files from its SVG. The
+tools/make_icons.py makes the OpenFOAM Studio files and the «Polars»
+window files (polars-*) from their SVG files. The
 MeshFix Studio files are copies from the MeshFix Studio repository
 (packaging/icons/make_icons.py there). If the files
 are missing (for example in an export without icons/), the icon is empty
@@ -22,6 +23,7 @@ from PySide6 import QtGui
 ICON_DIR = Path(__file__).resolve().with_name("icons")
 OFS = "openfoam-studio"
 MESHFIX = "meshfix-studio"
+POLARS = "polars"            # the «Polars» window (T45)
 # Windows app ids: each program gets its own taskbar button.
 OFS_APP_ID = "OpenFOAMStudio.OpenFOAMStudio"
 

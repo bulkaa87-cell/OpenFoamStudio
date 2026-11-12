@@ -70,6 +70,10 @@ DEFAULTS: dict = {
     # Машини
     "ssh_host": "",
     "check_machines_on_start": True,
+    # T44: notifications about the runs (tray message + line in the window),
+    # and the connection to the server runs again by itself.
+    "notify": True,
+    "auto_reconnect": True,
     "server_wizard_offered": False,     # installed copy: asked once (T34)
     # {ssh host: "docker|image" or "podman|image"} as JSON: the servers that
     # run OpenFOAM in a container (the server wizard writes it).
@@ -79,6 +83,10 @@ DEFAULTS: dict = {
     "dist_key": "~/.ssh/id_ed25519",
     "dist_user": "",            # "" = the user of the server login
     "dist_net": "",
+    # The run queue on a server (T46, fs_queue): its server ("" = ssh_host),
+    # and whether it is set up there (then an angle series goes to it).
+    "queue_host": "",
+    "queue_on": False,
     # 3D
     "view3d_backend": "auto",
     # Сітка
@@ -288,10 +296,6 @@ def get(key: str, default=None):
 def all_values() -> dict:
     """All known keys with their current values."""
     return {k: get(k) for k in DEFAULTS}
-
-
-def is_default(key: str) -> bool:
-    return get(key) == DEFAULTS.get(key)
 
 
 def update(values: dict) -> dict:

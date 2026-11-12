@@ -1,0 +1,13 @@
+{
+ "Apply and Start Main Run": "Застосувати й запустити основний прогін",
+ "Measured": "Виміряно",
+ "Measured: {m}": "Виміряно: {m}",
+ "Notes": "Примітки",
+ "Pre-run Results": "Результати попереднього прогону",
+ "Proposed changes": "Запропоновані зміни",
+ "Select the values to change. You can edit each proposed value. The main run starts with the values of this window.": "Позначте значення, які змінити. Кожне запропоноване значення можна виправити. Основний прогін стартує зі значеннями цього вікна.",
+ "Start Main Run": "Запустити основний прогін",
+ "Start Without Changes": "Запустити без змін",
+ "The pre-run proposes no changes: the main run can start with the current values.": "Попередній прогін не пропонує змін: основний прогін може стартувати з поточними значеннями.",
+ "now {v}": "зараз {v}"
+}

@@ -5,6 +5,16 @@ vtk>=9.3
 numpy>=1.26
 matplotlib>=3.8
 
+# Спільний код з MeshFix Studio (fs_shared.py): ремонт, перевірка сітки,
+# переклади (meshfix-core) і 3D-перегляд (foamview). Версія закріплена; та
+# сама версія — у fs_shared.PINNED. pip шукає колеса в теці wheels/ (місцева
+# збірка: python tools/build_wheels.py <ця тека>/wheels у клоні MeshFix
+# Studio) і серед файлів випуску на GitHub.
+--find-links wheels
+--find-links https://github.com/bulkaa87-cell/MeshFixStudio/releases/expanded_assets/v0.3.0
+meshfix-core==0.3.0
+foamview==0.3.0
+
 # Ремонт службою Windows — кнопка «Полагодити як слайсер» (fs_winfix.py).
 # Необовʼязкове: без цих пакунків кнопка просто неактивна, решта працює.
 winrt-Windows.Graphics.Printing3D>=3.2; sys_platform == "win32"

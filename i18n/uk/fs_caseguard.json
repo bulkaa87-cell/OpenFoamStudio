@@ -1,0 +1,6 @@
+{
+ "Refused to delete {folder} on {where}: it is not a case folder in ~/openfoam-studio ({detail}). Nothing was deleted.": "Не видаляю {folder} на {where}: це не тека кейсу в ~/openfoam-studio ({detail}). Нічого не видалено.",
+ "The folder {folder} on {where} has results that were not downloaded. Nothing was deleted. Connect to that run and get its results, or give the case another name.": "У теці {folder} на {where} є результати, які ще не забрано. Нічого не видалено. Підключіться до того прогону й заберіть результати, або дайте кейсу іншу назву.",
+ "The folder {folder} on {where} is used by a run now ({detail}). Nothing was deleted. Wait until the run ends or stop it, or give the case another name.": "Теку {folder} на {where} зараз використовує прогін ({detail}). Нічого не видалено. Дочекайтеся кінця прогону або зупиніть його, або дайте кейсу іншу назву.",
+ "“{name}” is not a valid case folder name. Nothing was deleted.": "«{name}» не годиться як назва теки кейсу. Нічого не видалено."
+}

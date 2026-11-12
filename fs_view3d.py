@@ -24,10 +24,11 @@ from pathlib import Path
 import numpy as np
 from fs_i18n import tr
 
-try:                                       # pragma: no cover - залежить від збірки
-    import foamview as _fv
-except ImportError:                        # pragma: no cover
-    _fv = None
+# The native module foamview._native of the shared package foamview
+# (MeshFix Studio, see fs_shared.py); None when it is missing.
+import fs_shared
+
+_fv = fs_shared.native("foamview")
 
 FONT_CANDIDATES = (r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf",
                    "/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -284,8 +285,9 @@ def _run_probe(args: list[str]) -> tuple[bool, str]:
     # іншої теки), а не перший-ліпший поруч зі скриптом.
     env = dict(os.environ)
     if _fv is not None and getattr(_fv, "__file__", None):
+        # The folder that has the package foamview (foamview/_native.pyd).
         env["PYTHONPATH"] = os.pathsep.join(
-            [os.path.dirname(os.path.abspath(_fv.__file__))]
+            [os.path.dirname(os.path.dirname(os.path.abspath(_fv.__file__)))]
             + [p for p in [env.get("PYTHONPATH")] if p])
     try:
         cp = subprocess.run([exe, "-X", "utf8", os.path.abspath(__file__), "--probe", *args],

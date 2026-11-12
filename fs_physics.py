@@ -271,18 +271,6 @@ def re_theta_t_freestream(intensity: float) -> float:
     return max(value, 20.0)
 
 
-def inlet_turbulence_from_length_scale(
-    u: float, intensity: float, length_scale: float
-) -> InletTurbulence:
-    """Задання через турбулентний масштаб довжини."""
-    k = 1.5 * (u * intensity) ** 2
-    ls = max(length_scale, 1e-12)
-    omega = math.sqrt(k) / (C_MU ** 0.25 * ls)
-    epsilon = C_MU ** 0.75 * k ** 1.5 / ls
-    nut = k / omega if omega > 0 else 0.0
-    return InletTurbulence(k=k, omega=omega, epsilon=epsilon, nut=nut)
-
-
 # --------------------------------------------------------------------------
 # Оцінка розміру сітки та памʼяті
 # --------------------------------------------------------------------------

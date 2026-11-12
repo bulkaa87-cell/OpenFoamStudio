@@ -247,7 +247,7 @@ class ActuatorDisk:
 
     Сила задається виразом (`exprField`), нормованим на самій сітці:
     скільки б комірок не потрапило в диск, сума сил рівно T, сума
-    моментів рівно Q. Перевірено на кубі 40³ (devlog/ZNAHIDKY.md, 100).
+    моментів рівно Q. Перевірено на кубі 40³.
     """
     name: str = "disk1"
     centre: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -1167,6 +1167,12 @@ class MeshCfg:
     max_thickness_medial: float = 0.3
     n_smooth_normals: int = 3
     n_smooth_surface_normals: int = 1
+    # Further addLayersControls knobs. The layer advice for a wall-resolved
+    # model (y+ ≈ 1, T38) changes them instead of the layer count. The
+    # defaults give the same dictionary text as before (same mesh key).
+    layer_min_medial_angle: int = 90
+    layer_n_smooth_thickness: int = 10
+    layer_n_relax_iter: int = 5
 
     snap_feature_iter: int = 10
     explicit_feature_snap: bool = True
@@ -1885,25 +1891,6 @@ class CaseCfg:
         долетіти, а слід — встигнути сформуватися.
         """
         return self.domain_size[0] / max(self.flow.u_inf, 1e-9)
-
-    @property
-    def motion_inner(self) -> float:
-        """Радіус, усередині якого вузли їдуть майже разом із тілом.
-
-        Нуль у налаштуваннях означає «порахуй сам»: беремо половину
-        характерного розміру тіла. Менше — і сітка почне вивертатися просто
-        біля поверхні; більше — і рух потягне за собою півдомену.
-        """
-        if self.motion.inner > 0:
-            return self.motion.inner
-        return 0.5 * max(self.body_length, self.body_span, self.body_height)
-
-    @property
-    def motion_outer(self) -> float:
-        """Радіус, за яким вузли вже стоять."""
-        if self.motion.outer > 0:
-            return self.motion.outer
-        return 3.0 * self.motion_inner
 
     @property
     def motion_pivot(self) -> tuple[float, float, float]:
@@ -3760,13 +3747,13 @@ addLayersControls
 
     featureAngle          {m.layer_feature_angle};
     slipFeatureAngle      30;
-    nRelaxIter            5;
+    nRelaxIter            {m.layer_n_relax_iter};
     nSmoothSurfaceNormals {m.n_smooth_surface_normals};
     nSmoothNormals        {m.n_smooth_normals};
-    nSmoothThickness      10;
+    nSmoothThickness      {m.layer_n_smooth_thickness};
     maxFaceThicknessRatio 0.5;
     maxThicknessToMedialRatio {m.max_thickness_medial};
-    minMedialAxisAngle    90;
+    minMedialAxisAngle    {m.layer_min_medial_angle};
     nBufferCellsNoExtrude 0;
     nLayerIter            50;
     nRelaxedIter          20;
@@ -5671,7 +5658,7 @@ def _portal_sources(cfg: CaseCfg) -> str:
     на обʼєм зони сам. Тому скільки б комірок не потрапило в шар, маса й
     сила ті самі.
 
-    Перевірено на rhoSimpleFoam (devlog/PLAN-dvyhuny-dysky.md, 12.3):
+    Перевірено на rhoSimpleFoam:
     лише сопло на +0.02 кг/с — з домену виходить рівно на 0.0200 кг/с
     більше; сопло й вхід — баланс нуль.
     """

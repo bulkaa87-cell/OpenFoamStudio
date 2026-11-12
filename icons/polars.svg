@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>OpenFOAM Studio — Polars</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#16233F" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="4"/>
+  <g fill="none" stroke="#F4F7FB" stroke-width="14" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M58 50 L58 200 L210 200"/>
+    <path d="M78 180 L140 104 Q166 72 198 90"/>
+  </g>
+  <g fill="#3CC6F0">
+    <circle cx="94" cy="160" r="17"/>
+    <circle cx="140" cy="104" r="17"/>
+    <circle cx="173" cy="83" r="17"/>
+  </g>
+</svg>

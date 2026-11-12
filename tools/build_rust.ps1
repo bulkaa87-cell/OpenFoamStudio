@@ -1,13 +1,17 @@
 # Зібрати Rust-частини програми:
 #   foamrs   -> foamrs.pyd   (швидке читання полів, лінії на тілі)
-#   foamview -> foamview.pyd (3D-перегляд вкладки «3D» на GPU, wgpu)
-#   meshfix  -> meshfix.pyd  (ремонт сітки кнопкою «meshfix»)
 #   foamdist -> Linux-бінарник для сервера (розподіл між машинами)
+#
+# Ремонт (meshfix) і 3D-перегляд (foamview) — спільні пакунки MeshFix Studio
+# (fs_shared.py): їх ставить requirements.txt, тут вони не збираються. Для
+# розробки: python tools\build_wheels.py --develop у клоні MeshFix Studio з
+# VIRTUAL_ENV=<ця тека>\.venv. Старі meshfix.pyd / foamview.pyd у корені
+# закривали б пакунки: скрипт перейменовує їх на *.pyd.old-<час>.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\build_rust.ps1
 #
-# Програма працює і без них: fs_fast.py тоді читає через VTK, а вкладка «3D»
-# малює VTK. Rust стоїть у X:\rust (CARGO_HOME, RUSTUP_HOME нижче).
+# Програма працює і без foamrs: fs_fast.py тоді читає через VTK.
+# Rust стоїть у X:\rust (CARGO_HOME, RUSTUP_HOME нижче).
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -42,8 +46,15 @@ function Build-Pyd([string]$crate) {
 }
 
 Build-Pyd "foamrs"
-Build-Pyd "foamview"
-Build-Pyd "meshfix"
+
+# Старі модулі попередніх версій: вони мали імʼя пакунків meshfix і foamview.
+foreach ($old in @("meshfix", "foamview")) {
+    $pyd = Join-Path $root "$old.pyd"
+    if (Test-Path $pyd) {
+        Rename-Item $pyd ("$old.pyd.old-" + (Get-Date -Format "yyyyMMddHHmmss"))
+        Write-Host "$old.pyd -> $old.pyd.old-* (now the package $old)"
+    }
+}
 
 # foamdist — ЕКСПЕРИМЕНТАЛЬНО: один прогін на кількох машинах. Збирається
 # під Linux (статичний musl, лінкер rust-lld з самого Rust); програма сама

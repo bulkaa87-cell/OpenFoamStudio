@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 
 import fs_backend as be
+import fs_timeline as ftl
 from fs_i18n import tr
 
 # Імена функцій у controlDict і тек у postProcessing.
@@ -367,9 +368,8 @@ def parse_probe(text: str) -> Probe:
     by: dict[str, LiveTime] = {}
 
     def get(name: str) -> "LiveTime | None":
-        try:
-            t = float(name)
-        except ValueError:
+        t = ftl.time_value(name)          # the rule of a time folder (T51)
+        if t is None:
             return None
         return by.setdefault(name, LiveTime(t, name))
 

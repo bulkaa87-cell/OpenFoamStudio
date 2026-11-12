@@ -22,6 +22,14 @@ import sys
 from pathlib import Path
 
 APP_NAME = "OpenFOAM Studio"
+
+# The folder of the program on a server and in WSL (bash text: the shell
+# expands $HOME). Each run is one folder directly in it; also the queue
+# (.queue), the saved meshes (meshes) and foamdist (bin). fs_queue_runner,
+# which lives alone on the server, has its own copy (tests/test_queue.py).
+REMOTE_ROOT = "$HOME/openfoam-studio"
+# The same folder in a text for the person.
+REMOTE_SHOWN = "~/openfoam-studio"
 FROZEN = bool(getattr(sys, "frozen", False))
 
 

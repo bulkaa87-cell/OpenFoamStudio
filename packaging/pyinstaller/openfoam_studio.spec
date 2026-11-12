@@ -3,16 +3,17 @@
 #   pyinstaller --noconfirm --distpath <dist> --workpath <work> \
 #       packaging/pyinstaller/openfoam_studio.spec
 #
-# Build the Rust modules first (foamrs.pyd, foamview.pyd, meshfix.pyd in the
-# repository root, and the Linux binary rust/foamdist/target/
-# x86_64-unknown-linux-musl/release/foamdist). packaging/windows/build.ps1
-# does all steps. The program works without the Rust modules too (slower
-# field reading, VTK 3D view, no meshfix repair).
+# Build the Rust module foamrs first (foamrs.pyd in the repository root, and
+# the Linux binary rust/foamdist/target/x86_64-unknown-linux-musl/release/
+# foamdist). packaging/windows/build.ps1 does all steps. The Python of the
+# build must have requirements.txt installed: the shared packages
+# meshfix-core and foamview of MeshFix Studio (fs_shared.py) come from there.
+# The program works without foamrs (slower field reading).
 
 import os
 import sys
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, "..", ".."))
 NAME = "OpenFOAM Studio"
@@ -24,7 +25,9 @@ datas = [(os.path.join(ROOT, "i18n"), "i18n"),
 import glob
 for f in glob.glob(os.path.join(ROOT, "icons", "openfoam-studio*.png")):
     datas.append((f, "icons"))
-for name in ("NASTANOVA.md", "NASTANOVA.en.md", "SLOVNYK.html", "SLOVNYK.en.html"):
+# fs_queue_runner.py goes to the server as a file (fs_queue.RUNNER_LOCAL, T46).
+for name in ("NASTANOVA.md", "NASTANOVA.en.md", "SLOVNYK.html", "SLOVNYK.en.html",
+             "fs_queue_runner.py"):
     if os.path.isfile(os.path.join(ROOT, name)):
         datas.append((os.path.join(ROOT, name), "."))
 # The Linux binary of the distributed run (fs_backend.FOAMDIST_LOCAL is
@@ -37,7 +40,13 @@ if os.path.isfile(os.path.join(ROOT, FOAMDIST)):
 binaries = []
 hidden = ["pyvistaqt", "vtkmodules.util.numpy_support",
           "vtkmodules.qt.QVTKRenderWindowInteractor"]
-for mod in ("foamrs", "foamview", "meshfix"):
+# The shared packages of MeshFix Studio: their modules (the aliases fs_meshfix,
+# fs_repair, fs_winfix, fs_i18n import them by name), the native modules
+# meshfix._native and foamview._native, and their catalogues.
+for pkg in ("meshfix", "foamview"):
+    hidden += collect_submodules(pkg)
+    datas += collect_data_files(pkg, includes=["i18n/**/*.json"])
+for mod in ("foamrs",):
     pyd = os.path.join(ROOT, mod + (".pyd" if sys.platform == "win32" else ".so"))
     if os.path.isfile(pyd):
         binaries.append((pyd, "."))

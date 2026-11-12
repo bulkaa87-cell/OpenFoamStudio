@@ -2451,6 +2451,9 @@ def body_field_style(key: str, body) -> dict:
     """Як фарбувати тіло полем BODY_FIELDS: мапа кольорів і межі шкали."""
     if key == SEP:
         return dict(cmap=sep_cmap(), clim=(-1.0, 1.0))
+    if key != DRAG:
+        # Another cell field (Cp of fs_report): the caller gives the limits.
+        return dict(cmap=diverging_cmap())
     return dict(cmap=diverging_cmap(), clim=drag_limits(body))
 
 

@@ -33,11 +33,16 @@ from pyvistaqt import QtInteractor
 
 import fs_advisor as adv
 import fs_anim as fa
-import fs_animbar
+import fs_player
+import fs_servertimes as fst
+import fs_timebar
+import fs_timesdlg
+import fs_timeline as ftl
 import fs_live
 import fs_livebar
 import fs_backend as be
 import fs_case as fc
+import fs_caseguard as guard
 import fs_crashlog as crashlog
 import fs_geometry as geo
 import fs_i18n
@@ -54,6 +59,12 @@ import fs_settingsdlg
 import fs_serverwiz
 import fs_restart
 import fs_post as post
+import fs_prerun as prerun
+import fs_prerunwin
+import fs_queue as fq
+import fs_queuewin
+import fs_runs
+import fs_recover
 import fs_slicebar as slicebar
 import fs_statusbar as sbar
 import fs_views as fv
@@ -960,10 +971,6 @@ class Viewport(QtWidgets.QWidget):
         self.set_problem(key, count)
         self.plotter.render()
 
-    def show_holes(self, edges):
-        self.show_problem("holes", edges,
-                          0 if edges is None else int(edges.n_cells))
-
     def set_problem(self, key: str, count: int, tip: str = ""):
         """Підпис чекбокса: скільки цього в моделі й що з цим робити."""
         chk = self.chk.get(key)
@@ -1004,17 +1011,6 @@ class Viewport(QtWidgets.QWidget):
         for key in PROBLEM_LAYERS:
             self._drop(key)
             self.set_problem(key, 0)
-
-    def show_scalar(self, mesh, field: str, cmap="coolwarm"):
-        self._drop("body")
-        self._drop("result")
-        if mesh is None:
-            return
-        self.actors["result"] = self.plotter.add_mesh(
-            mesh, scalars=field, cmap=cmap, smooth_shading=True,
-            scalar_bar_args=dict(title=tr(field), n_labels=5, fmt="%.3g"),
-            name="result", reset_camera=False)
-        self.plotter.render()
 
     def show_domain(self, cfg: fc.CaseCfg):
         self._drop("domain")
@@ -1166,10 +1162,6 @@ class Viewport(QtWidgets.QWidget):
         self.show_flow(cfg)
         self.plotter.render()
 
-    def clear_results(self):
-        self._drop("result")
-        self._drop("slice")
-
 
 # ==========================================================================
 # Робочий потік
@@ -1251,6 +1243,19 @@ class _BusyReceiver(QtCore.QObject):
         self.loop.quit()
 
 
+class _Receiver(QtCore.QObject):
+    """Calls `fn(result, exc)` in the thread of this object (the window
+    thread): the reason is the same as for _BusyReceiver."""
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    @QtCore.Slot(object, object)
+    def take(self, result, exc):
+        self.fn(result, exc)
+
+
 class RepairWorker(QtCore.QObject):
     """Ремонт геометрії поза потоком вікна.
 
@@ -1307,6 +1312,9 @@ class RunWorker(QtCore.QObject):
             mesh_key = (be.mesh_key(case_dir) if case_dir
                         and be.mesh_cache_supported(backend) else "")
         self.mesh_key = mesh_key
+        # The download of the results after the run (T44): None (no
+        # download), True (done), False (failed).
+        self.fetched: "bool | None" = None
         # The settings of THIS run (a copy made at the start). None: not
         # known here (attach) -> MainWindow._run_cfg reads the case manifest.
         self.cfg: "fc.CaseCfg | None" = None
@@ -1365,7 +1373,10 @@ class RunWorker(QtCore.QObject):
         if self.native_dir and self.sync_back:
             self.line.emit("")
             self.line.emit(tr(FETCH_MARK))
-            self.event.emit("fetch", "")
+            # The value: how the run ended ("ok" / "fail"), for the
+            # notification «Run finished» (T44).
+            self.event.emit("fetch", "ok" if ok else "fail")
+            self.fetched = False
             try:
                 if self.backend.kind == "ssh":
                     be.sync_from_ssh(self.backend, self.native_dir,
@@ -1373,6 +1384,7 @@ class RunWorker(QtCore.QObject):
                 else:
                     be.sync_from_wsl(self.backend, self.native_dir,
                                      self.case_dir)
+                self.fetched = True
             except Exception as exc:
                 self.line.emit(tr("could not copy back: {exc}", exc=exc))
         self.done.emit(ok, msg)
@@ -1484,6 +1496,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._batch_units: str | None = None
         self._load_factor: float | None = None
         self._series: AngleSeries | None = None
+        # The run queue on the server (T46): while not None, _start_one_run
+        # makes a job for the queue instead of starting the run.
+        self._queue_ctx: "dict | None" = None
+        self._queued_job: "dict | None" = None
+        self._queue_win = None
+        self.queue_watch = fs_queuewin.QueueWatch(self)
+        # Pre-run (T39, fs_prerun): "pre" while the short run goes. The
+        # warnings that the person accepted for the pre-run are not asked
+        # again for the main run that follows it.
+        self._prerun_phase = ""
+        self._warn_quiet: set = set()
+        self._prerun_dialog = None
         # Глибина `_off_thread`: усередині вже запущеної роботи нову не
         # пускаємо в потік, а рахуємо на місці (див. там).
         self._busy_depth = 0
@@ -1592,6 +1616,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.sessions_seen.connect(self._say_sessions)
         self.mesh_fetched.connect(self._mesh_fetched)
+        # T44: notifications about the runs, and the window connects to its
+        # server runs again by itself (start, after a sleep, a new network).
+        self.run_guard = fs_recover.RunGuard(self)
+        # T49b: the last read of the run folders of the servers, for the
+        # «Runs» window; the full reads of the run watch go there too.
+        self.runs_snapshot = fs_runs.Snapshot()
+        self.run_guard.probed.connect(self._runs_probe)
         self._detecting = False
         self._start_tries = 0
         QtCore.QTimer.singleShot(150, self._detect_on_start)
@@ -1632,6 +1663,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # Пізніше за все інше: це найдовше й найменш потрібне для першого
             # кадру, і без мережі воно просто мовчить.
             QtCore.QTimer.singleShot(1050, self._peek_sessions)
+            # T44: after the session restore (the guard waits for it).
+            QtCore.QTimer.singleShot(1500, self.run_guard.start)
 
     def _save_models(self):
         """Список моделей переживає закриття програми незалежно від сесії.
@@ -1752,7 +1785,10 @@ class MainWindow(QtWidgets.QMainWindow):
         bar = self.menuBar()
         file_menu = bar.addMenu("File")
 
-        act = QtGui.QAction("Open STL…", self)
+        act = QtGui.QAction("Open Geometry…", self)
+        act.setStatusTip("Open a mesh file: STL, 3MF, OBJ, PLY, OFF, glTF "
+                         "or VTK (the formats of the shared package "
+                         "meshfix-core)")
         act.setShortcut("Ctrl+O")
         act.triggered.connect(self.open_stl)
         file_menu.addAction(act)
@@ -1790,9 +1826,11 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu.addAction(act)
         file_menu.addSeparator()
 
-        act = QtGui.QAction("Save Geometry as STL…", self)
+        act = QtGui.QAction("Save Geometry…", self)
         act.setStatusTip("Write what is in the scene now — already in "
-                         "meters, rotated and repaired")
+                         "meters, rotated and repaired. STL, 3MF, OBJ, "
+                         "PLY, OFF, glTF or VTK; 3MF, OBJ, ASCII STL, glTF "
+                         "and VTK keep each model as a separate object")
         act.triggered.connect(self.save_geometry)
         file_menu.addAction(act)
         file_menu.addSeparator()
@@ -1859,6 +1897,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_to_model.triggered.connect(self.to_model)
         view_menu.addAction(self.act_to_model)
 
+        queue_menu = bar.addMenu("Runs")
+        act = QtGui.QAction("Runs…", self)
+        act.setStatusTip("The plan of the run queue and the runs on the "
+                         "servers: states, order, start time, connect, "
+                         "results")
+        act.triggered.connect(self.open_queue)
+        queue_menu.addAction(act)
+        act = QtGui.QAction("Add the Case to the Queue", self)
+        act.setStatusTip("The server starts it when the machine is free; "
+                         "the laptop can sleep")
+        act.triggered.connect(lambda: self.queue_add(series=False))
+        queue_menu.addAction(act)
+        act = QtGui.QAction("Add the Angle Series to the Queue", self)
+        act.setStatusTip("One job per angle of the «Angles» field")
+        act.triggered.connect(lambda: self.queue_add(series=True))
+        queue_menu.addAction(act)
+
         help_menu = bar.addMenu("Help")
         self._help_menu = help_menu
 
@@ -1917,11 +1972,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_detached = sbar.StatusText(
             "✔ The run lives on the server — you can turn off the laptop")
         self.lbl_detached.setStyleSheet("color:#7ee787; font-weight:600;")
-        self.lbl_detached.setToolTip(
-            "The case upload is complete, and the server runs on its "
-            "own. Close the program with the X button (not “Stop”) or "
-            "just turn off the laptop. Later: “Connect” — and the log, "
-            "plots and results will load.")
+        # Its text and tooltip come from the state (_laptop,
+        # RunPanel.LAPTOP_TIPS), never a fixed tooltip of one state (T49).
         self.lbl_detached.setVisible(False)
         self.statusBar().addPermanentWidget(self.lbl_detached)
         # Хто малює «3D»: щоб було видно, коли працює повільний запасний
@@ -1969,7 +2021,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_paraview.clicked.connect(lambda: self.open_in_paraview())
         bar.addWidget(self.btn_load_res)
         bar.addWidget(self.btn_paraview)
-        bar.addWidget(QtWidgets.QLabel("Time"))
+        # The time of the view: the timeline below (T40). The list stays as
+        # the model of the current time (hidden): the code and the tests read
+        # cmb_time.currentText().
+        self.cmb_time.hide()
         bar.addWidget(self.cmb_time)
         bar.addWidget(QtWidgets.QLabel("Field on Body"))
         bar.addWidget(self.cmb_field)
@@ -1984,6 +2039,36 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.btn_glossary)
         lay.addLayout(bar)
 
+        # Timeline: all times of the case, a mini player (T40). It is also
+        # the animation: play, scrub and step show fast frames (only the
+        # values change), loaded in the background.
+        self.time_bar = fs_timebar.TimeBar()
+        lay.addWidget(self.time_bar)
+        # After a download from the server: «only the last time» or «from …
+        # to …» in one line (T40). Hidden until the server has more times.
+        self.fetch_bar = fs_timesdlg.FetchBar()
+        self.fetch_bar.done.connect(self._times_came)
+        self.fetch_bar.more_requested.connect(
+            lambda: self.times_from_server(self.fetch_bar.backend,
+                                           self.fetch_bar.listing,
+                                           self.fetch_bar.remote))
+        lay.addWidget(self.fetch_bar)
+        self._run_folders: dict = {}      # case → run folder on the server
+        self._offer_job = (None, None, None)
+        self._source = "full"           # full fields or run surfaces
+        self._frames_cache = ftl.FrameCache()
+        self._frames_case = ""
+        self._frame_loader = fs_player.FrameLoader(self)
+        self._frame_loader.ready.connect(self._frames_ready)
+        self._frame_loader.loaded.connect(self._frame_loaded)
+        self._frame_loader.failed.connect(self._frames_failed)
+        self._frames_plan = None          # (body key, slice key, options)
+        self._frames_final = False        # common limits of all frames set
+        self._frames_ld = None            # fs_anim.Loader of the frames
+        self._frames_geom = None
+        self._anim_built = False          # actors of the frames are built
+        self._tl_times: list = []         # times of the timeline = cmb_time rows
+
         # Проміжний результат прогону, що йде (fs_live). Видно лише під час
         # прогону; малює той самий код, що й остаточні результати.
         self.live_bar = fs_livebar.LiveBar()
@@ -1997,10 +2082,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_slice = self.slice_bar.chk_enable
         lay.addWidget(self.slice_bar)
 
-        # Третя смуга — анімація нестаціонарного розвʼязку (fs_anim).
-        self.anim_bar = fs_animbar.AnimBar()
-        self.anim_bar.setEnabled(False)
-        lay.addWidget(self.anim_bar)
+        # Frames of the player (fs_anim): built from the view, in the
+        # background (self._frame_loader).
         self._anim = None                 # fa.Frames, коли кадри готові
         self._anim_i = 0
         self._anim_keys = ("", "")
@@ -2126,6 +2209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_run.run_requested.connect(self.start_run)
         self.panel_run.run_server_requested.connect(self.start_run_on_server)
         self.panel_run.attach_requested.connect(self.attach_to_server)
+        self.panel_run.queue_requested.connect(lambda: self.queue_add())
         self.panel_run.stop_requested.connect(self.stop_run)
         self.panel_run.soft_stop_requested.connect(self.soft_stop_run)
         self.panel_run.open_dir_requested.connect(self.open_case_dir)
@@ -2141,17 +2225,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_flow.btn_rot_fit.clicked.connect(self.fit_rotor_zone)
 
         self.btn_load_res.clicked.connect(self.load_results)
-        ab = self.anim_bar
-        ab.prepare_requested.connect(self._anim_prepare)
-        ab.reconstruct_requested.connect(self._anim_reconstruct)
-        ab.play_toggled.connect(self._anim_play)
-        ab.frame_changed.connect(self._anim_show)
-        ab.fields_changed.connect(self._anim_fields)
-        ab.export_requested.connect(self._anim_export)
-        ab.stop_requested.connect(lambda: self._anim_stop(redraw=True))
+        tb = self.time_bar
+        tb.seek.connect(self._timeline_seek)
+        tb.play_toggled.connect(self._anim_play)
+        tb.fps_changed.connect(lambda _: self._anim_play(tb.timeline.playing))
+        tb.full_view.connect(lambda: self._anim_stop(redraw=True))
+        tb.source_changed.connect(self._timeline_source)
+        tb.options_changed.connect(self._frames_options)
+        tb.export_requested.connect(self._anim_export)
+        tb.reconstruct_requested.connect(
+            lambda: self._anim_reconstruct(self._missing_times()))
+        tb.server_requested.connect(self.times_from_server)
         self.slice_bar.moved.connect(self._anim_slice_moved)
         self.cmb_time.currentTextChanged.connect(lambda _: self.draw_results())
-        self.cmb_field.currentTextChanged.connect(lambda _: self.draw_results())
+        self.cmb_field.currentTextChanged.connect(lambda _: self._field_changed())
         sb = self.slice_bar
         sb.toggled.connect(lambda on: self._view_toggled(on, sb.streams_on()))
         sb.streams_toggled.connect(lambda on: self._view_toggled(on, sb.is_on()))
@@ -2161,6 +2248,8 @@ class MainWindow(QtWidgets.QMainWindow):
         sb.moved.connect(self._slice_moved)
         sb.axis_changed.connect(self._slice_axis)
         sb.field_changed.connect(self._slice_field)
+        sb.field_changed.connect(self._frames_view_changed)
+        sb.axis_changed.connect(self._frames_view_changed)
         sb.limits_changed.connect(self._slice_limits_set)
         sb.limits_auto.connect(self._slice_limits_auto)
         sb.limits_fit.connect(self._slice_limits_fit)
@@ -2182,6 +2271,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_lib.open_requested.connect(self.open_saved)
         self.panel_lib.paraview_requested.connect(self.open_saved_in_paraview)
         self.panel_lib.changed_on_disk.connect(self.on_case_moved)
+        self.panel_lib.busy_reason = self._run_busy
         # Каталог кейсів задається на вкладці «Запуск», а бібліотека його
         # читає — інакше вони показували б різні місця.
         self.panel_run.ed_dir.textChanged.connect(
@@ -2991,21 +3081,57 @@ class MainWindow(QtWidgets.QMainWindow):
                 start = str(Path(part.path).with_name(
                     Path(part.path).stem + "_fixed.stl"))
                 break
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, tr("Save Geometry"), start,
-            "STL (*.stl);;PLY (*.ply);;VTK PolyData (*.vtp)")
+        # FORMATS: the shared package (meshfix.check.save_mesh, 0.3.0 and
+        # later) writes each format; each model of the scene is one body
+        # (an object in 3MF, OBJ, ASCII STL, glTF and VTK). The formats
+        # without a unit get meters, as the scene; 3MF gets mm, glTF m.
+        # Without such a package: binary STL only, as before.
+        chk = geo.formats()
+        bodies = self.scene_bodies()
+        filters = (chk.export_filters(len(bodies)) if chk
+                   else [("stl", tr("STL binary") + " (*.stl)")])
+        texts = [text for _key, text in filters]
+        path, picked = QtWidgets.QFileDialog.getSaveFileName(
+            self, tr("Save Geometry"), start, ";;".join(texts), texts[0])
         if not path:
             return
+        keys = [key for key, text in filters if text == picked]
         try:
-            geo.write_stl(self.mesh, path, binary=True)
+            if chk is None:
+                if Path(path).suffix.lower() != ".stl":
+                    path = str(Path(path).with_suffix(".stl"))
+                geo.write_stl(self.mesh, path, binary=True)
+                note = tr("The geometry is in meters.")
+            else:
+                if Path(path).suffix.lower() not in chk.READERS:
+                    path = path + chk.FORMATS[keys[0] if keys else "stl"].suffix
+                mesh = (chk.join_bodies(bodies) if len(bodies) > 1
+                        else self.mesh)
+                info = chk.save_mesh(mesh, path,
+                                     chk.format_for(path,
+                                                    keys[0] if keys else None),
+                                     unit_m=1.0)
+                note = chk.save_note(info)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, tr("Could not write"),
                                            f"{type(exc).__name__}: {exc}")
             return
         size = os.path.getsize(path) / 1e6
-        self.statusBar().showMessage(
-            tr("Wrote {name}: {n_cells} triangles, {size:.1f} MB. The "
-               "geometry is in meters — exactly what is in the viewport.", name=Path(path).name, n_cells=phys.fmt_cells(self.mesh.n_cells), size=size), 12000)
+        text = tr("Wrote {name}: {n_cells} triangles, {size:.1f} MB, exactly "
+                  "what is in the viewport.", name=Path(path).name,
+                  n_cells=phys.fmt_cells(self.mesh.n_cells), size=size)
+        self.log.push(text + " " + note)
+        self.statusBar().showMessage(text + " " + note, 12000)
+
+    def scene_bodies(self) -> list:
+        """[(name, mesh)] of the models of the scene, in the pose of the
+        sticks (as in the viewport and in the case). The name is the patch
+        name of the case, else the file name."""
+        out = []
+        for part in self.enabled_parts():
+            name = self._patch_of(part) or Path(part.path).stem or "body"
+            out.append((name, part.posed(self.channels) or part.mesh))
+        return out
 
     def open_stl(self):
         self._ask_file(add=False)
@@ -3024,7 +3150,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 break
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "Add Geometry" if add else "Open Geometry", start,
-            "Surfaces (*.stl *.obj *.ply *.vtp);;All files (*)")
+            geo.open_filter())
         if not paths:
             return
         if not add and self._pmesh.released:
@@ -3036,7 +3162,12 @@ class MainWindow(QtWidgets.QMainWindow):
         paths = sorted(paths)
         # Одиниці питаємо ЩОРАЗУ, типово міліметри: поле «Одиниці STL»
         # могло лишитися «метрами» від відкритого кейсу чи сесії.
-        units = panels.UnitsDialog.ask(self, paths)
+        # A 3MF or glTF file gives its unit: then no question («авто» takes
+        # the unit of the file, fs_geometry.guess_scale).
+        if all(geo.unit_in_file(p) for p in paths):
+            units = "авто"
+        else:
+            units = panels.UnitsDialog.ask(self, paths)
         if units is None:
             return
         self.start_batch(paths, add=add, units=units)
@@ -4870,7 +5001,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- кейс -----------------------------------------------------------
 
-    def create_case(self, report=True) -> str | None:
+    def create_case(self, report=True, build_cfg=None) -> str | None:
+        """Write the case. `build_cfg`: write the dictionaries from this
+        configuration (the pre-run copy). The checks and the manifest use
+        `self.cfg` all the same."""
         if self.mesh is None:
             QtWidgets.QMessageBox.warning(self, tr("No geometry"),
                                           tr("Load an STL first."))
@@ -4912,7 +5046,11 @@ class MainWindow(QtWidgets.QMainWindow):
                    "created. The same message is also shown on the tabs, "
                    "next to the setting it applies to.", blocking=(NEWLINE + NEWLINE).join(blocking), NEWLINE=NEWLINE))
             return None
-        if warnings and self._series_quiet():
+        if warnings and set(map(str, warnings)) <= self._warn_quiet:
+            for text in warnings:
+                self.log.push(tr("Warning (accepted before the pre-run): "
+                                 "{text}", text=text))
+        elif warnings and self._series_quiet():
             # На першому куті серії людина це вже бачила й погодилась.
             for text in warnings:
                 self.log.push(tr("Warning (accepted at the first angle "
@@ -4925,7 +5063,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.No)
             if ans != QtWidgets.QMessageBox.Yes:
                 return None
+            if self._prerun_phase == "pre":
+                self._warn_quiet = set(map(str, warnings))
 
+        if report:
+            # «Create Case»: not over the folder of an earlier run (T43).
+            self._new_run_folder()
+            if self._run_note:
+                self.log.push(self._run_note)
+                self._run_note = ""
         base = Path(self.panel_run.ed_dir.text().strip() or DEFAULT_CASES)
         # Імʼя йде в теку: «11:15» тут валило створення ([WinError 123]).
         name = fc.safe_case_name(self.cfg.name)
@@ -4941,7 +5087,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             for sub in ("system", "constant/triSurface", "0.orig"):
                 (case_dir / sub).mkdir(parents=True, exist_ok=True)
-            files = fc.build_case(self.cfg)
+            files = fc.build_case(build_cfg or self.cfg)
             # ПРИБРАТИ СТАЛЕ ПЕРЕД ЗАПИСОМ НОВОГО.
             #
             # build_case() пише лише те, що ЗАРАЗ потрібне. Якщо востаннє
@@ -5096,10 +5242,15 @@ class MainWindow(QtWidgets.QMainWindow):
                               f"{self._how_long(s.age)}{tail}")
         self.log.push(tr("The “Connect to Run” button on the “Run” tab will "
                       "show the log and bring back the results."))
+        # T49: plural forms, not English words put into the text («1 run
+        # there is on the server»).
         if going:
-            note = (tr("{n_going} {v2} {v} on the server", v='there is' if len(going) == 1 else 'there are', n_going=len(going), v2='run' if len(going) == 1 else 'runs'))
+            note = fs_i18n.plural(len(going), "{n} run is on the server now",
+                                  "{n} runs are on the server now")
         else:
-            note = (tr("{n_over} {v} on the server finished while you were away", n_over=len(over), v='run' if len(over) == 1 else 'runs'))
+            note = fs_i18n.plural(
+                len(over), "{n} run on the server ended while you were away",
+                "{n} runs on the server ended while you were away")
         self.statusBar().showMessage(tr("{note} — see the “Run” tab.", note=note), 20000)
         # Кнопку підсвічуємо: журнал легко проминути, а це те саме
         # повідомлення, тільки там, де на нього можна натиснути.
@@ -5107,40 +5258,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "font-weight:bold; color:#4caf50;")
 
     def attach_to_server(self):
-        """Підхопити прогін, який іде на сервері сам по собі.
+        """«Connect to Run»: the «Runs» window, on the runs on the servers
+        (T49b; before: the dialog «Runs on the Server»).
 
-        Сенс усієї справи: прогін там пускається відчепленим і живе без
-        цього вікна. Отже, має бути чим до нього повернутися — після
-        перезапуску програми, після перезавантаження ноута, з іншого
-        компʼютера. Питаємо не себе, а сервер: він єдиний знає правду.
+        The window reads each known server in a thread (fs_runs.scan) and
+        connects by the path of start_attach (RunGuard.connect_run).
         """
-        backend = self._ssh_backend_or_complain()
-        if backend is None:
-            return
-        self.statusBar().showMessage(
-            tr("Asking {host} what is running there…", host=backend.host))
-        QtWidgets.QApplication.processEvents()
-        try:
-            sessions = be.list_sessions(backend)
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(
-                self, tr("The server did not respond"), str(exc)[:400])
-            return
-        self.statusBar().clearMessage()
-        if not sessions:
-            QtWidgets.QMessageBox.information(
-                self, tr("No runs"),
-                tr("On {host} there is no run started by this "
-                   "program.{NEWLINE}{NEWLINE}Runs live in "
-                   "~/openfoam-studio/<case name>. If you started a "
-                   "calculation manually, the program does not know "
-                   "about it — it looks for its studio/ folder next to "
-                   "the case.", host=backend.host, NEWLINE=NEWLINE))
-            return
-        picked = self.pick_session(sessions)
-        if picked is None:
-            return
-        self.start_attach(backend, picked)
+        self.open_queue(focus_server=True)
 
     def _ssh_backend_or_complain(self):
         """Готовий ssh-бекенд або None — і тоді вже сказано, чому."""
@@ -5158,52 +5282,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 return None
         b = self.panel_run.current_backend()
         return b if b is not None and b.kind == "ssh" and b.ready else None
-
-    def pick_session(self, sessions):
-        """Дати вибрати прогін зі списку. None — передумали.
-
-        Окремим методом навмисне: вікно тут модальне, а перевірки мусять
-        уміти його обійти, не зупиняючись назавжди.
-        """
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Runs on the Server")
-        dlg.resize(760, 360)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        lay.addWidget(QtWidgets.QLabel(
-            "Select a run. A run in progress will continue to show live; "
-            "a finished run will open with its log and results."))
-        table = QtWidgets.QTableWidget(len(sessions), 5, dlg)
-        table.setHorizontalHeaderLabels(
-            ["Case", "Status", "Pitch", "Started", tr("Lines", ctx="log")])
-        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        table.verticalHeader().setVisible(False)
-        for r, s in enumerate(sessions):
-            for c, text in enumerate((s.name, s.human(), s.step_text or "—",
-                                      s.started or "—", str(s.log_lines))):
-                item = QtWidgets.QTableWidgetItem(text)
-                if s.stale:
-                    item.setForeground(QtGui.QColor("#e05252"))
-                elif s.running:
-                    item.setForeground(QtGui.QColor("#4caf50"))
-                table.setItem(r, c, item)
-        table.resizeColumnsToContents()
-        table.horizontalHeader().setStretchLastSection(True)
-        table.selectRow(0)
-        lay.addWidget(table, 1)
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Connect")
-        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Cancel")
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        table.doubleClicked.connect(dlg.accept)
-        lay.addWidget(buttons)
-        if dlg.exec() != QtWidgets.QDialog.Accepted:
-            return None
-        row = table.currentRow()
-        return sessions[row] if 0 <= row < len(sessions) else None
 
     def start_attach(self, backend, session):
         """Почати читати журнал сесії з сервера."""
@@ -5252,13 +5330,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread.started.connect(self.worker.run)
         self.worker.line.connect(self._run_line)
         self.worker.event.connect(self._run_event)
-        # Підключення — до прогону, що вже живе на сервері сам.
-        self._laptop("free")
+        # «You can turn off the laptop» only for a run that still runs on
+        # the server. An ended run (T44 connects to it by itself at start,
+        # to get its results) goes from here to the download (T49).
+        self._laptop(self.attach_laptop_state(session))
         self.worker.step.connect(self.on_step)
         self.worker.done.connect(self.on_done)
         self.thread.start()
         self.timer.start()
         self._live_start()
+
+    @staticmethod
+    def attach_laptop_state(session) -> str:
+        """The laptop indicator when the window connects to `session`:
+        "free" for a live run, "" for an ended one (its download sets
+        "fetch")."""
+        return "free" if session.running and session.alive else ""
 
     def _shows_case(self, case_dir: str) -> bool:
         """True if the window shows this case now: its folder and its name.
@@ -6561,9 +6648,112 @@ class MainWindow(QtWidgets.QMainWindow):
     def start_run(self):
         """«Запустити» — один прогін, а з галочкою серії — увесь список кутів."""
         if self.panel_run.chk_series.isChecked() and self._series is None:
+            if self.panel_run.chk_prerun.isChecked():
+                self.log.push(tr("The pre-run is not used for an angle "
+                                 "series: the series runs as it is."))
             self.start_series()
             return
+        if self.panel_run.chk_prerun.isChecked() and self._series is None:
+            self.start_prerun()
+            return
         self._start_one_run()
+
+    # --- PRE-RUN (T39): a short run that tunes the main run ---------------
+
+    def start_prerun(self) -> bool:
+        """Run the short pre-run. Its report window starts the main run."""
+        backend = self.panel_run.current_backend()
+        why = prerun.why_not(self.cfg, backend.kind if backend else "")
+        if why:
+            QtWidgets.QMessageBox.information(
+                self, tr("Run with a pre-run (tuning)"), why)
+            return False
+        self._prerun_phase = "pre"
+        if not self._start_one_run(pre=True):
+            self._prerun_phase = ""
+            return False
+        return True
+
+    def _prerun_report(self, ok: bool, msg: str):
+        """The Report of the pre-run that just ended (None: it was stopped)."""
+        w = self.worker
+        runner = w.runner if w else None
+        stop = getattr(runner, "_stop", None)
+        if stop is not None and stop.is_set():
+            return None
+        case_dir = Path((w.case_dir if w else "") or self.case_dir or ".")
+        logs = {}
+        for sid in prerun.log_names(getattr(w, "cfg", None)
+                                    or self.cfg).values():
+            f = case_dir / "logs" / f"{be._sh_name(sid)}.log"
+            if f.is_file():
+                logs[sid] = f.read_text(encoding="utf-8", errors="replace")
+        f = case_dir / "logs" / f"{be._sh_name(be.STEP_MESH_CHECK)}.log"
+        hit = f.is_file() and "mesh=hit" in f.read_text(
+            encoding="utf-8", errors="replace")
+        st = runner.state if runner else None
+        level, why = st.mesh_severity() if st else ("ok", "")
+        facts = prerun.RunFacts(
+            ok=ok, msg=msg,
+            step=be.step_id(runner.current_step) if runner else "",
+            cells=st.cells if st else 0,
+            coverage=st.layer_coverage if st else -1.0,
+            faces=getattr(st, "layer_faces", -1.0) if st else -1.0,
+            mesh_level=level, mesh_why=why, mesh_from_store=hit,
+            mesh_cache=bool(w) and be.mesh_cache_supported(w.backend))
+        prerun.remove_limit_file(case_dir)
+        # The configuration of the run itself (T38: RunWorker.cfg is a copy
+        # made at the start), not what the window holds now.
+        cfg = getattr(w, "cfg", None) or self.cfg
+        return prerun.analyse(cfg, facts, logs,
+                              mesh_locked=self._pmesh.active, diag=self.diag)
+
+    def _prerun_finished(self, ok: bool, msg: str) -> None:
+        """The pre-run ended: show the report, then start the main run."""
+        self._prerun_phase = ""
+        rep = self._prerun_report(ok, msg)
+        if rep is None:
+            self.panel_run.lbl_status.setText(tr("Pre-run stopped."))
+            return
+        self.log.push("")
+        self.log.push(tr("— Pre-run (tuning): {headline} —",
+                         headline=rep.headline))
+        for r in rep.rows:
+            if r.change:
+                self.log.push(tr("  proposed: {title} {old} → {new} ({m})",
+                                 title=r.title, old=r.current, new=r.proposed,
+                                 m=r.measured))
+            else:
+                self.log.push(f"  · {r.title}: {r.measured}")
+        for n in rep.notes:
+            self.log.push(f"  · {n}")
+        self.panel_run.lbl_status.setText(rep.headline)
+        dlg = fs_prerunwin.PreRunDialog(rep, self)
+        self._prerun_dialog = dlg
+        dlg.exec()
+        self._prerun_dialog = None
+        if dlg.action == "apply":
+            done = prerun.apply(self.cfg, dlg.values())
+            for key, old, new in done:
+                self.log.push(tr("Pre-run: {key} {old} → {new}",
+                                 key=key, old=old, new=new))
+            if done:
+                self.reload_panels()
+                self.refresh_all()
+        if dlg.action in ("apply", "skip"):
+            QtCore.QTimer.singleShot(0, self._start_main_after_prerun)
+        else:
+            self._warn_quiet = set()
+
+    def _start_main_after_prerun(self) -> None:
+        # The main run uses the folder of its pre-run (T43): no «_r2».
+        self._keep_folder = True
+        try:
+            if self._start_one_run():
+                self.log.push(tr("Main run after the pre-run."))
+        finally:
+            self._keep_folder = False
+            self._warn_quiet = set()
 
     # --- СЕРІЯ КУТІВ ДЛЯ НЕЙТРАЛЬНОЇ ТОЧКИ ---------------------------------
 
@@ -6591,6 +6781,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if why:
             QtWidgets.QMessageBox.warning(
                 self, tr("Series not started"), why[0].upper() + why[1:] + ".")
+            return
+        backend = self.panel_run.current_backend()
+        if (fset.get("queue_on") and backend is not None
+                and backend.kind == "ssh"):
+            # T46: the queue on the server runs the series; the laptop can
+            # sleep. The window loop below is the fallback without a queue.
+            self._series_to_queue(list(angles), backend)
             return
         f = self.cfg.flow
         self._series = AngleSeries(base_name=self.cfg.name or "case",
@@ -6666,7 +6863,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log.push(tr("Series: angle {angle:g}° did not compute — {why}", angle=angle, why=why))
         cases = [lib.read_case(d) for _, d in s.done if os.path.isdir(d)]
         head = (tr("Series stopped") if s.stopped else tr("Series complete"))
-        head += tr(": {n_cases} of {n_angles} angles computed.", n_cases=len(cases), n_angles=len(s.angles))
+        self._series_report(head, cases, len(s.angles))
+
+    def _series_report(self, head: str, cases: list, n_angles: int) -> None:
+        """The neutral point of the computed angles and the comparison (the
+        window loop and the queue, T46, end here)."""
+        head += tr(": {n_cases} of {n_angles} angles computed.", n_cases=len(cases), n_angles=n_angles)
         if len(cases) < 2:
             text = (tr("{head} The neutral point needs at least two "
                        "computed angles.", head=head))
@@ -6699,6 +6901,233 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.setModal(False)
         dlg.show()
         self._series_dialog = dlg
+
+    # --- THE RUN QUEUE ON THE SERVER (T46, fs_queue, fs_queuewin) -----------
+
+    def open_queue(self, focus_server: bool = False) -> None:
+        """The «Runs» window (not modal): the plan of the queue and the runs
+        on the servers (T49b)."""
+        if self._queue_win is None:
+            self._queue_win = fs_queuewin.RunsWindow(
+                self, self.queue_watch,
+                add_case=lambda nb: self.queue_add(series=False, not_before=nb),
+                add_series=lambda nb: self.queue_add(series=True, not_before=nb),
+                fetch=self.queue_fetch, connect=self._runs_connect,
+                hosts=self._runs_hosts, snapshot=self.runs_snapshot)
+        shown = self._queue_win.isVisible()
+        self._queue_win.show()           # a new show reads all (showEvent)
+        if shown:
+            self._queue_win.refresh_all()
+        self._queue_win.raise_()
+        self._queue_win.activateWindow()
+        if focus_server:
+            self._queue_win.focus_server()
+
+    def _runs_hosts(self) -> list:
+        """The servers that the «Runs» window reads: the ones of the run
+        watch (settings, «Server» field, the case) and each server backend
+        of the «Run» tab."""
+        hosts = list(self.run_guard._hosts())
+        cmb = self.panel_run.cmb_backend
+        for i in range(cmb.count()):
+            b = cmb.itemData(i)
+            if getattr(b, "kind", "") == "ssh" and b.host and                     b.host not in hosts:
+                hosts.append(b.host)
+        return hosts
+
+    def _runs_probe(self, host: str, sessions, mode: str) -> None:
+        """A full read of a server by the run watch (T44): keep it for the
+        «Runs» window, no second ssh call."""
+        if mode == "recover" and sessions is not None:
+            self.runs_snapshot.update({host: sessions})
+            if self._queue_win is not None:
+                self._queue_win._fill_runs()
+
+    def _runs_connect(self, session) -> None:
+        """«Connect» in the «Runs» window: like «Connect to Run» before."""
+        if self.thread is not None and self.thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, tr("Wait"), tr("Stop the current run first."))
+            return
+        self.run_guard.connect_run(session, user=True)
+        self.raise_()
+        self.activateWindow()
+
+    def _queue_client(self) -> "fq.Client | None":
+        """The client of the queue, or None after a note to the person."""
+        if not fset.get("queue_on") or not fq.queue_host():
+            QtWidgets.QMessageBox.information(
+                self, tr("Run Queue"),
+                tr("The queue is not set up yet. In «Runs → Runs…», "
+                   "enter the queue server and click «Set Up»."))
+            self.open_queue()
+            return None
+        return fq.Client(fq.queue_host())
+
+    def _queue_backend(self):
+        """The server backend for a queued run (like «Run on Server»)."""
+        b = self.panel_run.current_backend()
+        if b is not None and b.kind == "ssh" and b.ready:
+            return b
+        host = self.panel_run.ed_server.text().strip() or fq.queue_host()
+        if host and not self.panel_run.ed_server.text().strip():
+            self.panel_run.ed_server.setText(host)
+        if not self.panel_run.select_ssh_backend():
+            self.recheck_server()
+            if not self.panel_run.select_ssh_backend():
+                QtWidgets.QMessageBox.information(
+                    self, tr("Run Queue"),
+                    tr("The queue runs a case on a server. Enter the server "
+                       "in the «Server» field on the «Run» tab (a name from "
+                       "~/.ssh/config) and check it."))
+                return None
+        return self.panel_run.current_backend()
+
+    def queue_add(self, series: "bool | None" = None,
+                  not_before: float = 0.0) -> bool:
+        """Put the case (or, with the series check box, the angle series) in
+        the queue. `series` None: the check box decides."""
+        th = getattr(self, "thread", None)
+        if isinstance(th, QtCore.QThread) and th.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, tr("Run Queue"),
+                tr("A run of this window is going on. Add to the queue "
+                   "after it, or stop it."))
+            return False
+        if series is None:
+            series = self.panel_run.chk_series.isChecked()
+        if self._queue_client() is None:
+            return False
+        backend = self._queue_backend()
+        if backend is None:
+            return False
+        if series:
+            angles, why = self.panel_run.series_angles()
+            if not why:
+                why = lib.series_problem(self.cfg)
+            if why:
+                QtWidgets.QMessageBox.warning(
+                    self, tr("Series not started"),
+                    why[0].upper() + why[1:] + ".")
+                return False
+            return self._series_to_queue(list(angles), backend, not_before)
+        self._queue_ctx = {"queue": fq.queue_host(), "not_before": not_before,
+                           "meta": {"aoa": self.cfg.flow.aoa_deg}}
+        self._queued_job = None
+        try:
+            ok = self._start_one_run()
+        finally:
+            self._queue_ctx = None
+        if not ok or self._queued_job is None:
+            return False
+        return self._queue_put([self._queued_job])
+
+    def _series_to_queue(self, angles: list, backend,
+                         not_before: float = 0.0) -> bool:
+        """The angle series as jobs of the queue: one case and one job per
+        angle, the same rule for names and settings as the window loop."""
+        if self._queue_client() is None:
+            return False
+        f = self.cfg.flow
+        base, base_aoa = self.cfg.name or "case", f.aoa_deg
+        sid = f"{fc.safe_case_name(base)}-{time.strftime('%m%d-%H%M%S')}"
+        self.log.push(tr("Series for the neutral point in the queue: "
+                         "{runs_word}, angles {join}.",
+                         runs_word=lib.runs_word(len(angles)),
+                         join=", ".join(f"{a:g}°" for a in angles)))
+        for note in lib.series_notes(angles):
+            self.log.push(tr("Warning: {note}.", note=note))
+        jobs = []
+        # _series_quiet: the questions of the first angle are not asked again.
+        self._series = AngleSeries(base_name=base, base_aoa=base_aoa,
+                                   angles=list(angles))
+        try:
+            for i, a in enumerate(angles):
+                self._series.at = i
+                self._set_angle(lib.series_case_name(base, a), a)
+                self._queue_ctx = {
+                    "queue": fq.queue_host(), "series": sid,
+                    "not_before": not_before,
+                    "meta": {"aoa": a, "base": base, "base_aoa": base_aoa}}
+                self._queued_job = None
+                if not self._start_one_run() or self._queued_job is None:
+                    self.log.push(tr("Series: angle {angle:g}° was not "
+                                     "added; the series stops here.", angle=a))
+                    break
+                jobs.append(self._queued_job)
+        finally:
+            self._queue_ctx = None
+            self._series = None
+            self._set_angle(base, base_aoa)
+            if self.panel_run.chk_remesh.isChecked():
+                self.panel_run.chk_remesh.setChecked(False)
+        if not jobs:
+            return False
+        return self._queue_put(jobs)
+
+    def _queue_put(self, jobs: list) -> bool:
+        """Give the prepared jobs to the queue on the server."""
+        c = self.queue_watch.client()
+        try:
+            ids = self._off_thread(tr("Putting the jobs in the queue…"),
+                                   lambda: (c.ready(), c.add(jobs))[1])
+        except Exception as exc:                          # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, tr("Run Queue"), str(exc))
+            return False
+        for i, j in zip(ids, jobs):
+            self.log.push(tr("Queue: {id} — {name} on {host}.", id=i,
+                             name=j["name"], host=j.get("via") or c.host))
+        text = tr("{n} jobs are in the queue on {host}. The server starts "
+                  "them when the machine is free: you can turn off the "
+                  "laptop.", n=len(ids), host=c.host)
+        self.panel_run.lbl_status.setText(text)
+        self.statusBar().showMessage(text, 20000)
+        self.open_queue()
+        self.queue_watch.poll()
+        return True
+
+    def queue_fetch(self, jobs: list) -> None:
+        """Download the results of ended jobs; the neutral point for a
+        series whose jobs are all here."""
+        queue = fq.queue_host()
+        try:
+            got, bad = self._off_thread(
+                tr("Downloading the results…"),
+                lambda: fs_queuewin.fetch_jobs(jobs, queue), BIG_MESH)
+        except Exception as exc:                          # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, tr("Run Queue"), str(exc))
+            return
+        for j, why in bad:
+            self.log.push(tr("Queue: {name} not downloaded — {why}",
+                             name=j.get("name", ""), why=why))
+        self.log.push(tr("Queue: results of {n} jobs downloaded.", n=len(got)))
+        self.refresh_library()
+        # The download takes only the last time: for the case of the
+        # window, offer the other times of the run (T40 FetchBar).
+        for j in jobs:
+            d = j.get("case_dir", "")
+            if d in got and self._shows_case(d):
+                host = j.get("via") or j.get("host") or queue
+                self._offer_more_times(
+                    be.Backend(kind="ssh", label=host, host=host), d,
+                    j.get("dir", ""))
+        series = {j.get("series") for j in jobs if j.get("series")}
+        for sid in sorted(series):
+            mine = [j for j in jobs if j.get("series") == sid
+                    and j.get("case_dir") in got]
+            cases = [lib.read_case(j["case_dir"]) for j in mine]
+            all_jobs = [j for j in self.queue_watch.jobs or []
+                        if j.get("series") == sid] or mine
+            head = tr("Series {s} (queue)", s=sid)
+            self._series_report(head, cases, len(all_jobs))
+
+    def queue_series_ended(self, sid: str, jobs: list) -> None:
+        """QueueWatch: the last job of a series ended (on the server)."""
+        n_ok = sum(1 for j in jobs if j.get("state") == "done")
+        self.log.push(tr("Queue: series {s} ended, {ok} of {n} jobs done. "
+                         "«Runs → Runs… → Download Results» gets "
+                         "them and shows the neutral point.", s=sid, ok=n_ok,
+                         n=len(jobs)))
 
     # --- розподіл між машинами (експериментально, rust/foamdist) ----------
 
@@ -6883,8 +7312,61 @@ class MainWindow(QtWidgets.QMainWindow):
             return case_key
         return None
 
-    def _start_one_run(self) -> bool:
-        """Один прогін. True — прогін пішов."""
+    def _new_run_folder(self, backend=None) -> None:
+        """A run of a case that already ran goes into a new folder (T43).
+
+        «plane» has a run (here, on the server or in WSL) -> «plane_r2»,
+        then «plane_r3»… The old folder and its results stay; the
+        «Saved» list and «Connect to Run» show each folder. Changes
+        cfg.name and the «Name» field. `backend` None: only local folders.
+        """
+        self._run_note = ""
+        name = fc.safe_case_name(self.cfg.name)
+        base = Path(self.panel_run.ed_dir.text().strip() or DEFAULT_CASES)
+        used, taken = guard.local_names(base)
+        remote: set = set()
+        if backend is not None and (
+                backend.kind == "ssh" or (backend.kind == "wsl"
+                                          and self.panel_run.chk_native.isChecked())):
+            where = backend.host or backend.label
+            try:
+                remote = self._off_thread(
+                    tr("Checking the case folders on {where}…", where=where),
+                    lambda: be.server_case_names(backend))
+            except Exception as exc:                      # noqa: BLE001
+                # The upload checks the folder itself (fs_caseguard).
+                self._run_note = tr("Could not read the case folders on "
+                                    "{where}: {exc}", where=where, exc=exc)
+        new = guard.new_run_name(name, used | remote, taken | remote)
+        if new == name:
+            return
+        self._run_note = tr("Case “{name}” already has a run: this run goes "
+                            "to the new folder “{new}”. The old results "
+                            "stay.", name=name, new=new)
+        self.cfg.name = new
+        self.panel_run.ed_name.blockSignals(True)
+        self.panel_run.ed_name.setText(new)
+        self.panel_run.ed_name.blockSignals(False)
+        self.statusBar().showMessage(self._run_note, 15000)
+
+    def _run_busy(self, case_dir: str) -> str:
+        """Why this local case folder must not be deleted now ("" = no):
+        a run of this window uses it (T43, «Saved» → Delete)."""
+        w = self.worker
+        if (w is None or self.thread is None or not self.thread.isRunning()
+                or not case_dir or not getattr(w, "case_dir", "")):
+            return ""
+        if os.path.normcase(os.path.abspath(w.case_dir)) != os.path.normcase(
+                os.path.abspath(case_dir)):
+            return ""
+        return tr("A run uses this case now. Nothing was deleted. Stop the "
+                  "run or wait until it ends.")
+
+    def _start_one_run(self, pre: bool = False, same_folder: bool = False) -> bool:
+        """Один прогін. True — прогін пішов. `pre`: the pre-run (T39).
+        `same_folder` (or `_keep_folder`): the main run after the pre-run,
+        in the folder of the pre-run (T43)."""
+        same_folder = same_folder or getattr(self, "_keep_folder", False)
         backend = self.panel_run.current_backend()
         if backend is None or not backend.ready:
             QtWidgets.QMessageBox.warning(
@@ -6933,8 +7415,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log.push(tr("Equal pieces: {plan}", plan=self._plan_report(plan, dist_hosts)))
         else:
             self.cfg.solver.proc_weights = []
-        if self.create_case(report=False) is None:
+        if not same_folder:
+            self._new_run_folder(backend)
+        if self.create_case(report=False, build_cfg=(
+                prerun.prerun_cfg(self.cfg) if pre else None)) is None:
             return False
+        # The step limit of a transient pre-run lives in the case (system/),
+        # so each backend takes it with the case. Not in a main run.
+        if pre and not self.cfg.solver.steady:
+            prerun.write_limit_file(self.case_dir)
+        else:
+            prerun.remove_limit_file(self.case_dir)
 
         # Памʼять — до того, як «перебудувати» скинеться: від нього залежить,
         # чи буде snappyHexMesh.
@@ -6953,11 +7444,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if backend.kind == "wsl" and self.panel_run.chk_native.isChecked():
             try:
                 self.log.push(tr("Copying the case to the native WSL file system…"))
-                native_dir = be.sync_to_wsl(backend, self.case_dir, self.cfg.name)
+                native_dir = be.sync_to_wsl(backend, self.case_dir, self.cfg.name,
+                                            own=same_folder)
                 self.log.push(f"→ {native_dir}")
             except Exception as exc:
                 QtWidgets.QMessageBox.critical(self, tr("Copy failed"), str(exc))
-                return
+                return False
         elif backend.kind == "ssh":
             # Для сервера це не вибір, а обовʼязок: шляху Windows на тому
             # боці не існує, тож рахувати «на місці» там нема де.
@@ -6970,8 +7462,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 # встигав намалюватися.
                 native_dir = self._off_thread(
                     tr("Uploading the case to {host}…", host=backend.host),
-                    lambda: be.sync_to_ssh(backend, case_dir, name))
+                    lambda: be.sync_to_ssh(backend, case_dir, name,
+                                           own=same_folder))
                 self.log.push(f"→ {backend.host}:{native_dir}")
+                # The exact folder of this run on the server (T43).
+                try:
+                    lib.set_server(case_dir, backend.host, native_dir)
+                except OSError:
+                    pass
                 if dist_hosts:
                     err = self._off_thread(tr("Putting foamdist on the server…"),
                                            lambda: be.ensure_foamdist(backend))
@@ -6994,38 +7492,68 @@ class MainWindow(QtWidgets.QMainWindow):
             remesh = remesh and not self._pmesh.active
         # Сітка є тут (з проєкту чи з минулого прогону), а там, де рахуємо,
         # — ні: вивантажуємо. Це хвилини проти десятка хвилин snappy.
-        if mkey and not remesh and be.local_mesh_dir(mkey) is not None:
+        # The same rule as the queue and `ofs`: be.ensure_remote_mesh (T51).
+        if mkey and not remesh:
             try:
-                if not be.remote_mesh_exists(backend, mkey):
-                    err = self._off_thread(
-                        tr("Uploading the saved mesh…"),
-                        lambda: be.push_mesh(backend, mkey))
+                err = self._off_thread(
+                    tr("Uploading the saved mesh…"),
+                    lambda: be.ensure_remote_mesh(backend, mkey))
+                if err is not None:
                     self.log.push(err or tr("Mesh {mkey} uploaded — no "
                                             "need to build it.", mkey=mkey))
             except Exception as exc:                      # noqa: BLE001
                 self.log.push(tr("Mesh not uploaded, building it: {exc}", exc=exc))
-        steps = be.build_steps(
-            self.cfg.solver.n_procs, backend,
-            # Не solver.potential_init, а похідне від нього: у стисливому
-            # режимі potentialFoam не годиться, хоч би що стояло в галочці.
-            self.cfg.use_potential_init, self.cfg.solver.run_check_mesh,
-            two_stage=self.cfg.solver.two_stage,
-            solver=fc.solver_name(self.cfg),
-            topo_set=self.cfg.needs_topo_set,
-            warm=(fc.SOLVER_OF[(self.cfg.flow.regime, True)]
-                  if self.cfg.warm_start else ""),
-            dist=(be.dist_command(dist_hosts,
-                                  self.panel_run.ed_dist_key.text().strip(),
-                                  self.panel_run.ed_dist_user.text().strip(),
+        # The steps: the same function for «Run», the queue and `ofs` (T46).
+        dist_key = self.panel_run.ed_dist_key.text().strip()
+        dist_user = self.panel_run.ed_dist_user.text().strip()
+        steps = fq.run_steps(
+            self.cfg, backend,
+            dist=(be.dist_command(dist_hosts, dist_key, dist_user,
                                   self.panel_run.ed_dist_net.text().strip())
                   if dist_hosts else ""),
             mesh_key=mkey, remesh=remesh)
+        if pre:
+            steps = prerun.prerun_steps(steps, self.cfg)
         # «Перебудувати» — на один запуск; посеред серії лишається до кінця
         # серії, щоб кожен кут збудував свою.
         if remesh and self._series is None:
             self.panel_run.chk_remesh.setChecked(False)
 
+        ctx = self._queue_ctx
+        if ctx is not None:
+            # T46: a job for the queue on the server. The script is put next
+            # to the case; the queue starts it later.
+            case_dir, name = self.case_dir, self.cfg.name
+            stop_bad = self.cfg.solver.stop_on_bad_mesh
+            nodes = (fq.dist_nodes(dist_hosts, dist_key, dist_user)
+                     if dist_hosts else [])
+            try:
+                self._queued_job = self._off_thread(
+                    tr("Putting the run script on {host}…", host=backend.host),
+                    lambda: fq.script_job(
+                        backend, native_dir, steps, name=name,
+                        case_dir=case_dir, queue=ctx["queue"],
+                        stop_on_bad_mesh=stop_bad,
+                        series=ctx.get("series", ""),
+                        not_before=ctx.get("not_before", 0.0), nodes=nodes,
+                        meta=ctx.get("meta")))
+            except Exception as exc:                      # noqa: BLE001
+                self._laptop("")
+                QtWidgets.QMessageBox.critical(
+                    self, tr("Could not upload to the server"), str(exc))
+                return False
+            self._laptop("")
+            if getattr(self, "_run_note", ""):
+                self.log.push(self._run_note)
+                self._run_note = ""
+            return True
+
         self.log.clear_log()
+        if getattr(self, "_run_note", ""):
+            self.log.push(self._run_note)       # T43: the new folder
+            self._run_note = ""
+        if pre:
+            self.log.push(prerun.start_text(self.cfg))
         if mkey:
             self.log.push(tr("Mesh key: {mkey}{v}", mkey=mkey, v=" (rebuild)" if remesh else ""))
         self.log.push(mem_fit.details())
@@ -7074,6 +7602,11 @@ class MainWindow(QtWidgets.QMainWindow):
             _text, _bg, fg, short = got
             self.lbl_detached.setText(short)
             self.lbl_detached.setStyleSheet(f"color:{fg}; font-weight:600;")
+        # The tooltip of THIS state: the status bar said «getting the
+        # results back» with the tooltip «the upload is complete, turn off
+        # the laptop» (T49).
+        self.lbl_detached.setToolTip(
+            self.panel_run.LAPTOP_TIPS.get(state, "") if got else "")
         self.lbl_detached.setVisible(bool(got))
         QtWidgets.QApplication.processEvents()
 
@@ -7082,12 +7615,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _run_event(self, name: str, value: str = "") -> None:
         """An event of the run (RunWorker.event): no log text to compare."""
+        # T44: "fetch" (the run ended, the download starts) and "link"
+        # (the connection to the server is lost / back).
+        self.run_guard.run_event(name, value)
         if name == "detached":
             self._laptop("free")
             self.statusBar().showMessage(
                 tr("The run is detached on the server — you can turn off the laptop."), 15000)
-        elif name == "fetch" and self.panel_run.laptop_state() == "free":
+        elif name == "fetch" and (self.panel_run.laptop_state() == "free"
+                                  or self._follows_server_run()):
+            # The results come from a server: keep the laptop on. A copy
+            # back from WSL is on this computer: no indicator.
             self._laptop("fetch")
+
+    def _follows_server_run(self) -> bool:
+        w = self.worker
+        busy = self.thread is not None and self.thread.isRunning()
+        return bool(busy and w is not None
+                    and getattr(getattr(w, "backend", None), "kind", "")
+                    == "ssh")
 
     def _memory_gate(self) -> bool:
         """Пропускає прогін далі або пропонує його полагодити.
@@ -7198,6 +7744,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_run.set_running(False)
         self.panel_run.progress.setValue(self.panel_run.progress.maximum())
         self.panel_run.progress.setFormat(tr("done") if ok else tr("error"))
+        if self._prerun_phase == "pre":
+            if self.thread:
+                self.thread.quit()
+                self.thread.wait(4000)
+            self._prerun_finished(ok, msg)
+            return
 
         runner = self.worker.runner if self.worker else None
         soft = getattr(runner, "soft_result", "") if ok else ""
@@ -7279,12 +7831,23 @@ class MainWindow(QtWidgets.QMainWindow):
         elif ok:
             self.load_results()
             self.tabs_right.setCurrentWidget(self.results_view)
+        # A download from a server takes only the last time: offer the other
+        # times of the run (T40).
+        w = self.worker
+        wb = getattr(w, "backend", None)
+        if (ok and w is not None and getattr(wb, "kind", "") == "ssh"
+                and getattr(w, "native_dir", "")):
+            self._offer_more_times(
+                wb, getattr(w, "case_dir", "") or self.case_dir,
+                w.native_dir)
         if pending_fix is not None:
             self._offer_layer_fix(pending_fix, parts)
         if self._series is not None:
             self._series_after_run(
                 ok, msg, (self.worker.case_dir if self.worker else "")
                 or self.case_dir or "")
+        # T44: a notification (not for each angle of a series).
+        self.run_guard.run_done(ok, msg)
 
     def record_run(self, ok: bool, msg: str, st) -> None:
         """Дописує прогін у маніфест кейсу — це те, що потім видно в
@@ -7301,6 +7864,11 @@ class MainWindow(QtWidgets.QMainWindow):
             coeffs = post.summarise_coeffs(be.read_force_coeffs(case_dir))
         except OSError:
             coeffs = {}
+        # The folder of this run on the server (T43, be.run_server_dir).
+        wb = getattr(self.worker, "backend", None) if self.worker else None
+        server = ({"host": wb.host, "dir": self.worker.native_dir}
+                  if wb is not None and wb.kind == "ssh"
+                  and getattr(self.worker, "native_dir", "") else None)
         try:
             lib.record_run(
                 case_dir, ok=ok,
@@ -7317,6 +7885,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 backend=f"{backend.label} {backend.version}" if backend else "",
                 backend_id=backend.id if backend else "",
                 layers=st.layer_coverage if st else -1.0,
+                server=server,
                 note="" if ok else msg.strip().splitlines()[-1][:200])
         except (OSError, IndexError):
             pass
@@ -7328,6 +7897,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._series is not None:
             self._series.stopped = True
         if self.worker:
+            self.run_guard.user_stopped()
             self.panel_run.lbl_status.setText("Stopping…")
             self.worker.stop()
 
@@ -7348,8 +7918,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_run.btn_soft_stop.setEnabled(False)
         self.panel_run.lbl_status.setText(tr("Stopping with time step: {why}.", why=why))
 
-    _LAYER_FIELDS = ("add_layers", "n_layers", "expansion", "final_layer_rel",
-                     "min_thickness_rel")
+    _LAYER_FIELDS = adv.LAYER_FIX_FIELDS
 
     def _run_cfg(self) -> "fc.CaseCfg | None":
         """The settings of the run that has just ended (T38).
@@ -7432,10 +8001,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # as the locked fields ask.
         if not self.mesh_guard(tr("Repair Layers")):
             return
+        stack_before = (self.cfg.mesh.n_layers, self.cfg.mesh.expansion,
+                        self.cfg.mesh.final_layer_rel)
         adv.apply_layer_fix(self.cfg, diagnosis)
         # A layer fix from the last run is a hand choice: auto y+ must not
-        # undo it on the next change.
-        self.cfg.mesh.yplus_auto = False
+        # undo it on the next change. A wall-resolved fix keeps the stack
+        # (coverage knobs only), so auto y+ stays as it was.
+        if stack_before != (self.cfg.mesh.n_layers, self.cfg.mesh.expansion,
+                            self.cfg.mesh.final_layer_rel):
+            self.cfg.mesh.yplus_auto = False
         self.reload_panels()
         self.refresh_all()
         self.panel_run.show_layer_fix(None)
@@ -7464,7 +8038,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if procs and fa.time_dirs(str(procs[0])):
             return (tr("The results are in processor*/ and are not "
                     "reconstructed yet. Reconstruct them: reconstructPar "
-                    "(or the “Animation” bar → “Reconstruct…”)."))
+                    "(or the timeline → “Reconstruct…”)."))
         runs = (lib.read_manifest(self.case_dir) or {}).get("runs") or []
         last = runs[-1] if runs else None
         if last and not last.get("ok"):
@@ -7480,8 +8054,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.case_dir or not os.path.isdir(self.case_dir):
             return
         if not post.has_results(self.case_dir):
+            # Only the surfaces of the run («surfaces only» download, T40):
+            # show them.
+            if len(ftl.surface_folders(self.case_dir)) >= 1:
+                self._timeline_source("surf")
+                return
             self.lbl_coeffs.setText(self._no_results_text())
             return
+        self._source = "full"
         try:
             self.results = post.Results(self.case_dir, self.cfg.name)
             self._wall = ()            # поля стінки — від старого читача
@@ -7567,7 +8147,7 @@ class MainWindow(QtWidgets.QMainWindow):
                    "“cells/points do not match” on such time "
                    "directories. Remove them with the “Free up space” "
                    "button on the “Saved” tab.", text=fs_i18n.shown(self.lbl_coeffs), join=", ".join("%g" % t for t in stale), cells=phys.fmt_cells(cells)))
-        self._anim_fill()
+        self._timeline_fill(times)
         self.draw_results()
 
     # --- проміжний результат прогону, що йде (fs_live, fs_livebar) ---------
@@ -7594,8 +8174,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 tr("The intermediate result belongs to a different case: {case}",
                    case=case_dir), 10000)
             return
-        if self._anim is not None:
-            self._anim_stop(redraw=False)
+        self._anim_stop(redraw=False)
         self.results = results
         self._wall = ()
         self.cmb_time.blockSignals(True)
@@ -7603,6 +8182,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_time.addItems([f"{t:g}" for t in results.times])
         self.cmb_time.setCurrentText(f"{lt.time:g}")
         self.cmb_time.blockSignals(False)
+        # The live times join the timeline (the times that the live bar
+        # downloaded and keeps in its cache).
+        self._timeline_fill(list(results.times), lt.time)
         self.slice_bar.setEnabled(True)
         self.lbl_coeffs.setText(fs_livebar.banner(
             lt, bool(self._rcfg.solver.steady)))
@@ -7610,85 +8192,247 @@ class MainWindow(QtWidgets.QMainWindow):
         if explicit:
             self.tabs_right.setCurrentWidget(self.results_view)
 
-    # --- анімація нестаціонарного розвʼязку (fs_anim, fs_animbar) ----------
+    # --- timeline and the frames of the player (T40: fs_timebar, fs_anim) ----
+    #
+    # The timeline lists the times of the view (self.results.times; the rows
+    # of the hidden cmb_time are the same times). Each interaction with the
+    # timeline (scrub, step, play) shows FAST frames: the geometry of the
+    # body and of the slice once, then only the values of each time
+    # (update_scalars on the GPU). The frames load in the background
+    # (fs_player), the frame on the screen first. «Full View» (or a change
+    # of the view: a layer, the slice on or off) draws the full view of the
+    # current time again.
 
-    def _anim_fill(self) -> None:
-        """Моменти, які можна анімувати, — у смугу анімації.
+    def _timeline_fill(self, times=None, current: float | None = None) -> None:
+        """The times of the view → the timeline, and what the case has."""
+        if times is None:
+            times = list(self.results.times) if self.results is not None else []
+        self._tl_times = [float(t) for t in times]
+        if current is None:
+            i = self.cmb_time.currentIndex()
+            current = self._tl_times[i] if 0 <= i < len(self._tl_times) else None
+        self.time_bar.set_times(self._tl_times, current)
+        entries = ftl.case_times(self.case_dir) if self.case_dir else []
+        self.time_bar.set_missing(len(self._missing_times(entries)))
+        self.time_bar.set_sources(sum(e.full for e in entries),
+                                  sum(e.surf for e in entries), self._source)
 
-        `missing` — моменти, що лежать лише в processor*/: паралельний прогін
-        збирає в корінь кейсу тільки останній (reconstructPar -latestTime).
-        """
-        case = self.case_dir
-        if not case or not os.path.isdir(case):
-            self.anim_bar.set_times([])
-            return
-        times = fa.time_dirs(case)
-        missing = []
-        proc = Path(case) / "processor0"
-        if proc.is_dir():
-            have = set(times)
-            missing = [t for t in fa.time_dirs(str(proc)) if t not in have]
-        self.anim_bar.set_times(times, missing)
+    def _missing_times(self, entries=None) -> list[str]:
+        """Times that are only in processor*/ of the local case."""
+        if not self.case_dir:
+            return []
+        if entries is None:
+            entries = ftl.case_times(self.case_dir)
+        return [e.name for e in entries if e.proc and not e.full]
 
-    def _anim_prepare(self, d: dict) -> None:
-        if self.results is None or not self.case_dir:
-            return
-        times = d["times"]
-        if len(times) < 2:
-            QtWidgets.QMessageBox.information(
-                self, tr("Too few frames"),
-                tr("The animation needs at least two time steps."))
-            return
-        if not (d["body_fields"] and d["body"]) and not (
-                d["slice_fields"] and d["slice"]) and not d["streams"]:
-            QtWidgets.QMessageBox.information(
-                self, tr("Nothing to animate"),
-                tr("Select what to animate (body, slice, lines) and at "
-                "least one field for them."))
-            return
-        import fs_fast
-        plan = fa.Plan(
-            self.case_dir, times, [b.name for b in self.cfg.body_patches],
-            body_fields=d["body_fields"] if d["body"] else [],
-            slice_fields=d["slice_fields"] if d["slice"] else [],
-            body=d["body"], slice=d["slice"], streams=d["streams"],
-            moving=d["moving"], axis=self.slice_bar.axis(),
-            pos=self.slice_bar.position() if self.slice_bar.is_on() else None)
-        n_cells = fs_fast.n_cells(self.case_dir, times[0]) or 1_000_000
-        est = fa.estimate_bytes(plan, n_cells, int(2 * n_cells ** (2 / 3)),
-                                int(n_cells ** (2 / 3)))
-        if est > 2e9:
-            answer = QtWidgets.QMessageBox.question(
-                self, tr("A lot of memory"),
-                tr("The frames will take about {v:.1f} GB of memory "
-                   "({n_times} frames). Make the interval shorter, take "
-                   "every second frame, or clear “moving "
-                   "slice”.\n\nPrepare them anyway?", v=est / 1e9, n_times=len(times)))
-            if answer != QtWidgets.QMessageBox.Yes:
-                return
+    def _timeline_source(self, kind: str) -> None:
+        """«Data»: the full fields of the case or the run surfaces."""
+        self._source = "surf" if kind == "surf" else "full"
         self._anim_stop(redraw=False)
-        fs = fv.Freestream.from_flow(self.cfg.flow)
-        rotors = [fv.Rotor.from_zone(z) for z in self.cfg.rotating]
-        results = self.results
-        try:
-            frames = self._off_thread(
-                tr("Preparing {n_times} animation frames…", n_times=len(times)),
-                lambda: fa.prepare(plan, results, fs, rotors=rotors),
-                n_cells * len(times))
-        except Exception as exc:                          # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, tr("Frames not prepared"),
-                                           str(exc))
+        if self._source == "full":
+            self.load_results()
             return
-        self._anim = frames
-        self._anim_i = 0
-        self.anim_bar.show_ready(frames)
-        self._anim_keys = (self.anim_bar.cmb_body.currentData() or "",
-                           self.anim_bar.cmb_slice.currentData() or "")
-        self._anim_build(keep_camera=True)
-        self._anim_show(0)
-        self.log.push(
-            tr("Animation: {n} frames ({times:g}…{times2:g} s), {v:.0f} "
-               "MB, {v2}.", n=frames.n, times=frames.times[0], times2=frames.times[-1], v=frames.nbytes() / 1e6, v2="directly from files" if frames.fast else "via VTK"))
+        try:
+            res = ftl.surface_results(self.case_dir, cfg=self._rcfg)
+        except Exception as exc:                          # noqa: BLE001
+            self.lbl_coeffs.setText(tr("Could not read the case: {exc}", exc=exc))
+            return
+        if not res.times:
+            return
+        self.results = res
+        self._wall = ()
+        self.cmb_time.blockSignals(True)
+        self.cmb_time.clear()
+        self.cmb_time.addItems([f"{t:g}" for t in res.times])
+        self.cmb_time.setCurrentIndex(len(res.times) - 1)
+        self.cmb_time.blockSignals(False)
+        self._timeline_fill(res.times, res.times[-1])
+        self.slice_bar.setEnabled(True)
+        self.draw_results()
+
+    def _timeline_seek(self, i: int) -> None:
+        """The person went to frame i: the slider, a step, first or last."""
+        if not (0 <= i < len(self._tl_times)):
+            return
+        self.cmb_time.blockSignals(True)
+        self.cmb_time.setCurrentIndex(i)
+        self.cmb_time.blockSignals(False)
+        if not self._frames_on():
+            return
+        self._frames_show_or_wait(i)
+
+    def _view_keys(self) -> tuple:
+        """What the frames show, from the view: (body, slice, lines, moving)."""
+        f = self.cmb_field.currentText()
+        body = {"Cp": "cp", "p": "dp", "yPlus": "yplus",
+                "wallShearStress": "tau"}.get(f, "cp")
+        sl = ""
+        if self.slice_bar.is_on():
+            k = self.slice_bar.field()
+            sl = k if k in fa.SLICE_KEYS else "dU"
+        tb = self.time_bar
+        streams = self.slice_bar.streams_on() and tb.act_streams.isChecked()
+        moving = bool(sl) and tb.act_moving.isChecked()
+        return (body, sl, bool(streams), bool(moving))
+
+    def _frames_on(self) -> bool:
+        """Frame mode for the current view. False: there is nothing to show."""
+        if self.results is None or not self.case_dir or not self._tl_times:
+            return False
+        keys = self._view_keys()
+        if self._frames_plan == keys:
+            return True
+        return self._frames_start(keys)
+
+    def _time_names(self, live: bool) -> list[str]:
+        """Folder names of the timeline times (the fast reader needs them)."""
+        names = {}
+        if not live:
+            for e in ftl.case_times(self.case_dir):
+                if e.full:
+                    names[f"{e.time:.12g}"] = e.name
+        return [names.get(f"{t:.12g}", f"{t:.12g}") for t in self._tl_times]
+
+    def _frames_start(self, keys: tuple) -> bool:
+        body, sl, streams, moving = keys
+        live = bool(getattr(self.results, "live", False))
+        names = self._time_names(live)
+        cfg = self._rcfg
+        axis = 1 if live else self.slice_bar.axis()
+        pos = None if live or not sl else self.slice_bar.position()
+        plan = fa.Plan(self.case_dir, names, [b.name for b in cfg.body_patches],
+                       body_fields=[body] if body else [],
+                       slice_fields=[sl] if sl else [], body=bool(body),
+                       slice=bool(sl), streams=streams, moving=moving,
+                       axis=axis, pos=pos)
+        if moving:
+            import fs_fast
+            n_cells = fs_fast.n_cells(self.case_dir, names[0]) or 1_000_000
+            est = fa.estimate_bytes(plan, n_cells, int(2 * n_cells ** (2 / 3)),
+                                    int(n_cells ** (2 / 3)))
+            if est > 2e9:
+                answer = QtWidgets.QMessageBox.question(
+                    self, tr("A lot of memory"),
+                    tr("The frames will take about {v:.1f} GB of memory "
+                       "({n_times} frames). Clear “moving slice” in the "
+                       "frame options (⚙).\n\nLoad them anyway?",
+                       v=est / 1e9, n_times=len(names)))
+                if answer != QtWidgets.QMessageBox.Yes:
+                    self.time_bar.act_moving.setChecked(False)
+                    return False
+        here = os.path.normcase(str(self.case_dir))
+        if here != self._frames_case:
+            self._frames_cache.clear()
+            self._frames_case = here
+        geom = (tuple(names), axis, pos, live, moving, streams,
+                tuple(plan.walls))
+        old = self._frames_ld
+        reuse = None
+        if (old is not None and old.frames.fast and not live
+                and getattr(self, "_frames_geom", None) == geom):
+            reuse = old.refield(plan.body_fields, plan.slice_fields)
+        fs = fv.Freestream.from_flow(cfg.flow)
+        rotors = [fv.Rotor.from_zone(z) for z in cfg.rotating]
+        cache = self._frames_cache
+        if reuse is not None:
+            make = (lambda r=reuse: r)
+        else:
+            # Own reader for the thread: the window reads self.results.
+            if live:
+                src = self.results
+                results = fs_live.LiveResults(src.folders, src.info, src.cfg)
+            else:
+                results = post.Results(self.case_dir, self.cfg.name)
+            make = (lambda: fa.Loader(plan, results, fs, rotors=rotors,
+                                      force_vtk=live, cache=cache))
+        self._frame_loader.stop()
+        self._anim_timer_hold = False
+        self._frames_ld = None
+        self._anim = None
+        self._anim_built = False
+        self._frames_final = False
+        self._frames_plan = keys
+        self._frames_geom = geom
+        self._anim_keys = (body, sl)
+        self.time_bar.set_frame_mode(True)
+        self.time_bar.set_progress(0, len(names))
+        self._frame_loader.start(make)
+        return True
+
+    def _frames_ready(self, ld) -> None:
+        """The geometry is here: load the frames, the current one first."""
+        self._frames_ld = ld
+        self._anim = ld.frames
+        for note in ld.frames.notes:
+            self.log.push(tr("Timeline: {note}", note=note))
+        self._frames_want()
+
+    def _frames_want(self) -> None:
+        ld = self._frames_ld
+        if ld is not None:
+            self._frame_loader.want(self.time_bar.timeline.load_order(ld.done))
+        self._frames_progress()
+
+    def _frames_progress(self) -> None:
+        ld = self._frames_ld
+        n = len(self._tl_times)
+        self.time_bar.set_progress(len(ld.done) if ld is not None else 0, n)
+
+    def _frame_loaded(self, i: int) -> None:
+        fr, ld = self._anim, self._frames_ld
+        if fr is None or ld is None:
+            return
+        cur = self.time_bar.timeline.index
+        if not self._anim_built:
+            # Scale limits from the frames that are here; when all frames
+            # are here, the common limits of all (one rebuild).
+            fa.set_limits(fr)
+            self._drop_scene()
+            self._anim_build(keep_camera=True)
+            self._anim_built = True
+            self._anim_show(i if cur not in ld.done else cur)
+        elif len(ld.done) == fr.n and not self._frames_final:
+            old = dict(fr.limits)
+            fa.set_limits(fr)
+            self._frames_final = True
+            if fr.limits != old:
+                self._anim_build(keep_camera=True)
+                self._anim_show(self._anim_i if self._anim_i in ld.done else i)
+        if i == cur:
+            self._anim_show(i)
+        self._frames_progress()
+
+    def _frames_failed(self, msg: str) -> None:
+        self.log.push(tr("Timeline: the frames could not be loaded: {msg}",
+                         msg=msg))
+        self.statusBar().showMessage(
+            tr("Frames not loaded: {msg}", msg=msg[:200]), 12000)
+        self._anim_stop(redraw=self._anim_built)
+
+    def _frames_show_or_wait(self, i: int) -> None:
+        ld = self._frames_ld
+        if ld is not None and self._anim_built and i in ld.done:
+            self._anim_show(i)
+        else:
+            self._frames_want()
+
+    def _frames_options(self) -> None:
+        """⚙: lines in the frames or a moving slice changed."""
+        if self._frames_plan is not None:
+            self._frames_start(self._view_keys())
+
+    def _frames_view_changed(self, *_args) -> None:
+        """The slice field or axis changed while the player shows frames."""
+        if self._frames_plan is not None and self._frames_plan != self._view_keys():
+            self._frames_start(self._view_keys())
+
+    def _field_changed(self) -> None:
+        """«Field on Body»: in frame mode the frames change the field (the
+        values of a field loaded once stay in the cache); else a new view."""
+        if self._frames_plan is not None:
+            self._frames_start(self._view_keys())
+            return
+        self.draw_results()
 
     def _anim_build(self, keep_camera: bool = True) -> None:
         """Актори анімації з першого кадру. Далі кадри лише міняють масиви."""
@@ -7705,7 +8449,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if fr.body is not None:
             m = fr.body.copy()
             m.cell_data[fa.ANIM] = np.zeros(m.n_cells, np.float32)
-            if bkey:
+            if bkey and bkey in fr.body_vals:
                 title, sym = fa.BODY_FIELDS[bkey]
                 act = pl.add_mesh(
                     m, scalars=fa.ANIM, preference="cell",
@@ -7720,9 +8464,12 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 act = pl.add_mesh(m, color="#c8ccd0", smooth_shading=False)
             self._anim_actors["body"], self._anim_meshes["body"] = act, m
-        if skey and fr.slices:
+        first = fr.slice_at(0) if fr.slices else None
+        if first is None and fr.slices:
+            first = next((s for s in fr.slices if s is not None), None)
+        if skey and first is not None and skey in fr.slice_vals:
             spec = fv.spec_by_key(skey)
-            sl = fr.slice_at(0).copy()
+            sl = first.copy()
             sl.cell_data[fa.ANIM] = np.zeros(sl.n_cells, np.float32)
             act = pl.add_mesh(
                 sl, scalars=fa.ANIM, preference="cell",
@@ -7734,7 +8481,8 @@ class MainWindow(QtWidgets.QMainWindow):
             fv.style_bar(bars[spec.label] if spec.label in bars.keys() else None)
             self._anim_actors["slice"], self._anim_meshes["slice"] = act, sl
         if fr.streams:
-            first = next((s for s in fr.streams if s.n_points), None)
+            first = next((s for s in fr.streams if s is not None and s.n_points),
+                         None)
             if first is not None:
                 act = pl.add_mesh(first.copy(), scalars=fa.ANIM, cmap="turbo",
                                   clim=fr.limits.get("streams", (0.0, 1.0)),
@@ -7749,34 +8497,42 @@ class MainWindow(QtWidgets.QMainWindow):
     def _anim_show(self, i: int) -> None:
         """Показати кадр i: лише підставити готові масиви в актори."""
         fr = self._anim
+        ld = self._frames_ld
         if fr is None or not (0 <= i < fr.n):
+            return
+        if ld is not None and i not in ld.done:
             return
         self._anim_i = i
         bkey, skey = self._anim_keys
         m = self._anim_meshes.get("body")
-        if m is not None and bkey:
+        if m is not None and bkey in fr.body_vals:
             v = fr.body_vals[bkey][i]
             self._anim_values("body", m, v if v is not None else
                               np.full(m.n_cells, np.nan, np.float32))
         act = self._anim_actors.get("slice")
-        if act is not None and skey:
+        if act is not None and skey in fr.slice_vals:
             v = fr.slice_vals[skey][i]
             if len(fr.slices) > 1:
                 # Сітка рухається: у кожного кадру своя геометрія зрізу.
-                sl = fr.slices[i].copy()
-                sl.cell_data[fa.ANIM] = (v if v is not None else
-                                         np.full(sl.n_cells, np.nan, np.float32))
-                act.mapper.SetInputData(sl)
-                self._anim_meshes["slice"] = sl
+                if fr.slices[i] is not None:
+                    sl = fr.slices[i].copy()
+                    sl.cell_data[fa.ANIM] = (
+                        v if v is not None else
+                        np.full(sl.n_cells, np.nan, np.float32))
+                    act.mapper.SetInputData(sl)
+                    self._anim_meshes["slice"] = sl
             else:
                 sl = self._anim_meshes["slice"]
                 self._anim_values("slice", sl, v if v is not None else
                                   np.full(sl.n_cells, np.nan, np.float32))
         act = self._anim_actors.get("streams")
-        if act is not None and fr.streams:
+        if act is not None and fr.streams and fr.streams[i] is not None:
             act.mapper.SetInputData(fr.streams[i])
         self.res_plotter.render()
-        self.anim_bar.show_frame(i, fr.times[i])
+        self.time_bar.set_index(i)
+        self.cmb_time.blockSignals(True)
+        self.cmb_time.setCurrentIndex(i)
+        self.cmb_time.blockSignals(False)
 
     def _anim_values(self, key: str, mesh, values) -> None:
         """Нові значення кадру в актор `key`. foamview (fs_view3d) кладе на
@@ -7790,31 +8546,35 @@ class MainWindow(QtWidgets.QMainWindow):
             mesh.Modified()
 
     def _anim_tick(self) -> None:
-        fr = self._anim
-        if fr is None:
-            self._anim_timer.stop()
+        tl = self.time_bar.timeline
+        ld = self._frames_ld
+        n = len(tl)
+        if not n:
+            self._anim_play(False)
             return
-        nxt = self._anim_i + 1
-        if nxt >= fr.n:
-            if not self.anim_bar.chk_loop.isChecked():
-                self.anim_bar.btn_play.setChecked(False)
+        nxt = tl.index + 1
+        if nxt >= n:
+            if not tl.loop:
+                self.time_bar.set_playing(False)
+                self._anim_timer.stop()
                 return
             nxt = 0
+        if ld is None or not self._anim_built or nxt not in ld.done:
+            # The next frame is not here yet: wait for it (it loads next).
+            self._frames_want()
+            return
+        tl.go(nxt)
         self._anim_show(nxt)
+        self._frames_want()
 
     def _anim_play(self, on: bool) -> None:
-        if on and self._anim is not None:
-            self._anim_timer.start(max(int(1000 / self.anim_bar.spin_fps.value()),
-                                       15))
+        if on and len(self._tl_times) >= 2 and self._frames_on():
+            self.time_bar.set_playing(True)
+            self._anim_timer.start(self.time_bar.timeline.interval_ms())
+            self._frames_want()
         else:
             self._anim_timer.stop()
-
-    def _anim_fields(self, body_key: str, slice_key: str) -> None:
-        if self._anim is None:
-            return
-        self._anim_keys = (body_key, slice_key)
-        self._anim_build(keep_camera=True)
-        self._anim_show(self._anim_i)
+            self.time_bar.set_playing(False)
 
     def _anim_slice_moved(self, pos: float) -> None:
         """Рухомий зріз (Q35b): пересунути площину без нового читання."""
@@ -7830,8 +8590,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _anim_export(self) -> None:
         """GIF з поточного ракурсу: кадр за кадром, як на екрані."""
-        fr = self._anim
-        if fr is None:
+        if not self._frames_on():
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, tr("Save Animation"), str(Path(self.case_dir or ".")
@@ -7839,8 +8598,24 @@ class MainWindow(QtWidgets.QMainWindow):
             "GIF (*.gif)")
         if not path:
             return
+        self._anim_play(False)
+        # All frames first (the loader of the player can still be busy:
+        # wait for it with the busy dialog).
+        progress = QtWidgets.QProgressDialog("Loading frames…", "", 0, 0, self)
+        progress.setCancelButton(None)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        while (self._frames_ld is None or len(self._frames_ld.done)
+               < len(self._tl_times)):
+            if self._frames_plan is None:
+                _drop_progress(progress)
+                return
+            self._frames_want()
+            QtWidgets.QApplication.processEvents(
+                QtCore.QEventLoop.AllEvents, 100)
+            time.sleep(0.02)
+        _drop_progress(progress)
+        fr = self._anim
         from PIL import Image
-        self.anim_bar.btn_play.setChecked(False)
         keep = self._anim_i
         shots = []
         progress = QtWidgets.QProgressDialog("Writing frames…", "", 0, fr.n, self)
@@ -7854,7 +8629,7 @@ class MainWindow(QtWidgets.QMainWindow):
             progress.setValue(i + 1)
             QtWidgets.QApplication.processEvents()
         _drop_progress(progress)
-        delay = int(1000 / self.anim_bar.spin_fps.value())
+        delay = self.time_bar.timeline.interval_ms()
         shots[0].save(path, save_all=True, append_images=shots[1:],
                       duration=delay, loop=0, optimize=False)
         self._anim_show(keep)
@@ -7862,11 +8637,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(tr("GIF saved: {name}", name=Path(path).name), 8000)
 
     def _anim_stop(self, redraw: bool = True) -> None:
+        """Back from the frames to the full view of the current time."""
         self._anim_timer.stop()
-        was = self._anim is not None
+        was = self._anim is not None or self._frames_plan is not None
+        self._frame_loader.stop()
         self._anim = None
+        self._frames_ld = None
+        self._frames_plan = None
+        self._anim_built = False
         self._anim_actors, self._anim_meshes = {}, {}
-        self.anim_bar.reset_player()
+        tb = self.time_bar
+        tb.set_playing(False)
+        tb.set_frame_mode(False)
+        tb.set_progress(0, 0)
         if redraw and was:
             self.draw_results()
 
@@ -7880,11 +8663,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, tr("No place to reconstruct"),
                 tr("The time steps of a parallel run are reconstructed "
                 "where the processor*/ folders of this case are — on a "
-                "local backend (WSL, Docker). For a server, reconstruct "
-                "them there: reconstructPar -time …"))
+                "local backend (WSL, Docker). For a run on a server, use "
+                "“Times from Server…”: the server reconstructs them."))
             return
         import subprocess
-        cmd = "reconstructPar -time '" + ",".join(times) + "'"
+        cmd = "reconstructPar -newTimes -time '" + ",".join(times) + "'"
         argv = backend.shell(self.case_dir, cmd)
         try:
             proc = self._off_thread(
@@ -7899,7 +8682,105 @@ class MainWindow(QtWidgets.QMainWindow):
         tail = (proc.stdout or b"")[-600:].decode("utf-8", "replace")
         self.log.push(tr("reconstructPar ({n_times} time steps): code "
                          "{returncode}. {strip}", n_times=len(times), returncode=proc.returncode, strip=tail.strip()[-300:]))
-        self._anim_fill()
+        self.load_results()
+
+    # --- all times from the server (T40, fs_servertimes, fs_timesdlg) -------
+
+    def times_from_server(self, backend=None, listing=None,
+                          remote: str = "") -> None:
+        """«Times from Server…»: list the times of the run, then download
+        «everything not here», a range «from … to …» or a selection.
+
+        The run folder: fs_servertimes.run_folder (the folder of the last run
+        of this case that the window knows, else the name rule).
+        """
+        if not self.case_dir:
+            return
+        backend = backend or self._ssh_backend_or_complain()
+        if backend is None:
+            return
+        remote = remote or fst.run_folder(
+            self.case_dir, self._run_folders.get(
+                os.path.normcase(str(self.case_dir)), ""))
+        if listing is None:
+            try:
+                listing = self._off_thread(
+                    tr("Asking {host} which times the run wrote…",
+                       host=backend.host),
+                    lambda: fst.list_times(backend, remote), BIG_MESH)
+            except Exception as exc:                      # noqa: BLE001
+                listing = fst.Listing(ok=False, why=str(exc))
+        if not listing.ok or not listing.times:
+            QtWidgets.QMessageBox.information(
+                self, tr("Times on the Server"),
+                tr("No times of this case on {host} ({remote}): {why}",
+                   host=backend.host, remote=remote,
+                   why=listing.why or tr("the run wrote no time")))
+            return
+        dlg = fs_timesdlg.TimesDialog(self, backend, self.case_dir, remote,
+                                      listing)
+        if dlg.exec() != QtWidgets.QDialog.Accepted or not dlg.result_info:
+            return
+        self.fetch_bar.hide()
+        self._times_came(dlg.result_info)
+
+    def _times_came(self, got: dict) -> None:
+        """Times came from the server (the dialog or the bar): log, reload."""
+        self.log.push(tr(
+            "Times from the server: {n} times ({mode}), {mb:,.0f} MB in "
+            "{s:.0f} s; reconstructed on the server: {rec}.",
+            n=len(got.get("came", [])),
+            mode={"view": tr("fields for viewing"), "all": tr("all fields"),
+                  "surf": tr("surfaces only")}.get(got.get("mode"), ""),
+            mb=got.get("bytes", 0) / 1e6, s=got.get("seconds", 0.0),
+            rec=len(got.get("reconstructed", []))))
+        self._anim_stop(redraw=False)
+        if got.get("mode") == "surf":
+            self._timeline_source("surf")
+        else:
+            self._source = "full"
+            self.load_results()
+
+    def _offer_more_times(self, backend, case_dir: str, remote: str) -> None:
+        """After a download from the server (it takes only the last time):
+        ask the server for its other times in the background, and offer
+        them in the small bar of the «Results» tab (fs_timesdlg.FetchBar)."""
+        if not case_dir or not remote or backend is None:
+            return
+        self._run_folders[os.path.normcase(str(case_dir))] = remote
+        self._stop_offer_job()
+        job = fs_timesdlg._Job(lambda _say: fst.list_times(backend, remote))
+        th = QtCore.QThread(self)
+        th.setObjectName("times-list")
+        job.moveToThread(th)
+        th.started.connect(job.run)
+
+        def got(listing, exc, case=case_dir):
+            self._stop_offer_job()
+            if (exc is not None or listing is None or not listing.ok
+                    or os.path.normcase(str(self.case_dir or ""))
+                    != os.path.normcase(str(case))):
+                return
+            self.fetch_bar.offer(backend, case, remote, listing)
+
+        # The receiver lives in the window thread (T49). Connected to the
+        # plain function, the answer ran in the «times-list» thread: there
+        # _stop_offer_job() waited on its own thread («QThread::wait: Thread
+        # tried to wait on itself») and FetchBar.offer() made widgets in a
+        # worker thread («QObject::setParent: … in a different thread»).
+        recv = _Receiver(got, self)
+        job.done.connect(recv.take)
+        self._offer_job = (th, job, recv)
+        th.start()
+
+    def _stop_offer_job(self) -> None:
+        th, _job, recv = getattr(self, "_offer_job", None) or (None,) * 3
+        self._offer_job = (None, None, None)
+        if th is not None:
+            th.quit()
+            th.wait(20000)
+        if recv is not None:
+            recv.deleteLater()
 
     def _engine_report(self, stats) -> list[str]:
         """Рядки звіту про двигуни: виміряна сила проти заданої й підсумок.
@@ -8014,7 +8895,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def draw_results(self):
         # Звичайний кадр і анімація ділять один вʼюпорт: що б не
         # перемальовувало вкладку, анімацію спершу зупиняємо.
-        if self._anim is not None:
+        if self._anim is not None or self._frames_plan is not None:
             self._anim_stop(redraw=False)
         if self.results is None or not self.cmb_time.currentText():
             return
@@ -8848,6 +9729,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # From here the window closes (no way back): on_done must not treat
         # the end of the log reading as the end of the run.
         self._closing = True
+        # T44: no more server questions; the tray icon goes away.
+        self.run_guard.stop()
         # Сесію пишемо першою: далі йде зупинка потоків, і якщо щось там
         # піде не так, стан уже на диску.
         try:
@@ -8891,6 +9774,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._fix_thread and self._fix_thread.isRunning():
             self._fix_thread.quit()
             self._fix_thread.wait(10000)
+        # The background loader of the timeline frames (T40).
+        self._anim_timer.stop()
+        self._frame_loader.close()
+        self._stop_offer_job()
+        self.fetch_bar.stop()
         self._drop_scene()
         try:
             self.viewport.plotter.close()

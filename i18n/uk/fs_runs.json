@@ -1,0 +1,7 @@
+{
+ "cannot delete {name} on {host}: {why}": "не вдалося видалити {name} на {host}: {why}",
+ "downloaded": "завантажено",
+ "no process on the server (a reboot or no memory)": "процесу на сервері немає (перезавантаження чи брак памʼяті)",
+ "not downloaded": "не завантажено",
+ "queue job {id}": "завдання черги {id}"
+}

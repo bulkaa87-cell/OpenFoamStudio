@@ -137,9 +137,6 @@ class LiveBar(QtWidgets.QGroupBox):
     def source(self) -> "fl.Source | None":
         return self._src
 
-    def showing_live(self) -> bool:
-        return self._shown is not None
-
     def mark_final(self) -> None:
         """Вікно знову показує остаточні результати."""
         self._shown = None

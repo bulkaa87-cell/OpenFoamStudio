@@ -98,14 +98,6 @@ class Diagnosis:
         sx, sy, sz = self.size
         return math.sqrt(sx * sx + sy * sy + sz * sz)
 
-    @property
-    def worst_level(self) -> str:
-        if any(lvl == "bad" for lvl, _ in self.notes):
-            return "bad"
-        if any(lvl == "warn" for lvl, _ in self.notes):
-            return "warn"
-        return "ok"
-
 
 # --------------------------------------------------------------------------
 # Завантаження
@@ -153,14 +145,71 @@ def drop_stray_cells(mesh: pv.PolyData) -> pv.PolyData:
                      polys_to_lines=False, strips_to_polys=False)
 
 
+# --------------------------------------------------------------------------
+# Формати файлів сітки: спільний код MeshFix Studio
+# --------------------------------------------------------------------------
+# FILE FORMATS. The readers and writers of STL, 3MF, OBJ, PLY, OFF, glTF and
+# VTK are in the shared package (meshfix.formats and meshfix.check of
+# meshfix-core 0.3.0 and later, see fs_shared.py): one code for both
+# programs. With an older package OpenFOAM Studio reads what pv.read reads
+# and writes STL only. constant/triSurface always gets STL (write_stl):
+# snappyHexMesh reads it.
+
+def formats():
+    """meshfix.check of the shared package when it has the file formats
+    (save_mesh, meshfix-core 0.3.0 and later), else None."""
+    try:
+        import fs_shared
+        chk = fs_shared.module("meshfix.check")
+    except ImportError:
+        return None
+    return chk if hasattr(chk, "save_mesh") else None
+
+
+SURFACE_SUFFIXES_OLD = (".stl", ".obj", ".ply", ".vtp", ".vtk")
+
+
+def surface_suffixes() -> tuple:
+    """The suffixes of the mesh files that the program opens."""
+    chk = formats()
+    return tuple(chk.READERS) if chk else SURFACE_SUFFIXES_OLD
+
+
+def open_filter() -> str:
+    """The filter of an open dialog for mesh files."""
+    chk = formats()
+    if chk:
+        return chk.open_filter()
+    return tr("Meshes ({patterns});;All files (*)",
+              patterns=" ".join("*" + s for s in SURFACE_SUFFIXES_OLD))
+
+
+def unit_in_file(path) -> bool:
+    """True when the format of `path` keeps its unit (3MF, glTF): then the
+    program does not need to ask for the units."""
+    chk = formats()
+    if not chk:
+        return False
+    try:
+        return chk.format_for(path).unit is not None
+    except ValueError:
+        return False
+
+
 def load_surface(path: str) -> pv.PolyData:
-    """Читає STL/OBJ/PLY/VTP і повертає трикутну поверхню.
+    """Читає файл сітки і повертає трикутну поверхню.
 
     Файл без жодного трикутника відкидаємо ТУТ, а не десь далі. Перевірка
     «немає комірок» його не ловить: у хмари точок і в каркаса комірки є, і
     така геометрія доходила до вʼюпорта, де падала на порахунку нормалей —
     уже у вікні, з трасуванням у консоль замість людського повідомлення.
+
+    With meshfix-core 0.3.0 and later: meshfix.check.load_surface (the same
+    code, with the readers of meshfix.formats: 3MF, OFF, glTF too).
     """
+    chk = formats()
+    if chk:
+        return chk.load_surface(path)
     mesh = pv.read(path)
     if not isinstance(mesh, pv.PolyData):
         mesh = mesh.extract_surface(algorithm="dataset_surface")
@@ -179,7 +228,12 @@ def guess_scale(mesh: pv.PolyData) -> tuple[float, str]:
 
     Повертає (множник, пояснення). Евристика проста: типова деталь у метрах
     має габарит 0.01..30, у міліметрах — сотні й тисячі.
+
+    A 3MF or glTF file gives its unit (meshfix.check.guess_scale).
     """
+    chk = formats()
+    if chk and chk.UNIT in mesh.field_data:
+        return chk.guess_scale(mesh)
     b = mesh.bounds
     span = max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
     if span > 300:
@@ -339,6 +393,32 @@ def _count_regions(mesh: pv.PolyData) -> int:
     return int(conn.GetNumberOfExtractedRegions())
 
 
+def _region_points(poly: pv.PolyData, limit: int | None = None
+                   ) -> list[np.ndarray] | None:
+    """The points of each connected region of `poly`, in the order of VTK.
+
+    One place for vtkPolyDataConnectivityFilter on points (holes, flipped
+    parts; T51). Its RegionId is a POINT array of ITS OUTPUT: read it with
+    the points of the output, never with the indexes of the input (see
+    `_region_ids` for the faces). None: VTK gave no RegionId. `limit`: only
+    the first regions.
+    """
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(poly)
+    conn.SetExtractionModeToAllRegions()
+    conn.SetColorRegions(True)
+    conn.Update()
+    labelled = pv.wrap(conn.GetOutput())
+    if "RegionId" not in labelled.point_data:
+        return None
+    ids = np.asarray(labelled.point_data["RegionId"])
+    pts = labelled.points
+    n = int(conn.GetNumberOfExtractedRegions())
+    if limit is not None:
+        n = min(n, limit)
+    return [pts[ids == region] for region in range(n)]
+
+
 _CELL_TAG = "_fs_cell"
 
 
@@ -440,8 +520,7 @@ def _bad_winding_edges(mesh: pv.PolyData) -> int:
     Це і є справжня неузгодженість намотки: у нормально зшитій поверхні
     спільне ребро двох трикутників кожен із них проходить у свій бік. Рахуємо
     з самої топології, а не з vtkPolyDataNormals: той на збірці з
-    non-manifold ребрами вигадує вивернуті ділянки там, де їх немає
-    (див. devlog/ZNAHIDKY.md).
+    non-manifold ребрами вигадує вивернуті ділянки там, де їх немає.
     """
     faces = _tri_faces(mesh)
     if faces is None:
@@ -488,20 +567,8 @@ def _hole_sizes(mesh: pv.PolyData, limit: int = 400) -> list[float]:
     if edges.n_cells == 0:
         return []
 
-    conn = vtk.vtkPolyDataConnectivityFilter()
-    conn.SetInputData(edges)
-    conn.SetExtractionModeToAllRegions()
-    conn.SetColorRegions(True)
-    conn.Update()
-    labelled = pv.wrap(conn.GetOutput())
-    if "RegionId" not in labelled.point_data:
-        return []
-
-    ids = np.asarray(labelled.point_data["RegionId"])
-    pts = labelled.points
     sizes = []
-    for region in range(min(conn.GetNumberOfExtractedRegions(), limit)):
-        p = pts[ids == region]
+    for p in _region_points(edges, limit) or []:
         if len(p) < 2:
             continue
         sizes.append(float(np.linalg.norm(p.max(axis=0) - p.min(axis=0))))
@@ -591,20 +658,8 @@ def hole_report(mesh: pv.PolyData, limit: int = 12) -> list[tuple[float, tuple]]
     if edges.n_cells == 0:
         return []
 
-    conn = vtk.vtkPolyDataConnectivityFilter()
-    conn.SetInputData(edges)
-    conn.SetExtractionModeToAllRegions()
-    conn.SetColorRegions(True)
-    conn.Update()
-    labelled = pv.wrap(conn.GetOutput())
-    if "RegionId" not in labelled.point_data:
-        return []
-
-    ids = np.asarray(labelled.point_data["RegionId"])
-    pts = labelled.points
     out = []
-    for region in range(conn.GetNumberOfExtractedRegions()):
-        p = pts[ids == region]
+    for p in _region_points(edges) or []:
         if len(p) < 2:
             continue
         size = float(np.linalg.norm(p.max(axis=0) - p.min(axis=0)))
@@ -629,17 +684,8 @@ def problem_spots(mesh: pv.PolyData, diagnosis, limit: int = 10) -> list[dict]:
     if mask is not None:
         inverted = inverted_polydata(mesh, mask)
         if inverted is not None and inverted.n_cells:
-            conn = vtk.vtkPolyDataConnectivityFilter()
-            conn.SetInputData(inverted)
-            conn.SetExtractionModeToAllRegions()
-            conn.SetColorRegions(True)
-            conn.Update()
-            labelled = pv.wrap(conn.GetOutput())
-            ids = np.asarray(labelled.point_data.get("RegionId", []))
-            pts = labelled.points
             groups = []
-            for region in range(min(conn.GetNumberOfExtractedRegions(), 200)):
-                pick = pts[ids == region] if ids.size else pts
+            for pick in _region_points(inverted, 200) or []:
                 if len(pick) < 3:
                     continue
                 span = float(np.linalg.norm(pick.max(axis=0) - pick.min(axis=0)))
@@ -1080,13 +1126,6 @@ def weld(mesh: pv.PolyData, tolerance_m: float,
         drop_stray_cells(out.triangulate()), tr("Weld vertices"),
         tr("Tolerance {v:.3g} mm merged the whole model into one point — "
            "use a smaller one.", v=tolerance_m * 1000))
-
-
-def clean_surface(mesh: pv.PolyData, tolerance: float = 1e-8) -> pv.PolyData:
-    """Зшиває точні дублі вершин і прибирає вироджені трикутники."""
-    out = mesh.clean(tolerance=tolerance, point_merging=True,
-                     lines_to_points=True, polys_to_lines=True)
-    return drop_stray_cells(out.triangulate())
 
 
 def fill_holes(mesh: pv.PolyData, max_size: float) -> pv.PolyData:

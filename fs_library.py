@@ -484,6 +484,9 @@ def _base(case_dir: str | os.PathLike) -> dict:
         "notes": notes if isinstance(notes, str) else "",
         "runs": [r for r in (data.get("runs") or []) if isinstance(r, dict)],
         "cfg": data.get("cfg"),
+        # The last upload: {"host", "dir"} (T43, fs_backend.run_server_dir).
+        **({"server": data["server"]}
+           if isinstance(data.get("server"), dict) else {}),
     }
 
 
@@ -503,7 +506,7 @@ def record_run(case_dir: str | os.PathLike, *, ok: bool, seconds: float = 0.0,
                coeffs: dict | None = None, backend: str = "",
                backend_id: str = "",
                note: str = "", layers: float = -1.0,
-               end_time: float = 0.0) -> str:
+               end_time: float = 0.0, server: "dict | None" = None) -> str:
     """Дописує результат прогону в історію кейсу.
 
     `iterations` — скільки кроків зробив розвʼязувач; у стаціонарі це й є
@@ -528,7 +531,20 @@ def record_run(case_dir: str | os.PathLike, *, ok: bool, seconds: float = 0.0,
         "coeffs": {k: [float("%.6g" % v[0]), float("%.3g" % v[1])]
                    for k, v in (coeffs or {}).items()},
     }
+    if server and server.get("dir"):
+        # The folder of this run on the server (T43): {"host", "dir"}.
+        entry["server"] = {"host": str(server.get("host", "")),
+                           "dir": str(server["dir"])}
     data["runs"] = (data["runs"] + [entry])[-RUNS_KEPT:]
+    return _write(case_dir, data)
+
+
+def set_server(case_dir: str | os.PathLike, host: str, remote_dir: str) -> str:
+    """Keep where the case went on the server (T43): the exact folder, also
+    for «<name>_r2». fs_backend.run_server_dir reads it."""
+    data = _base(case_dir)
+    data["server"] = {"host": str(host), "dir": str(remote_dir),
+                      "uploaded": _now()}
     return _write(case_dir, data)
 
 

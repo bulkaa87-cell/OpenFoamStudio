@@ -1,0 +1,14 @@
+{
+ "No time can be downloaded in this mode.": "У цьому режимі не можна завантажити жодного моменту.",
+ "The local case has no mesh (constant/polyMesh). Download the results of the run first, or select “surfaces only”.": "У локальному кейсі немає сітки (constant/polyMesh). Спершу заберіть результати прогону або виберіть «лише поверхні».",
+ "The mesh of the local case ({here:,} cells) is not the mesh of the run on the server ({there:,} cells): the fields would not fit. Download the results of the run again first.": "Сітка локального кейсу ({here:,} комірок) — не сітка прогону на сервері ({there:,} комірок): поля до неї не підійдуть. Спершу заберіть результати прогону наново.",
+ "cannot get the data: {err}": "не вдалося забрати дані: {err}",
+ "code {rc}": "код {rc}",
+ "done": "готово",
+ "downloading {n} times (about {mb:,.0f} MB)…": "завантажую моменти: {n} (близько {mb:,.0f} МБ)…",
+ "reconstructPar on the server failed (code {rc}): {tail}": "reconstructPar на сервері не вдався (код {rc}): {tail}",
+ "reconstructPar on the server: times {a}–{b} of {n}": "reconstructPar на сервері: моменти {a}–{b} з {n}",
+ "the run folder does not exist": "теки прогону немає",
+ "there is no data for these times on the server": "на сервері немає даних для цих моментів",
+ "unpacking…": "розпаковую…"
+}

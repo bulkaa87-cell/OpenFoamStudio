@@ -13,9 +13,11 @@ from pathlib import Path
 
 import numpy as np
 import pyvista as pv
+
+import fs_rsmesh
+import fs_timeline as ftl
 from fs_i18n import tr
 
-TIME_DIR = re.compile(r"^\d+(\.\d+)?$")
 
 
 def ensure_foam_file(case_dir: str, name: str = "case") -> str:
@@ -32,17 +34,8 @@ def _time_entries(case_dir: str) -> list[tuple[float, str]]:
     Імʼя береться з диска, а не відновлюється з числа через «%g»: у кейсі з
     timePrecision 8–10 таке відновлення дає рядок, якого на диску нема.
     """
-    out = []
-    try:
-        entries = os.listdir(case_dir)
-    except OSError:
-        return []
-    for e in entries:
-        if TIME_DIR.match(e) and os.path.isdir(os.path.join(case_dir, e)):
-            t = float(e)
-            if t > 0:
-                out.append((t, e))
-    return sorted(out)
+    # One rule for the program: fs_timeline.time_folders (T51; also 5e-05).
+    return ftl.time_folders(case_dir)
 
 
 def time_dirs(case_dir: str) -> list[float]:
@@ -242,6 +235,15 @@ class Results:
         # Обʼєм тримаємо лише ОДИН — останнього моменту часу: гігабайт на
         # кожен переглянутий момент швидко не вміщається в памʼять.
         self._volume: tuple[float, pv.UnstructuredGrid | None] | None = None
+        # T47: the Rust reader (fs_rsmesh) gives the same grid and patches
+        # 3-6 times faster. None after its first error: then VTK only.
+        self._rs = fs_rsmesh.Reader(case_dir) if fs_rsmesh.available() else None
+
+    def _rs_failed(self, what: str, exc: Exception) -> None:
+        fs_rsmesh.log.warning("fs_rsmesh: %s of %s failed (%s: %s) - "
+                              "reading through VTK", what, self.case_dir,
+                              type(exc).__name__, exc)
+        self._rs = None
 
     @property
     def times(self) -> list[float]:
@@ -293,10 +295,19 @@ class Results:
         # Попередній обʼєм відпускаємо ДО читання нового: інакше на мить у
         # памʼяті лежали б обидва.
         self._volume = None
-        try:
-            grid = self._read_at(self._volume_reader(), time)["internalMesh"]
-        except (KeyError, TypeError):
-            grid = None
+        grid = None
+        name = fs_rsmesh.nearest_time(self.case_dir, time) if self._rs else None
+        if name is not None:
+            try:
+                grid = self._rs.volume(name, VOLUME_ARRAYS)
+            except Exception as exc:             # noqa: BLE001 - VTK below
+                self._rs_failed("volume", exc)
+                grid = None
+        if grid is None:
+            try:
+                grid = self._read_at(self._volume_reader(), time)["internalMesh"]
+            except (KeyError, TypeError):
+                grid = None
         self._volume = (time, grid)
         return grid
 
@@ -313,6 +324,9 @@ class Results:
             # прохід по всіх файлах поля на кожну частину.
             # У «прочитано» момент потрапляє ПІСЛЯ читання: виняток посередині
             # не мусить запамʼятатися назавжди (старе читання пробувало знову).
+            if self._scan_rs(time):
+                self._scanned.add(time)
+                return self._cache.get(key)
             try:
                 bnd = self._read(time)["boundary"]
                 for nm in bnd.keys():
@@ -324,6 +338,20 @@ class Results:
                 pass
             self._scanned.add(time)
         return self._cache.get(key)
+
+    def _scan_rs(self, time: float) -> bool:
+        """All patches of a time through the Rust reader. False: use VTK."""
+        name = fs_rsmesh.nearest_time(self.case_dir, time) if self._rs else None
+        if name is None:
+            return False
+        try:
+            got = self._rs.boundary(name)
+        except Exception as exc:                 # noqa: BLE001 - VTK then
+            self._rs_failed("patches", exc)
+            return False
+        for nm, mesh in got:
+            self._cache.setdefault((time, nm), mesh)
+        return True
 
     @staticmethod
     def fields(mesh) -> list[str]:
@@ -385,15 +413,6 @@ def add_umag(mesh):
         if "U" in store:
             store["Umag"] = np.linalg.norm(np.asarray(store["U"]), axis=1)
     return mesh
-
-
-def slice_through(mesh, normal=(0, 1, 0), origin=None):
-    if mesh is None:
-        return None
-    try:
-        return mesh.slice(normal=normal, origin=origin or mesh.center)
-    except Exception:
-        return None
 
 
 def _tail_mean(series, window: int = 50) -> np.ndarray | None:
@@ -561,7 +580,7 @@ MARCH_LIMIT = 0.75           # частка кроків в один бік, щ�
 
 
 def coeff_verdict(pts: list[tuple[float, float]],
-                  steady: bool = True) -> tuple[str, str]:
+                  steady: bool = True, floor: float = 0.0) -> tuple[str, str]:
     """Чи можна брати середнє — і що робити, якщо ні.
 
     Розкид сам собою нічого не каже. Те саме число «0.35» означає дві різні
@@ -589,6 +608,9 @@ def coeff_verdict(pts: list[tuple[float, float]],
     tail, t_it = vals[cut:], it[cut:]
     mean = float(tail.mean())
     scale = abs(mean) if abs(mean) > 1e-12 else 1.0
+    # `floor` (fs_polars): a coefficient near zero (Cl at 0°, Cm near trim)
+    # is not divided by its own tiny value. 0 keeps the old behaviour.
+    scale = max(scale, floor)
     rng = float(tail.max() - tail.min()) / scale
 
     # Наскільки середнє зсунулося — і, ОКРЕМО, чи воно при цьому йшло в

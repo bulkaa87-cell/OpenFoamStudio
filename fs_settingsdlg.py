@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import threading
-from pathlib import Path
 
 from PySide6 import QtCore, QtWidgets
 
@@ -201,6 +200,24 @@ class SettingsDialog(QtWidgets.QDialog):
                                    "opens faster. Then click «Search» on "
                                    "the «Run» tab.")))
 
+        self.chk_notify = QtWidgets.QCheckBox(tr("Notify about the runs"))
+        self.chk_notify.setToolTip(tr("A message of the system (a Windows "
+                                      "notification) and a line in the "
+                                      "window: a run finished, failed or "
+                                      "stopped, the results are "
+                                      "downloaded. A click opens the run"))
+        f.addRow(self.chk_notify)
+        self.chk_reconnect = QtWidgets.QCheckBox(
+            tr("Connect to the server runs again by itself"))
+        self.chk_reconnect.setToolTip(tr("At start, after a sleep of the "
+                                         "computer and after a new network, "
+                                         "the program finds the runs that it "
+                                         "started on a server and connects "
+                                         "to them, like «Connect to Run». "
+                                         "With unsaved changes in the "
+                                         "scene, it only tells"))
+        f.addRow(self.chk_reconnect)
+
         box = QtWidgets.QGroupBox(tr("Distribute between machines (experimental)"))
         g = QtWidgets.QFormLayout(box)
         self.ed_dist_user = QtWidgets.QLineEdit()
@@ -306,6 +323,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self.ed_projects.setText(v["projects_dir"])
         self.ed_ssh.setText(v["ssh_host"])
         self.chk_check.setChecked(bool(v["check_machines_on_start"]))
+        self.chk_notify.setChecked(bool(v["notify"]))
+        self.chk_reconnect.setChecked(bool(v["auto_reconnect"]))
         self.ed_dist_user.setText(v["dist_user"])
         self.ed_dist_key.setText(v["dist_key"])
         self.ed_dist_net.setText(v["dist_net"])
@@ -322,6 +341,8 @@ class SettingsDialog(QtWidgets.QDialog):
             "projects_dir": self.ed_projects.text().strip(),
             "ssh_host": self.ed_ssh.text().strip(),
             "check_machines_on_start": self.chk_check.isChecked(),
+            "notify": self.chk_notify.isChecked(),
+            "auto_reconnect": self.chk_reconnect.isChecked(),
             "dist_user": self.ed_dist_user.text().strip(),
             "dist_key": self.ed_dist_key.text().strip(),
             "dist_net": self.ed_dist_net.text().strip(),
@@ -374,8 +395,4 @@ class SettingsDialog(QtWidgets.QDialog):
         self._checking = False
         self.btn_check.setEnabled(True)
         self.lbl_check.setText(tr("Automatic choice: {result}", result=text))
-
-
-def default_projects_dir(cases: Path) -> str:
-    return str(Path(cases).parent / "projects")
 

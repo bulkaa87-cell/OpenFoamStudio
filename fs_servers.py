@@ -213,16 +213,6 @@ def login_argv(state: TailscaleState) -> list[str]:
     return [state.exe or tailscale_exe() or "tailscale", verb]
 
 
-def tailscale_ping(host: str, exe: str | None = None) -> str:
-    """One `tailscale ping` (read only): the path to `host`. "" on error."""
-    exe = exe or tailscale_exe()
-    if not exe:
-        return ""
-    rc, out, err = _run([exe, "ping", "--c", "1", "--timeout", "5s", host],
-                        timeout=15)
-    return (out or err).strip().splitlines()[-1] if (out or err).strip() else ""
-
-
 # --------------------------------------------------------------------------
 # SSH key and config of this computer
 # --------------------------------------------------------------------------

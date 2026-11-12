@@ -58,10 +58,6 @@ def set_rookie(on: bool) -> None:
             pass
 
 
-def is_rookie() -> bool:
-    return _ROOKIE[0]
-
-
 class WrapLabel(QtWidgets.QLabel):
     """Мітка з переносом рядків, яка чесно повідомляє свою висоту.
 
@@ -869,10 +865,12 @@ class GeometryPanel(Panel):
         super().__init__(cfg, parent)
 
         row = QtWidgets.QHBoxLayout()
-        self.btn_open = QtWidgets.QPushButton("Open STL…")
+        self.btn_open = QtWidgets.QPushButton("Open Geometry…")
         self.btn_open.setToolTip(
             "Replace the scene with this model.\nYou can select several "
-            "files at once: Ctrl or Shift in the dialog.")
+            "files at once: Ctrl or Shift in the dialog.\nFormats: STL, "
+            "3MF, OBJ, PLY, OFF, glTF, VTK. A 3MF or glTF file gives its "
+            "units; the program asks for the units of the other formats.")
         self.btn_open.clicked.connect(self.load_requested)
         row.addWidget(self.btn_open, 2)
         self.btn_add = QtWidgets.QPushButton("Add…")
@@ -1326,7 +1324,7 @@ class GeometryPanel(Panel):
         mrow = QtWidgets.QHBoxLayout()
         self.move_step = dspin(0.0001, 100.0, 0.01, 0.005, 4, " m")
         self.move_step.setToolTip("How far to move per click")
-        mrow.addWidget(QtWidgets.QLabel("Pitch"))
+        mrow.addWidget(QtWidgets.QLabel("Step"))
         mrow.addWidget(self.move_step, 1)
         for label, key in (("−X", "-x"), ("+X", "+x"), ("−Y", "-y"),
                            ("+Y", "+y"), ("−Z", "-z"), ("+Z", "+z")):
@@ -3984,6 +3982,8 @@ class RunPanel(Panel):
     run_server_requested = QtCore.Signal()
     # Підхопити прогін, що вже йде на сервері.
     attach_requested = QtCore.Signal()
+    # Put the case (or the angle series) in the queue on the server (T46).
+    queue_requested = QtCore.Signal()
     stop_requested = QtCore.Signal()
     soft_stop_requested = QtCore.Signal()
     # Список машин розподілу змінився (зберегти).
@@ -4250,6 +4250,20 @@ class RunPanel(Panel):
             "moment, and in separated flow the steady solver does not "
             "converge. “Stop” stops the whole series."), title="Angle series: how it works"))
 
+        # PRE-RUN (T39, fs_prerun). A short run of the same case before
+        # the main run. It measures the layers, y+, the stability and the
+        # time per step, and a window then proposes values. It works with
+        # both run buttons, so also on the server.
+        self.chk_prerun = QtWidgets.QCheckBox("Run with a pre-run (tuning)")
+        self.chk_prerun.setToolTip(
+            "First a short run of the same case: the same mesh, 200 "
+            "iterations (steady) or 40 time steps (transient). Then a "
+            "window shows what it measured and proposes values for the "
+            "main run: layers, y+, maxCo, the stable start. You accept, "
+            "edit or skip each value, then the main run starts. The mesh "
+            "is kept, so the main run does not build it again.")
+        self.v.addWidget(self.chk_prerun)
+
         grid = QtWidgets.QGridLayout()
         self.btn_create = QtWidgets.QPushButton("Create Case")
         self.btn_run = QtWidgets.QPushButton("▶  Run")
@@ -4306,6 +4320,16 @@ class RunPanel(Panel):
             "of the one you select. Works also for a run started by a "
             "different program or from a different computer.")
         self.btn_attach.clicked.connect(self.attach_requested)
+        # THE RUN QUEUE ON THE SERVER (T46). The server starts the jobs one
+        # after another itself: the laptop can sleep. With the series check
+        # box, each angle is one job.
+        self.btn_queue = QtWidgets.QPushButton("☰  Add to Queue")
+        self.btn_queue.setToolTip(
+            "Put this case (or, with the series check box, each angle) in "
+            "the run queue on the server. The server starts the next job "
+            "when the machine is free, also when this laptop sleeps or is "
+            "off. “Queue” in the menu shows the jobs.")
+        self.btn_queue.clicked.connect(self.queue_requested)
         grid.addWidget(self.btn_create, 0, 0)
         grid.addWidget(self.btn_open, 0, 1)
         grid.addWidget(self.btn_run, 1, 0)
@@ -4313,6 +4337,7 @@ class RunPanel(Panel):
         grid.addWidget(self.btn_soft_stop, 2, 0, 1, 2)
         grid.addWidget(self.btn_run_server, 3, 0, 1, 2)
         grid.addWidget(self.btn_attach, 4, 0, 1, 2)
+        grid.addWidget(self.btn_queue, 5, 0, 1, 2)
         self.v.addLayout(grid)
         self.v.addWidget(hint(
             tr("The button checks the server itself, selects it as the "
@@ -4465,6 +4490,22 @@ class RunPanel(Panel):
                   "#5c3b00", "#ffd27a",
                   "⬇  Getting the results back to the laptop — do NOT turn off the laptop"),
     }
+    # The tooltip of each state, in the panel and in the status bar (T49:
+    # the status bar kept the tooltip of «free» also during «fetch»).
+    LAPTOP_TIPS = {
+        "upload": ("The program uploads the case to the server. The run "
+                   "starts when the upload is complete. If the laptop turns "
+                   "off now, the run does not start."),
+        "free": ("The case upload is complete, and the server runs on its "
+                 "own. Close the program with the X button (not “Stop”) or "
+                 "just turn off the laptop. Later: “Connect” — and the log, "
+                 "plots and results will load."),
+        "fetch": ("The run on the server has ended. The program downloads "
+                  "its results into the case folder on this computer. Keep "
+                  "the laptop on until this line goes away. If the download "
+                  "breaks off, nothing is lost: “Connect to Run” downloads "
+                  "the results again."),
+    }
 
     def set_laptop_state(self, state: str) -> None:
         """'upload' | 'free' | 'fetch' | '' (сховати)."""
@@ -4472,9 +4513,11 @@ class RunPanel(Panel):
         if not got:
             self.lbl_laptop.setVisible(False)
             self.lbl_laptop.setProperty("state", "")
+            self.lbl_laptop.setToolTip("")
             return
         text, bg, fg, _short = got
         self.lbl_laptop.setText(text)
+        self.lbl_laptop.setToolTip(self.LAPTOP_TIPS.get(state, ""))
         self.lbl_laptop.setProperty("state", state)
         self.lbl_laptop.setStyleSheet(
             f"background:{bg}; color:{fg}; font-weight:600; padding:6px 8px;"
@@ -4618,12 +4661,14 @@ class RunPanel(Panel):
     def set_running(self, running: bool):
         self.btn_run.setEnabled(not running)
         self.btn_run_server.setEnabled(not running)
+        self.btn_queue.setEnabled(not running)
         self.btn_create.setEnabled(not running)
         self.btn_stop.setEnabled(running)
         self.btn_soft_stop.setEnabled(running)
         # Кути посеред серії не міняють: прогін, що йде, їх уже не почує,
         # а наступні пішли б уже з іншого списку.
         self.chk_series.setEnabled(not running)
+        self.chk_prerun.setEnabled(not running)
         self.ed_angles.setEnabled(not running and self.chk_series.isChecked())
         if running:
             # Порада з минулого прогону стосувалася минулої сітки.
@@ -4758,6 +4803,11 @@ class LibraryPanel(QtWidgets.QWidget):
         f.setBold(True)
         self.btn_open.setFont(f)
         self.btn_compare = QtWidgets.QPushButton("Compare Selected")
+        self.btn_polars = QtWidgets.QPushButton("Polars…")
+        self.btn_polars.setToolTip(
+            "Cl, Cd, Cm, L/D against the angle of attack from the selected "
+            "cases or from an angle series, with the table, CSV, plots and a "
+            "simple report")
         self.btn_para = QtWidgets.QPushButton("In ParaView")
         self.btn_dir = QtWidgets.QPushButton("Folder")
         self.btn_rename = QtWidgets.QPushButton("Rename…")
@@ -4765,12 +4815,14 @@ class LibraryPanel(QtWidgets.QWidget):
         self.btn_delete = QtWidgets.QPushButton("Delete…")
         self.btn_open.clicked.connect(self._open)
         self.btn_compare.clicked.connect(self._compare)
+        self.btn_polars.clicked.connect(self.open_polars)
         self.btn_para.clicked.connect(self._paraview)
         self.btn_dir.clicked.connect(self._open_dir)
         self.btn_rename.clicked.connect(self._rename)
         self.btn_slim.clicked.connect(self._slim)
         self.btn_delete.clicked.connect(self._delete)
-        for b in (self.btn_open, self.btn_compare, self.btn_para, self.btn_dir,
+        for b in (self.btn_open, self.btn_compare, self.btn_polars,
+                  self.btn_para, self.btn_dir,
                   self.btn_rename, self.btn_slim, self.btn_delete):
             row.addWidget(b)
         row.addStretch(1)
@@ -4909,6 +4961,7 @@ class LibraryPanel(QtWidgets.QWidget):
         self.btn_slim.setEnabled(info is not None)
         self.btn_delete.setEnabled(info is not None)
         self.btn_compare.setEnabled(chosen >= 2)
+        self.btn_polars.setEnabled(chosen >= 1 or self._has_series())
         self.btn_notes.setEnabled(info is not None)
         self.ed_notes.setEnabled(info is not None)
         if info is None:
@@ -5022,6 +5075,10 @@ class LibraryPanel(QtWidgets.QWidget):
         info = self.current()
         if info is None:
             return
+        busy = self.busy_reason(info.path)      # T43: never under a run
+        if busy:
+            QtWidgets.QMessageBox.warning(self, tr("Free Up Space"), busy)
+            return
         parts = lib.reclaimable(info.path)
         if not parts:
             QtWidgets.QMessageBox.information(
@@ -5050,9 +5107,16 @@ class LibraryPanel(QtWidgets.QWidget):
         self.select(info.path)
         self.lbl_status.setText(tr("Freed {freed}.", freed=lib.fmt_size(freed)))
 
+    # The window sets it: path -> why a run uses the case now ("" = free).
+    busy_reason = staticmethod(lambda path: "")
+
     def _delete(self):
         info = self.current()
         if info is None:
+            return
+        busy = self.busy_reason(info.path)      # T43: never under a run
+        if busy:
+            QtWidgets.QMessageBox.warning(self, tr("Delete Case"), busy)
             return
         ans = QtWidgets.QMessageBox.question(
             self, tr("Delete Case"),
@@ -5077,6 +5141,23 @@ class LibraryPanel(QtWidgets.QWidget):
         chosen = self.selected()
         if len(chosen) >= 2:
             CompareDialog(chosen, self).exec()
+
+    def _has_series(self) -> bool:
+        import fs_polars
+        return bool(fs_polars.find_series(self.cases))
+
+    def open_polars(self):
+        """«Polars…»: a window that stays open beside the main window (T45)."""
+        import fs_polarwin
+        chosen = self.selected()
+        if not chosen and not self._has_series():
+            return None
+        w = fs_polarwin.PolarWindow(chosen, self.cases, self)
+        w.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        w.setModal(False)
+        w.show()
+        self._polar_window = w
+        return w
 
 
 def _fmt_num(value, fmt: str = "%.4g") -> str:
@@ -5304,10 +5385,29 @@ class CompareDialog(QtWidgets.QDialog):
         lay.addWidget(self._stability_box(cases))
         btn = QtWidgets.QPushButton("Close")
         btn.clicked.connect(self.accept)
+        self.btn_polars = QtWidgets.QPushButton("Polars…")
+        self.btn_polars.setToolTip(
+            "Cl, Cd, Cm, L/D against the angle of attack of these cases, "
+            "with the table, CSV, plots and a simple report")
+        self.btn_polars.clicked.connect(lambda: self.open_polars(cases))
         strip = QtWidgets.QHBoxLayout()
+        strip.addWidget(self.btn_polars)
         strip.addStretch(1)
         strip.addWidget(btn)
         lay.addLayout(strip)
+
+    def open_polars(self, cases: list):
+        import fs_polarwin
+        owner = self.parentWidget() or self
+        if self.isModal():
+            # A modal comparison would block the polar window: close it.
+            self.accept()
+        w = fs_polarwin.PolarWindow(cases, cases, owner)
+        w.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        w.setModal(False)
+        w.show()
+        self._polar_window = w
+        return w
 
     def _stability_box(self, cases: list) -> QtWidgets.QGroupBox:
         """Нейтральна точка за виділеними кейсами й перевірка центру ваги.
