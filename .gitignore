@@ -28,11 +28,21 @@
 !/fs_*.py
 !/requirements.txt
 !/OpenFOAM Studio.bat
+!/MeshFix Studio.bat
 
 # Translations of the interface (the program reads them at run time)
 !/i18n/
 /i18n/*
-!/i18n/en/
+!/i18n/uk/
+
+# Logos of the programs (window, taskbar, installer)
+!/icons/
+
+# Build files of the installer (PyInstaller, Inno Setup)
+!/packaging/
+
+# Install guides (the program shows them, the installer includes them)
+!/docs/
 
 # Rust modules: only the source and the build files
 !/rust/

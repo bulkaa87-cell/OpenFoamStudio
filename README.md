@@ -4,7 +4,7 @@ OpenFOAM Studio is a desktop program for external aerodynamics with OpenFOAM.
 You load an STL model, examine and repair it, set the domain, the mesh and the flow.
 Then the program writes the OpenFOAM case, runs it, and shows the results.
 
-The user interface of the program is in Ukrainian.
+The user interface of the program is in English and Ukrainian.
 
 ## Status
 
@@ -67,7 +67,14 @@ Pause and resume do not work for a distributed run.
 - A Rust toolchain, only if you want to build the Rust modules
 - `wrapwrap` (https://github.com/ipadjen/wrapwrap), only for the alpha wrap repair. Put `wrapwrap.exe` in `tools\` or in `PATH`.
 
-## Install and run
+## Download (Windows)
+
+The Windows x64 installer is on the [Releases](https://github.com/bulkaa87-cell/OpenFoamStudio/releases) page.
+The installer has no signature. If Windows SmartScreen stops it, click **More info**, then **Run anyway**.
+The install guide and the server setup are in [docs/INSTALL.en.md](docs/INSTALL.en.md) (Ukrainian: [docs/INSTALL.uk.md](docs/INSTALL.uk.md)).
+macOS and Linux installers come later. On these systems, run the program from the source (see below).
+
+## Install and run from the source
 
 1. Install Python and Git.
 2. Clone the repository:
