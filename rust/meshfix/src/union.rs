@@ -1,5 +1,5 @@
-//! Union of closed shells that intersect (the "Wrap" behavior of the
-//! Windows repair: two cubes that cut into each other become one body).
+//! Union of closed shells that intersect (the Wrap step: two cubes that
+//! cut into each other become one body).
 //!
 //! Steps:
 //! 1. Move each vertex by a very small vector (1e-6 units, direction from

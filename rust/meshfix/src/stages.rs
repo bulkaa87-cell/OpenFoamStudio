@@ -493,11 +493,10 @@ pub fn close_all_holes_checked(mesh: &mut Mesh) -> usize {
 
 // ---- Wrap --------------------------------------------------------------
 //
-// Like the Windows Wrap: split non-manifold edges and vertices, turn each
+// Split non-manifold edges and vertices, turn each
 // closed shell so that the normals point out, make the union of the shells
 // that intersect (union.rs), and remove each closed shell that is fully
-// inside another closed shell. The Windows Wrap also refines the mesh. This
-// one does not.
+// inside another closed shell. The mesh is not refined.
 
 fn shell_bbox(mesh: &Mesh, shell: &[u32]) -> (Vec3, Vec3) {
     let mut lo = [f64::INFINITY; 3];
@@ -693,7 +692,7 @@ pub fn remove_flaps(mesh: &mut Mesh) -> usize {
 pub fn winding_post(mesh: &mut Mesh) {
     let t0 = std::time::Instant::now();
     // A closed shell with a negative volume is a void inside the body. The
-    // Windows Wrap fills such voids; so does this step.
+    // Wrap fills such voids.
     let voids = remove_voids(mesh);
     if std::env::var_os("MESHFIX_TIMING").is_some() {
         eprintln!("winding voids removed {voids}");
@@ -762,7 +761,7 @@ pub fn winding_post(mesh: &mut Mesh) {
         remove_voids(mesh);
         remove_inverted_parts(mesh, 1e-3);
         // A closed shell inside another one (a pocket between bodies that
-        // the overlay of contacts closed) goes, as in the Windows Wrap.
+        // the overlay of contacts closed) goes.
         remove_nested_with(mesh, true);
     }
     crate::union::dbg_time("winding post done", t0);
@@ -2100,7 +2099,7 @@ pub fn split_pinched_edges(mesh: &mut Mesh) -> usize {
 }
 
 /// Parts below this |volume| (normalized units cubed) are removed by
-/// remove_inverted_parts: the Windows limit of RemoveTinyShells.
+/// remove_inverted_parts: the limit of RemoveTinyShells.
 pub const TINY_PART_VOLUME: f64 = 0.001;
 
 #[inline]

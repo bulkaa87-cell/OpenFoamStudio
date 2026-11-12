@@ -1,4 +1,4 @@
-//! Seal: a topological last step for assemblies that the Windows steps
+//! Seal: a topological last step for assemblies that the 12 steps
 //! leave open (from the stitch approach, wip/t9-stitch). In this branch the
 //! winding Wrap calls it when its own post steps leave open or non-manifold
 //! edges.

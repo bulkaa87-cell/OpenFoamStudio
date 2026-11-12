@@ -1,6 +1,6 @@
 ﻿; Inno Setup script of the Windows installer of OpenFOAM Studio.
 ;
-;   ISCC.exe /DAppVersion=0.1.0 /DSrcDir=<dist>\OpenFOAM Studio /DOutDir=<out> ^
+;   ISCC.exe /DAppVersion=0.1.1 /DSrcDir=<dist>\OpenFOAM Studio /DOutDir=<out> ^
 ;            packaging\windows\openfoam_studio.iss
 ;
 ; Input: the PyInstaller folder (packaging\pyinstaller\openfoam_studio.spec).
@@ -25,7 +25,7 @@
 ;   "OpenFOAM Studio (installed)", and the uninstaller removes only that one.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.1.1"
 #endif
 #ifndef SrcDir
   #define SrcDir "..\..\build\dist\OpenFOAM Studio"

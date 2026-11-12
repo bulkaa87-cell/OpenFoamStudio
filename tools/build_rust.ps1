@@ -1,7 +1,7 @@
 # Зібрати Rust-частини програми:
 #   foamrs   -> foamrs.pyd   (швидке читання полів, лінії на тілі)
 #   foamview -> foamview.pyd (3D-перегляд вкладки «3D» на GPU, wgpu)
-#   meshfix  -> meshfix.pyd  (ремонт сітки кнопкою «meshfix», кроки служби Windows)
+#   meshfix  -> meshfix.pyd  (ремонт сітки кнопкою «meshfix»)
 #   foamdist -> Linux-бінарник для сервера (розподіл між машинами)
 #
 #   powershell -ExecutionPolicy Bypass -File tools\build_rust.ps1

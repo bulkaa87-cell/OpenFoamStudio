@@ -2,7 +2,7 @@
 #
 #   powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 `
 #       -Python C:\path\to\venv\Scripts\python.exe -Out X:\some\build `
-#       [-Version 0.1.0] [-Iscc C:\path\to\ISCC.exe] [-CargoTarget X:\some\target] `
+#       [-Version 0.1.1] [-Iscc C:\path\to\ISCC.exe] [-CargoTarget X:\some\target] `
 #       [-SkipRust] [-SkipInstaller]
 #
 # Steps:
@@ -19,7 +19,7 @@
 param(
     [string]$Python = "",
     [string]$Out = "",
-    [string]$Version = "0.1.0",
+    [string]$Version = "0.1.1",
     [string]$Iscc = "",
     [string]$CargoTarget = "",
     [switch]$SkipRust,
@@ -42,6 +42,13 @@ if (-not $SkipRust) {
         $cargo = Join-Path $env:CARGO_HOME "bin\cargo.exe"
     }
     $env:PYO3_PYTHON = $Python
+    # No local paths in the published modules: panic messages and generated
+    # sources keep the paths of the build folders. Map them to short names.
+    if (-not $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS) {
+        $remap = "--remap-path-prefix=$root=ofs"
+        if ($CargoTarget) { $remap = "--remap-path-prefix=$CargoTarget=target $remap" }
+        $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = $remap
+    }
     foreach ($crate in @("foamrs", "foamview", "meshfix")) {
         Push-Location (Join-Path $root "rust\$crate")
         try {

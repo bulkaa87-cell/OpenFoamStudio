@@ -1470,6 +1470,8 @@ class MainWindow(QtWidgets.QMainWindow):
             fc.mesh_dicts, be.mesh_key, be.local_mesh_dir, be.MESH_INPUTS,
             lib.project_mesh_source)
         self.worker: RunWorker | None = None
+        # The case to open after an attach (start_attach, T37).
+        self._attach_open = ""
         self._load_thread: QtCore.QThread | None = None
         self._loader: GeometryLoader | None = None
         self._load_head = ""
@@ -5211,6 +5213,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # подінуться, їх можна забрати й потім.
         case_dir = session.case_dir if (
             session.case_dir and Path(session.case_dir).is_dir()) else ""
+        # The window can show another case (or no case) than the run. Then
+        # its settings (patch names, steady or transient) do not fit the
+        # results: after the run, open the case of the run (T37).
+        self._attach_open = (case_dir if case_dir
+                             and not self._shows_case(case_dir) else "")
         if case_dir:
             self.case_dir = case_dir
         self.log.clear_log()
@@ -5224,7 +5231,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log.push(tr("WARNING: the status says “running”, but there "
                           "is no process on the server. The log will be "
                           "shown, but the run is no longer in progress."))
-        self.plots.set_steady(self.cfg.solver.steady)
+        self.plots.set_steady(self._case_steady(case_dir))
         self.plots.update_plots({}, {})
         self._run_started = time.monotonic()
         self.tabs_right.setCurrentWidget(self.log)
@@ -5249,6 +5256,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread.start()
         self.timer.start()
         self._live_start()
+
+    def _shows_case(self, case_dir: str) -> bool:
+        """True if the window shows this case now: its folder and its name.
+
+        The name is the name of the case folder (_apply_restore), so a
+        window with only the folder of the case (start_attach sets it) and
+        the settings of another case does not count.
+        """
+        if not case_dir or not self.case_dir:
+            return False
+        return (os.path.normcase(os.path.abspath(str(self.case_dir)))
+                == os.path.normcase(os.path.abspath(str(case_dir)))
+                and self.cfg.name == Path(case_dir).name)
+
+    def _case_steady(self, case_dir: str) -> bool:
+        """Steady or transient: from the manifest of the case, if it has one.
+
+        The window can show another case than the run (attach, T37); its
+        setting would give wrong plots and a wrong end time.
+        """
+        if case_dir and not self._shows_case(case_dir):
+            try:
+                solver = (lib.read_manifest(case_dir) or {}).get(
+                    "cfg", {}).get("solver", {})
+                if isinstance(solver, dict) and "steady" in solver:
+                    return bool(solver["steady"])
+            except (OSError, ValueError, AttributeError):
+                pass
+        return bool(self.cfg.solver.steady)
+
+    def _open_attached(self, case_dir: str) -> None:
+        """After an attach: open the case of the run, like «Open» on the
+        «Saved» tab (settings, geometry, results), and select it there.
+
+        Unsaved changes in the scene stay: then the case does not open, and
+        the window tells where it is.
+        """
+        name = Path(case_dir).name
+        if self.project_is_dirty():
+            self.log.push(tr("The results are in the case “{name}”. The scene "
+                             "has unsaved changes, so the case did not open: "
+                             "it is selected on the “Saved” tab, click "
+                             "“Open” there.", name=name))
+            # Only the list of the «Saved» tab goes to the folder of the case
+            # (like its «Browse…»); the cases folder of the scene stays.
+            self.panel_lib.set_root(str(Path(case_dir).parent))
+            self.show_library()
+            self.panel_lib.select(case_dir)
+            return
+        self.log.push(tr("Opening the case “{name}” of the run.", name=name))
+        self.open_saved(case_dir)
+        if self.panel_lib.loaded:
+            self.panel_lib.select(case_dir)
 
     def open_case_dir(self):
         target = self.case_dir or self.panel_run.ed_dir.text()
@@ -7178,7 +7238,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if ok and key and self.worker is not None:
             self._remote_meshes.add((self._res_key(self.worker.backend), key))
             self._auto_fetch_mesh(self.worker.backend, key)
-        if ok:
+        # An attach to a run of a case that the window does not show: open
+        # that case (its settings, geometry and results). load_results with
+        # the settings of the window found no body patch and showed an empty
+        # view (T37).
+        opening = (self._attach_open
+                   if self.worker is not None and self.worker.attach_to else "")
+        self._attach_open = ""
+        if ok and opening and lib.read_manifest(opening) is not None:
+            self._open_attached(opening)
+        elif ok:
             self.load_results()
             self.tabs_right.setCurrentWidget(self.results_view)
         if self._series is not None:
@@ -7209,7 +7278,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Кроки, а не останній «Time»: у нестаціонарі Time — це
                 # секунди, і int(0.2) дав би нуль ітерацій.
                 iterations=st.steps if st else 0,
-                end_time=(st.moment if (st and not self.cfg.solver.steady)
+                end_time=(st.moment if (st and not self._case_steady(case_dir))
                           else 0.0),
                 cells=st.cells if st else 0,
                 converged=bool(st and st.converged),

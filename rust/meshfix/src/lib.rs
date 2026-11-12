@@ -1,8 +1,8 @@
 //! meshfix — mesh repair for OpenFOAM Studio.
 //!
-//! It does the steps of the Windows 3D-print repair (Printing3DModel.
-//! RepairAsync in Windows.Graphics.Printing.3D.dll) in the same order and
-//! with the same tolerances. The comments of stages.rs describe the steps.
+//! It repairs a triangle mesh in 12 steps. The result is close to the
+//! Windows 3D-model repair; this is checked by measurements on test meshes.
+//! The comments of stages.rs describe the steps.
 //!
 //! The Python side is fs_meshfix.py. The program works without this module:
 //! the «meshfix» button is then disabled.
@@ -47,7 +47,7 @@ pub enum Stage {
     RemoveDegeneratedFaces,
     RemoveTinyShells,
     PrepareForExport,
-    /// Fallback 1 after the 12 steps (not a Windows step): alpha wrap of
+    /// Fallback 1 after the 12 steps (not one of them): alpha wrap of
     /// the input, shrunk onto the input (alphawrap.rs).
     AlphaWrap,
     /// Fallback 2, the last one: volumetric remesh (volume.rs).
@@ -57,7 +57,7 @@ pub enum Stage {
     StlSafe,
 }
 
-/// The step order of the Windows repair ("repair_extended").
+/// The 12 steps, in the order that `repair` runs them.
 pub const PIPELINE: [Stage; 12] = [
     Stage::Stitch1,
     Stage::CloseTrivialHoles1,
@@ -488,7 +488,7 @@ fn pipeline(
     for stage in PIPELINE {
         let t0 = Instant::now();
         // Guard: a step that gives more open + non-manifold edges than
-        // before is undone. The Windows steps reduce these numbers; a step
+        // before is undone. The 12 steps reduce these numbers; a step
         // that does not is wrong for this mesh.
         let snapshot = mesh.clone();
         let mut count = if stage == Stage::Wrap && o_wrap(opts) {

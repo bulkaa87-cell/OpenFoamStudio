@@ -2,7 +2,7 @@
 name = "meshfix"
 version = "0.1.0"
 edition = "2021"
-description = "Mesh repair for OpenFOAM Studio: the steps of the Windows 3D-print repair, in Rust (see stages.rs)"
+description = "Mesh repair for OpenFOAM Studio, in Rust (see stages.rs)"
 publish = false
 
 [lib]
