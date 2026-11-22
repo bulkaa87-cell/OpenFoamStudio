@@ -1,6 +1,6 @@
 ﻿; Inno Setup script of the Windows installer of OpenFOAM Studio.
 ;
-;   ISCC.exe /DAppVersion=0.2.2 /DSrcDir=<dist>\OpenFOAM Studio /DOutDir=<out> ^
+;   ISCC.exe /DAppVersion=0.2.3 /DSrcDir=<dist>\OpenFOAM Studio /DOutDir=<out> ^
 ;            packaging\windows\openfoam_studio.iss
 ;
 ; Input: the PyInstaller folder (packaging\pyinstaller\openfoam_studio.spec).
@@ -25,7 +25,7 @@
 ;   "OpenFOAM Studio (installed)", and the uninstaller removes only that one.
 
 #ifndef AppVersion
-  #define AppVersion "0.2.2"
+  #define AppVersion "0.2.3"
 #endif
 #ifndef SrcDir
   #define SrcDir "..\..\build\dist\OpenFOAM Studio"
@@ -83,6 +83,8 @@ en.FoamTask=Prepare OpenFOAM in WSL (also WSL and Ubuntu if they are missing; ab
 uk.FoamTask=Підготувати OpenFOAM у WSL (і WSL з Ubuntu, якщо їх немає; близько 1-2 ГБ)
 en.FoamGroup=Calculations on this computer:
 uk.FoamGroup=Розрахунки на цьому компʼютері:
+en.AskResults=Also delete the results of the simulations?%n%nThe folders cases, projects, session and meshes in:%n%1%nand ~/openfoam-studio in WSL.%n%nThe settings stay. Servers are not changed.
+uk.AskResults=Видалити також результати симуляцій?%n%nТеки cases, projects, session і meshes у:%n%1%nі ~/openfoam-studio у WSL.%n%nНалаштування лишаються. Сервери не змінюються.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
@@ -139,6 +141,73 @@ begin
     if not Result then
       Log('Keep the shortcut of another program: ' + Lnk + ' -> ' + Target);
   end;
+end;
+
+{ ---- An installed version is removed before the new one goes in. ----
+  Without this, files that the new version does not have stay in the
+  program folder, and an install "for all users" and one "for this user"
+  stay side by side. The old uninstaller runs silent: then it does not
+  remove the backend and does not ask about the results (see below). }
+const
+  UninstKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{3B7E4C1A-9D52-4E8B-A6F3-0C2D7E91B845}_is1';
+
+procedure RemoveOld(RootKey: Integer);
+var
+  S: String;
+  Code, Tries: Integer;
+begin
+  if not RegQueryStringValue(RootKey, UninstKey, 'UninstallString', S) then
+    Exit;
+  S := RemoveQuotes(S);
+  if not FileExists(S) then
+    Exit;
+  Log('Removing the installed version: ' + S);
+  if not ShellExec('', S, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '',
+                   SW_HIDE, ewWaitUntilTerminated, Code) then
+    Log('The uninstaller did not start: ' + SysErrorMessage(Code));
+  Tries := 0;
+  while FileExists(S) and (Tries < 75) do
+  begin
+    Sleep(200);
+    Tries := Tries + 1;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+  begin
+    RemoveOld(HKCU);
+    if IsWin64 then
+    begin
+      RemoveOld(HKLM64);
+      RemoveOld(HKLM32);
+    end
+    else
+      RemoveOld(HKLM);
+  end;
+end;
+
+{ ---- Uninstall: the backend and, on request, the results. ----
+  The program removes only what it installed itself (fs_setupfoam,
+  installed-backend.json). A silent uninstall (also the one of an update)
+  removes nothing of this and asks nothing. }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Params, Docs: String;
+  Code: Integer;
+begin
+  if (CurUninstallStep <> usUninstall) or UninstallSilent then
+    Exit;
+  Docs := ExpandConstant('{userdocs}\{#AppName}');
+  Params := '--remove-backend';
+  if SuppressibleMsgBox(FmtMessage(CustomMessage('AskResults'), [Docs]),
+                        mbConfirmation, MB_YESNO or MB_DEFBUTTON2,
+                        IDNO) = IDYES then
+    Params := Params + ' --remove-results';
+  if not Exec(ExpandConstant('{app}\{#AppExe}'), Params, '', SW_SHOW,
+              ewWaitUntilTerminated, Code) then
+    Log('The backend was not removed: ' + SysErrorMessage(Code));
 end;
 
 function LaunchArgs(Param: String): String;

@@ -9849,6 +9849,12 @@ SERVER_WIZARD_FLAG = "--server-wizard"
 
 
 def main():
+    import fs_setupfoam
+    if fs_setupfoam.REMOVE_FLAG in sys.argv[1:]:
+        # The uninstaller: remove the backend that the program installed
+        # (and the results, on request), without the main window.
+        crashlog.install()
+        sys.exit(fs_setupfoam.run_remove(sys.argv))
     crashed = crashlog.last_crash()     # before install() starts a new record
     crashlog.install()
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_ShareOpenGLContexts)
@@ -9862,7 +9868,6 @@ def main():
         win.tell_last_crash(crashed)
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
         win.load_stl(sys.argv[1])
-    import fs_setupfoam
     if fs_setupfoam.wanted_at_start():
         # The installer task «Prepare OpenFOAM in WSL», or a step that
         # waited for the restart of Windows.
