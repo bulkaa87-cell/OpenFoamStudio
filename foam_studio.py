@@ -4982,24 +4982,24 @@ class MainWindow(QtWidgets.QMainWindow):
                                  saved_cells=cells)
 
     def install_openfoam(self):
-        b = self.panel_run.current_backend()
-        distro = b.distro if b and b.distro else "Ubuntu"
-        argv, script = be.install_command(distro)
         ans = QtWidgets.QMessageBox.question(
             self, tr("Install OpenFOAM"),
-            tr("A WSL console will open and run:\n\n{script}\n\nThis will "
-               "download about 1-2 GB and ask for the sudo password. "
-               "Continue?", script=script),
+            tr("The program installs OpenFOAM in WSL by itself (and WSL "
+               "with Ubuntu, if they are not there). This downloads about "
+               "1-2 GB and takes 10-30 min. Continue?"),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
         if ans != QtWidgets.QMessageBox.Yes:
             return
-        try:
-            import subprocess
-            subprocess.Popen(argv)
-            self.panel_run.lbl_status.setText(
-                "Console opened. When it is done, click “Search”.")
-        except OSError as exc:
-            QtWidgets.QMessageBox.critical(self, tr("Could not start"), str(exc))
+        self.prepare_openfoam()
+
+    def prepare_openfoam(self):
+        """The window «Prepare OpenFOAM» (fs_setupfoam): WSL, Ubuntu and
+        OpenFOAM without questions. After it: a new search."""
+        import fs_setupfoam
+        dlg = fs_setupfoam.PrepareDialog(self)
+        dlg.finished_ok.connect(
+            lambda: QtCore.QTimer.singleShot(0, self.detect_backends))
+        dlg.exec()
 
     # --- кейс -----------------------------------------------------------
 
@@ -9862,6 +9862,11 @@ def main():
         win.tell_last_crash(crashed)
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
         win.load_stl(sys.argv[1])
+    import fs_setupfoam
+    if fs_setupfoam.wanted_at_start():
+        # The installer task «Prepare OpenFOAM in WSL», or a step that
+        # waited for the restart of Windows.
+        QtCore.QTimer.singleShot(1200, win.prepare_openfoam)
     if SERVER_WIZARD_FLAG in sys.argv[1:]:
         # The installer starts the program with this flag (its last page).
         QtCore.QTimer.singleShot(800, win.open_server_wizard)

@@ -1,0 +1,16 @@
+{
+ "Checking OpenFOAM…": "Перевіряю OpenFOAM…",
+ "Checking WSL…": "Перевіряю WSL…",
+ "Installing OpenFOAM in {distro} (about 1-2 GB, 10-30 min)…": "Встановлюю OpenFOAM у {distro} (близько 1-2 ГБ, 10-30 хв)…",
+ "Installing WSL and Ubuntu (Windows asks for administrator rights)…": "Встановлюю WSL і Ubuntu (Windows попросить права адміністратора)…",
+ "Installing {distro}…": "Встановлюю {distro}…",
+ "OpenFOAM is ready: {what}": "OpenFOAM готовий: {what}",
+ "Prepare OpenFOAM": "Підготовка OpenFOAM",
+ "Starting…": "Починаю…",
+ "The OpenFOAM install in {distro} ended with code {rc}. The log above shows why.": "Встановлення OpenFOAM у {distro} завершилося з кодом {rc}. Причину видно в журналі вище.",
+ "The install ended, but OpenFOAM was not found in WSL.": "Встановлення завершилося, але OpenFOAM у WSL не знайдено.",
+ "WSL exists only on Windows. On this system, install OpenFOAM with the packages of your Linux, or use a server.": "WSL є лише у Windows. На цій системі встановіть OpenFOAM пакетами вашого Linux або беріть сервер.",
+ "WSL is installed. Restart Windows, then start OpenFOAM Studio again: it continues with OpenFOAM by itself.": "WSL встановлено. Перезавантажте Windows і знову запустіть OpenFOAM Studio: вона сама продовжить з OpenFOAM.",
+ "WSL was not installed (code {rc}). Install it by hand: open PowerShell as administrator and run “wsl --install”.": "WSL не встановлено (код {rc}). Встановіть його вручну: відкрийте PowerShell від імені адміністратора і виконайте «wsl --install».",
+ "{distro} was not installed (code {rc}).": "{distro} не встановлено (код {rc})."
+}

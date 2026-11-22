@@ -1113,15 +1113,42 @@ def _triangles(mesh, cells: bool = False):
             np.ascontiguousarray(faces, np.uint32), cid)
 
 
+def _cell_ids(arr) -> np.ndarray:
+    """A vtkDataArray of a cell array (offsets or connectivity) as int64.
+
+    VTK 9.6+ can give an implicit array (vtkAffineArray: the offsets of
+    lines with 2 points each, e.g. after extract_all_edges). Such an array
+    has no buffer, and the fallback of vtk_to_numpy in VTK 9.7 then fails
+    with NameError (vtkConstants is not imported there). In the installed
+    program this stopped the domain, the point and the flow arrow
+    (2026-11-22). Thus: a normal array is read directly, an implicit array
+    is first copied to a normal array.
+    """
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+    try:
+        return vtk_to_numpy(arr).astype(np.int64)
+    except (ValueError, NameError, TypeError):
+        pass
+    aos = arr.ToAOSDataArray() if hasattr(arr, "ToAOSDataArray") else None
+    if aos is None or aos is arr:
+        from vtkmodules.vtkCommonCore import vtkIdTypeArray
+        aos = vtkIdTypeArray()
+        aos.DeepCopy(arr)
+    try:
+        return vtk_to_numpy(aos).astype(np.int64)
+    except (ValueError, NameError, TypeError):
+        n = arr.GetNumberOfTuples()
+        return np.fromiter((arr.GetTuple1(i) for i in range(n)), np.int64, n)
+
+
 def _line_index(m):
     """(i0, i1, line) для кожного відрізка ліній PolyData `m`: номери точок
     кінців і номер лінії (від першої лінії, без точок-вершин)."""
-    from vtkmodules.util.numpy_support import vtk_to_numpy
     ca = m.GetLines()
     if ca is None or ca.GetNumberOfCells() == 0:
         return None
-    off = vtk_to_numpy(ca.GetOffsetsArray()).astype(np.int64)
-    conn = vtk_to_numpy(ca.GetConnectivityArray()).astype(np.int64)
+    off = _cell_ids(ca.GetOffsetsArray())
+    conn = _cell_ids(ca.GetConnectivityArray())
     if len(conn) < 2:
         return None
     k = np.arange(len(conn) - 1)

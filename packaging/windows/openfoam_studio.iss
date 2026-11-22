@@ -1,6 +1,6 @@
 ﻿; Inno Setup script of the Windows installer of OpenFOAM Studio.
 ;
-;   ISCC.exe /DAppVersion=0.2.1 /DSrcDir=<dist>\OpenFOAM Studio /DOutDir=<out> ^
+;   ISCC.exe /DAppVersion=0.2.2 /DSrcDir=<dist>\OpenFOAM Studio /DOutDir=<out> ^
 ;            packaging\windows\openfoam_studio.iss
 ;
 ; Input: the PyInstaller folder (packaging\pyinstaller\openfoam_studio.spec).
@@ -25,7 +25,7 @@
 ;   "OpenFOAM Studio (installed)", and the uninstaller removes only that one.
 
 #ifndef AppVersion
-  #define AppVersion "0.2.1"
+  #define AppVersion "0.2.2"
 #endif
 #ifndef SrcDir
   #define SrcDir "..\..\build\dist\OpenFOAM Studio"
@@ -79,10 +79,15 @@ en.ServerGroup=Server:
 uk.ServerGroup=Сервер:
 en.InstalledCopy=installed
 uk.InstalledCopy=встановлена
+en.FoamTask=Prepare OpenFOAM in WSL (also WSL and Ubuntu if they are missing; about 1-2 GB)
+uk.FoamTask=Підготувати OpenFOAM у WSL (і WSL з Ubuntu, якщо їх немає; близько 1-2 ГБ)
+en.FoamGroup=Calculations on this computer:
+uk.FoamGroup=Розрахунки на цьому компʼютері:
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "serverwizard"; Description: "{cm:ServerTask}"; GroupDescription: "{cm:ServerGroup}"; Flags: unchecked
+Name: "prepareopenfoam"; Description: "{cm:FoamTask}"; GroupDescription: "{cm:FoamGroup}"
 
 [Files]
 Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -96,7 +101,12 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "
 Name: "{autodesktop}\{#AppName} ({cm:InstalledCopy})"; Filename: "{app}\{#AppExe}"; AppUserModelID: "{#AppUserModelId}"; Tasks: desktopicon; Check: not PlainName('{autodesktop}')
 
 [Run]
-Filename: "{app}\{#AppExe}"; Parameters: "{code:LaunchArgs}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; With the task «Prepare OpenFOAM» the program starts at the end of the
+; install in any case (it opens the window of fs_setupfoam). Then the box
+; «Launch» is not shown: one window, not two. runasoriginaluser: WSL
+; belongs to the user, not to the administrator of an install for all users.
+Filename: "{app}\{#AppExe}"; Parameters: "{code:LaunchArgs}"; Tasks: prepareopenfoam; Flags: nowait skipifsilent runasoriginaluser
+Filename: "{app}\{#AppExe}"; Parameters: "{code:LaunchArgs}"; Description: "{cm:LaunchProgram,{#AppName}}"; Tasks: not prepareopenfoam; Flags: nowait postinstall skipifsilent
 
 [Code]
 { The target of a .lnk file ('' when it cannot be read). }
@@ -133,8 +143,11 @@ end;
 
 function LaunchArgs(Param: String): String;
 begin
+  Result := '';
   if WizardIsTaskSelected('serverwizard') then
-    Result := '--server-wizard'
-  else
-    Result := '';
+    Result := '--server-wizard';
+  { The program prepares OpenFOAM (fs_setupfoam) when it starts with this
+    flag. }
+  if WizardIsTaskSelected('prepareopenfoam') then
+    Result := Trim(Result + ' --prepare-openfoam');
 end;

@@ -4011,10 +4011,10 @@ class RunPanel(Panel):
         self.box_install = QtWidgets.QGroupBox("OpenFOAM not found")
         bi = QtWidgets.QVBoxLayout(self.box_install)
         bi.addWidget(hint(
-            tr("WSL already has Ubuntu — only OpenFOAM itself is left to "
-            "install. The button opens a WSL console and runs the "
-            "command; apt asks for the sudo password, so this step is "
-            "interactive."), fold=False))
+            tr("OpenFOAM is not on this computer. The button installs it in "
+               "WSL by itself (also WSL and Ubuntu, if they are not there), "
+               "without a password. The command below is the same install, "
+               "for a console."), fold=False))
         self.txt_install = QtWidgets.QPlainTextEdit()
         self.txt_install.setReadOnly(True)
         self.txt_install.setMaximumHeight(70)

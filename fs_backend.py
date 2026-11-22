@@ -767,6 +767,8 @@ INSTALL_SCRIPT = (
     "v=$(apt-cache policy \"$p\" | awk '/Candidate:/{print $2}'); "
     "case \"$v\" in *~rc*|*~beta*|*~alpha*) continue;; esac; "
     "echo \"$p\"; break; done) && "
+    '{ [ -n "$PKG" ] || { echo "No openfoam<N>-default package found"; '
+    'exit 1; }; } && '
     'echo "Ставлю $PKG" && '
     'sudo apt-get install -y "$PKG"'
 )
