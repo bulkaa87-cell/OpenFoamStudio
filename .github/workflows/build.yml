@@ -144,7 +144,8 @@ jobs:
           python packaging/make_cube_stl.py "$RUNNER_TEMP/cube.stl"
           if [ "${{ matrix.target }}" = "macos" ]; then
             EXE="dist/OpenFOAM Studio.app/Contents/MacOS/OpenFOAM Studio"
-            QT_QPA_PLATFORM=offscreen timeout 600 "$EXE" --smoke-test "$RUNNER_TEMP/smoke.json" "$RUNNER_TEMP/cube.stl" || echo "exit $?"
+            # macOS has no «timeout»: perl alarm ends the program after 600 s.
+            QT_QPA_PLATFORM=offscreen perl -e 'alarm shift; exec @ARGV' 600 "$EXE" --smoke-test "$RUNNER_TEMP/smoke.json" "$RUNNER_TEMP/cube.stl" || echo "exit $?"
           else
             EXE="dist/OpenFOAM Studio/OpenFOAM Studio"
             QT_QPA_PLATFORM=xcb timeout 600 xvfb-run -a "$EXE" --smoke-test "$RUNNER_TEMP/smoke.json" "$RUNNER_TEMP/cube.stl" || echo "exit $?"
