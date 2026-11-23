@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import sys
 import shutil
@@ -47,6 +48,7 @@ import fs_crashlog as crashlog
 import fs_geometry as geo
 import fs_i18n
 import fs_icons
+import fs_shared
 import fs_update
 import fs_version
 import fs_library as lib
@@ -5036,6 +5038,21 @@ class MainWindow(QtWidgets.QMainWindow):
                                  saved_cells=cells)
 
     def install_openfoam(self):
+        if os.name != "nt":
+            # Linux and macOS: no WSL. OpenFOAM on this computer (the
+            # program finds it in /usr/lib/openfoam, /opt), Docker or a
+            # server.
+            QtWidgets.QMessageBox.information(
+                self, tr("Install OpenFOAM"),
+                tr("Install OpenFOAM on this computer, then click «Search» "
+                   "again. Ubuntu and Debian:{NEWLINE}{NEWLINE}"
+                   "curl -s https://dl.openfoam.com/add-debian-repo.sh | "
+                   "sudo bash{NEWLINE}sudo apt-get install "
+                   "openfoam2512-default{NEWLINE}{NEWLINE}Other systems "
+                   "and macOS: Docker (the image opencfd/openfoam-default) "
+                   "or a calculation server (File → Set up a server…).",
+                   NEWLINE=NEWLINE))
+            return
         ans = QtWidgets.QMessageBox.question(
             self, tr("Install OpenFOAM"),
             tr("The program installs OpenFOAM in WSL by itself (and WSL "
@@ -9923,6 +9940,55 @@ def end_process(win, rc: int, grace_ms: int = 5000) -> None:
 
 
 SERVER_WIZARD_FLAG = "--server-wizard"
+# «--smoke-test <out.json> [model.stl]»: the check of a built program (CI of
+# each system). The window opens, reads the model, writes out.json and
+# closes. No questions, no server wizard, no Prepare OpenFOAM.
+SMOKE_FLAG = "--smoke-test"
+
+
+def _smoke_test(win, out: str, model: str) -> None:
+    import platform
+    res = {"ok": False, "version": fs_version.VERSION,
+           "platform": sys.platform, "machine": platform.machine(),
+           "frozen": fs_paths.FROZEN}
+    try:
+        import foamrs  # noqa: F401
+        res["foamrs"] = True
+    except ImportError:
+        res["foamrs"] = False
+    try:
+        res["meshfix"] = fs_shared.package("meshfix").__version__
+        res["foamview"] = fs_shared.package("foamview").__version__
+    except Exception as exc:                            # noqa: BLE001
+        res["shared_error"] = str(exc)
+    res["foamdist"] = os.path.isfile(str(be.FOAMDIST_LOCAL))         if hasattr(be, "FOAMDIST_LOCAL") else None
+    win.ask_save_on_close = False
+    t0 = time.monotonic()
+
+    def finish(error=""):
+        if error:
+            res["error"] = error
+        res["ok"] = not error
+        res["seconds"] = round(time.monotonic() - t0, 1)
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(res, fh, ensure_ascii=False, indent=1)
+        win.close()
+        QtWidgets.QApplication.quit()
+
+    if not model:
+        QtCore.QTimer.singleShot(3000, finish)
+        return
+    win.load_stl(model, units="mm")
+
+    def wait():
+        if getattr(win, "mesh", None) is not None:
+            res["cells"] = int(win.mesh.n_cells)
+            QtCore.QTimer.singleShot(2000, finish)
+        elif time.monotonic() - t0 > 180:
+            finish("the model did not load in 180 s")
+        else:
+            QtCore.QTimer.singleShot(250, wait)
+    QtCore.QTimer.singleShot(250, wait)
 
 
 def main():
@@ -9941,6 +10007,15 @@ def main():
     app.setWindowIcon(fs_icons.icon(fs_icons.OFS))
     win = MainWindow()
     win.show()
+    args = sys.argv[1:]
+    if SMOKE_FLAG in args:
+        i = args.index(SMOKE_FLAG)
+        rest = args[i + 1:]
+        QtCore.QTimer.singleShot(500, lambda: _smoke_test(
+            win, rest[0] if rest else "smoke.json",
+            rest[1] if len(rest) > 1 else ""))
+        end_process(win, app.exec())
+        return
     if crashed:
         win.tell_last_crash(crashed)
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):

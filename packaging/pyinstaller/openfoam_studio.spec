@@ -1,4 +1,5 @@
-# PyInstaller spec of OpenFOAM Studio: one folder (<dist>/OpenFOAM Studio/).
+# PyInstaller spec of OpenFOAM Studio: one folder (<dist>/OpenFOAM Studio/),
+# on macOS also the bundle <dist>/OpenFOAM Studio.app.
 #
 #   pyinstaller --noconfirm --distpath <dist> --workpath <work> \
 #       packaging/pyinstaller/openfoam_studio.spec
@@ -106,3 +107,25 @@ exe = EXE(
     icon=icon,
 )
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name=NAME)
+
+if sys.platform == "darwin":
+    import re
+    with open(os.path.join(ROOT, "fs_version.py"), encoding="utf-8") as fh:
+        VERSION = re.search(r'^VERSION = "([^"]+)"', fh.read(), re.M).group(1)
+    app = BUNDLE(
+        coll,
+        name=NAME + ".app",
+        icon=icon,
+        bundle_identifier="io.github.bulkaa87-cell.openfoamstudio",
+        info_plist={
+            "CFBundleShortVersionString": VERSION,
+            "CFBundleVersion": VERSION,
+            "NSHighResolutionCapable": True,
+            "CFBundleDocumentTypes": [{
+                "CFBundleTypeName": "STL mesh",
+                "CFBundleTypeRole": "Editor",
+                "LSItemContentTypes": ["public.standard-tesselated-geometry-format"],
+                "CFBundleTypeExtensions": ["stl"],
+            }],
+        },
+    )

@@ -177,6 +177,7 @@
  "How many triangles to keep:": "Скільки трикутників лишити:",
  "If you change this value, the mesh must be rebuilt (snappyHexMesh, ~{snappy_minutes} min on the server). Change it?": "Якщо змінити це значення, сітку доведеться перебудувати (snappyHexMesh, ~{snappy_minutes} хв на сервері). Змінити?",
  "Install OpenFOAM": "Встановити OpenFOAM",
+ "Install OpenFOAM on this computer, then click «Search» again. Ubuntu and Debian:{NEWLINE}{NEWLINE}curl -s https://dl.openfoam.com/add-debian-repo.sh | sudo bash{NEWLINE}sudo apt-get install openfoam2512-default{NEWLINE}{NEWLINE}Other systems and macOS: Docker (the image opencfd/openfoam-default) or a calculation server (File → Set up a server…).": "Встановіть OpenFOAM на цьому компʼютері, тоді знову натисніть «Пошук». Ubuntu і Debian:{NEWLINE}{NEWLINE}curl -s https://dl.openfoam.com/add-debian-repo.sh | sudo bash{NEWLINE}sudo apt-get install openfoam2512-default{NEWLINE}{NEWLINE}Інші системи й macOS: Docker (образ opencfd/openfoam-default) або сервер для розрахунків (Файл → Налаштувати сервер…).",
  "Install and server guide": "Довідник: встановлення і сервер",
  "Install the program, connect a server through Tailscale, and what to do when the connection hangs": "Встановлення програми, підключення сервера через Tailscale і що робити, коли зʼєднання зависає",
  "Iso": "Ізо",

@@ -1,0 +1,4 @@
+#!/bin/sh
+# The start script of the AppImage: run the PyInstaller program.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/lib/openfoam-studio/OpenFOAM Studio" "$@"

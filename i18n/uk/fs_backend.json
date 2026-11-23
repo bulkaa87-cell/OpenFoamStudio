@@ -8,6 +8,7 @@
  "Server {host} / {version}": "Сервер {host} / {version}",
  "Server {host} / {version} ({engine})": "Сервер {host} / {version} ({engine})",
  "Starting on {host} detached — the run will not depend on this window.": "Пускаю на {host} відчепленим — прогін не залежатиме від цього вікна.",
+ "This computer": "Цей компʼютер",
  "You can close the program: the run will not stop, and you can connect to it again with the “Connect” button.": "Програму можна закрити: прогін не спиниться, а підключитися до нього можна кнопкою «Підключитися».",
  "[checkMesh] remarks: {why}. For a real mesh this is within normal limits — continuing.{tip}": "[checkMesh] зауваження: {why}. Для реальної сітки це в межах норми — продовжую.{tip}",
  "[{name}] optional step, continuing (code {rc})": "[{name}] крок необовʼязковий, продовжую (код {rc})",

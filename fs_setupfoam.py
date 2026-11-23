@@ -516,6 +516,8 @@ def run_remove(argv) -> int:
 def wanted_at_start(argv=None) -> bool:
     """Open the window at the start: the installer flag, or a step that
     waits for the restart of Windows."""
+    if os.name != "nt":                 # WSL is Windows only
+        return False
     argv = sys.argv[1:] if argv is None else argv
     return FLAG in argv or bool(fset.get(PENDING_KEY))
 

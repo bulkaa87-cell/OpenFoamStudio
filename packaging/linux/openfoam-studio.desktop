@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenFOAM Studio
+Comment=External aerodynamics with OpenFOAM: geometry, mesh, run, results
+Exec=openfoam-studio %f
+Icon=openfoam-studio
+Terminal=false
+Categories=Science;Engineering;Physics;
+MimeType=model/stl;application/sla;

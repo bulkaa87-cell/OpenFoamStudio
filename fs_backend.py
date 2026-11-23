@@ -455,6 +455,10 @@ class Backend:
                 f'source /usr/lib/openfoam/openfoam*/etc/bashrc 2>/dev/null; {command}',
             ]
 
+        # native: OpenFOAM on this computer (Linux, macOS).
+        if self.bashrc:
+            return ["bash", "-c", f'source "{self.bashrc}" >/dev/null 2>&1; '
+                                  f'cd "{case_dir}" && {command}']
         return ["bash", "-c", f'cd "{case_dir}" && {command}']
 
     def pause_argv(self, case_dir: str, native_dir: str | None = None,
@@ -553,6 +557,27 @@ def detect_wsl() -> list[Backend]:
                              bashrc=bashrc, version=version,
                              ready=version != "?", detail=bashrc))
     return found
+
+
+def detect_native() -> list[Backend]:
+    """OpenFOAM on this computer (Linux, macOS): an etc/bashrc in the usual
+    folders (FOAM_BASHRC_GLOBS). Nothing on Windows (WSL is its way)."""
+    if os.name == "nt":
+        return []
+    rc, out = _run(["bash", "-c", _PROBE], timeout=30)
+    paths = [ln[6:].strip() for ln in out.splitlines() if ln.startswith("FOUND:")]
+    paths = [p for p in paths if p.startswith("/")]
+    if not paths:
+        return []
+    bashrc = sorted(paths)[-1]
+    rc, ver = _run(["bash", "-c", f'source "{bashrc}" >/dev/null 2>&1 '
+                                  f'&& echo "V:$WM_PROJECT_VERSION"'], timeout=60)
+    version = "?"
+    for ln in ver.splitlines():
+        if ln.startswith("V:") and ln[2:].strip():
+            version = ln[2:].strip()
+    return [Backend(kind="native", label=tr("This computer"), bashrc=bashrc,
+                    version=version, ready=version != "?", detail=bashrc)]
 
 
 def detect_bluecfd() -> list[Backend]:
@@ -699,15 +724,18 @@ def detect_all(ssh_hosts: "list[str] | tuple[str, ...]" = (),
     на сервер), і без цього вікно виглядало б завислим.
     """
     hosts = [h.strip() for h in ssh_hosts if (h or "").strip()]
-    steps = [("WSL", detect_wsl), ("blueCFD", detect_bluecfd),
-             ("Docker", detect_docker)]
+    if os.name == "nt":
+        steps = [("WSL", detect_wsl), ("blueCFD", detect_bluecfd),
+                 ("Docker", detect_docker)]
+    else:
+        steps = [(tr("This computer"), detect_native), ("Docker", detect_docker)]
     steps += [(h, lambda h=h: detect_ssh([h], containers)) for h in hosts]
     found: list[Backend] = []
     for i, (name, check) in enumerate(steps, 1):
         if progress is not None:
             progress(name, i, len(steps))
         found += check()
-    found.sort(key=lambda b: (not b.ready, b.kind != "wsl"))
+    found.sort(key=lambda b: (not b.ready, b.kind not in ("wsl", "native")))
     return found
 
 
