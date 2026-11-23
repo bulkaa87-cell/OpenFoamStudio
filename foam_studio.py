@@ -4926,8 +4926,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # знову. Відповіді, що вже є, лишаються.
         self._res_cache = {k: v for k, v in self._res_cache.items()
                            if v[0] > 0 and v[2] > 0}
-        _, script = be.install_command()
-        self.panel_run.set_backends(self.backends, script)
+        self.panel_run.set_backends(self.backends)
         # Пошук може завершитися і після відновлення сесії — тоді вибір
         # бекенда чекає тут.
         self._select_backend()
@@ -5038,26 +5037,25 @@ class MainWindow(QtWidgets.QMainWindow):
                                  saved_cells=cells)
 
     def install_openfoam(self):
-        if os.name != "nt":
-            # Linux and macOS: no WSL. OpenFOAM on this computer (the
-            # program finds it in /usr/lib/openfoam, /opt), Docker or a
-            # server.
-            QtWidgets.QMessageBox.information(
-                self, tr("Install OpenFOAM"),
-                tr("Install OpenFOAM on this computer, then click «Search» "
-                   "again. Ubuntu and Debian:{NEWLINE}{NEWLINE}"
-                   "curl -s https://dl.openfoam.com/add-debian-repo.sh | "
-                   "sudo bash{NEWLINE}sudo apt-get install "
-                   "openfoam2512-default{NEWLINE}{NEWLINE}Other systems "
-                   "and macOS: Docker (the image opencfd/openfoam-default) "
-                   "or a calculation server (File → Set up a server…).",
-                   NEWLINE=NEWLINE))
-            return
+        """The button «Install WSL / OpenFOAM» (Windows) or «Install
+        OpenFOAM» (Linux, macOS): one question, then the window «Prepare
+        OpenFOAM» does all steps (fs_setupfoam)."""
+        if os.name == "nt":
+            text = tr("The program installs OpenFOAM in WSL by itself (and "
+                      "WSL with Ubuntu, if they are not there). This "
+                      "downloads about 1-2 GB and takes 10-30 min. Continue?")
+        elif sys.platform == "darwin":
+            text = tr("The program downloads OpenFOAM for Docker (about "
+                      "1-2 GB). Docker Desktop must be installed and "
+                      "started. Continue?")
+        else:
+            text = tr("The program installs OpenFOAM on this computer: the "
+                      "package of openfoam.com on Ubuntu and Debian, a "
+                      "podman or docker container on other systems. The "
+                      "system asks for your password. This downloads about "
+                      "1-2 GB and takes 10-30 min. Continue?")
         ans = QtWidgets.QMessageBox.question(
-            self, tr("Install OpenFOAM"),
-            tr("The program installs OpenFOAM in WSL by itself (and WSL "
-               "with Ubuntu, if they are not there). This downloads about "
-               "1-2 GB and takes 10-30 min. Continue?"),
+            self, tr("Install OpenFOAM"), text,
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
         if ans != QtWidgets.QMessageBox.Yes:
             return

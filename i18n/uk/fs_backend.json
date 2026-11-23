@@ -98,6 +98,7 @@
  "{cores} cores, but no OpenFOAM image (podman pull docker.io/opencfd/openfoam-run:2512)": "{cores} ядер, але немає образу OpenFOAM (podman pull docker.io/opencfd/openfoam-run:2512)",
  "{done:.0f} MB · {speed:.1f} MB/s": "{done:.0f} МБ · {speed:.1f} МБ/с",
  "{done:.0f} of {total:.0f} MB · {speed:.1f} MB/s": "{done:.0f} з {total:.0f} МБ · {speed:.1f} МБ/с",
+ "{engine} (no OpenFOAM image)": "{engine} (немає образу OpenFOAM)",
  "{engine} image {image}, cores {cores}": "образ {engine} {image}, ядер {cores}",
  "{local} is missing — build it: tools\\build_rust.ps1 (it also builds foamdist for Linux)": "немає {local} — зберіть: tools\\build_rust.ps1 (збирає й foamdist під Linux)",
  "{solver}-stable": "{solver}-стійкий",

@@ -24,6 +24,7 @@ import shutil
 import tarfile
 import tempfile
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -157,6 +158,40 @@ def container_run(engine: str, image: str, script: str) -> str:
             f'-e {CONTAINER_HWLOC} '
             f'-v "{CONTAINER_ROOT}:{CONTAINER_ROOT}:z" -w "$PWD" '
             f'--entrypoint bash {_shq(image)} -c {_shq(inner)}')
+
+
+def local_container_argv(engine: str, image: str, case_dir: str,
+                         command: str, uid: int | None = None,
+                         gid: int | None = None) -> list[str]:
+    """argv: run `command` in `image` on THIS computer, in the case folder
+    (mounted at /case).
+
+    - The name comes from the case folder: «pause» finds the container by
+      it, and two cases do not use the same name.
+    - podman (rootless): --userns=keep-id, the files stay the files of the
+      person; ":z" for SELinux (Fedora: without it the case is not readable).
+    - docker on Linux: --user uid:gid, else the results belong to root.
+    - HOME=/tmp: the uid has no home folder in the image.
+    - CONTAINER_HWLOC: hwloc looks for GPUs through X and hangs.
+    """
+    if engine not in CONTAINER_ENGINES:
+        raise ValueError(engine)
+    wd = "/case"
+    argv = [engine, "run", "--rm", "--name", container_name(case_dir),
+            "--label", CONTAINER_LABEL, "-e", "HOME=/tmp",
+            "-e", CONTAINER_HWLOC]
+    mount = f"{os.path.abspath(case_dir)}:{wd}"
+    if engine == "podman":
+        argv += ["--userns=keep-id"]
+        mount += ":z"
+    else:
+        if uid is None and hasattr(os, "getuid") and sys.platform != "darwin":
+            uid, gid = os.getuid(), os.getgid()
+        if uid is not None:
+            argv += ["--user", f"{uid}:{gid if gid is not None else uid}"]
+    argv += ["-v", mount, "-w", wd, "--entrypoint", "bash", image, "-c",
+             f"source {CONTAINER_BASHRC} >/dev/null 2>&1; {command}"]
+    return argv
 
 
 def parse_container(text: str) -> tuple[str, str]:
@@ -379,7 +414,8 @@ class Backend:
     setvars: str = ""
     image: str = ""
     host: str = ""            # для ssh: імʼя з ~/.ssh/config або user@host
-    # ssh only: OpenFOAM in a container on the server ("" = native install).
+    # ssh: OpenFOAM in a container on the server ("" = native install).
+    # docker: the engine on this computer ("" = docker).
     engine: str = ""          # docker | podman
     ready: bool = True
     detail: str = ""
@@ -397,6 +433,8 @@ class Backend:
         if self.kind == "ssh":
             return f"ssh:{self.host}"
         if self.kind == "docker":
+            if self.engine and self.engine != "docker":
+                return f"docker:{self.engine}|{self.image}"
             return f"docker:{self.image}"
         if self.kind == "bluecfd":
             return f"bluecfd:{self.version}"
@@ -443,17 +481,8 @@ class Backend:
             return ["cmd.exe", "/c", inner]
 
         if self.kind == "docker":
-            wd = "/case"
-            return [
-                "docker", "run", "--rm",
-                # Імʼя потрібне, щоб контейнер можна було поставити на паузу:
-                # docker pause адресується саме за ним. Виводиться з каталогу
-                # кейсу, тому два різні кейси не б'ються за одне імʼя.
-                "--name", container_name(case_dir),
-                "-v", f"{os.path.abspath(case_dir)}:{wd}",
-                "-w", wd, self.image, "bash", "-c",
-                f'source /usr/lib/openfoam/openfoam*/etc/bashrc 2>/dev/null; {command}',
-            ]
+            return local_container_argv(self.engine or "docker", self.image,
+                                        case_dir, command)
 
         # native: OpenFOAM on this computer (Linux, macOS).
         if self.bashrc:
@@ -474,7 +503,7 @@ class Backend:
                 self.work_dir(case_dir, native_dir), sig))
         if self.kind == "docker":
             verb = "unpause" if resume else "pause"
-            return ["docker", verb, container_name(case_dir)]
+            return [self.engine or "docker", verb, container_name(case_dir)]
         if self.kind == "ssh":
             return ssh_argv(self.host, signal_script(
                 self.work_dir(case_dir, native_dir), sig))
@@ -595,19 +624,36 @@ def detect_bluecfd() -> list[Backend]:
     return out
 
 
-def detect_docker() -> list[Backend]:
-    rc, out = _run(["docker", "--version"])
-    if rc != 0:
-        return []
-    rc, imgs = _run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"])
-    cands = [ln.strip() for ln in imgs.splitlines()
-             if "openfoam" in ln.lower() or "foam" in ln.lower()]
-    if not cands:
-        return [Backend(kind="docker", label="Docker (no OpenFOAM image)",
-                        ready=False, detail=out.strip().splitlines()[0]
-                        if out.strip() else "docker found")]
-    return [Backend(kind="docker", label=f"Docker / {c}", image=c, detail=c)
-            for c in cands]
+def _image_rank(name: str) -> int:
+    """default and dev images first: they have wmake (coded entries of
+    the program, e.g. adaptErr); the run image has not."""
+    low = name.lower()
+    return 0 if "default" in low else 1 if "dev" in low else 2
+
+
+def detect_docker(engines=CONTAINER_ENGINES) -> list[Backend]:
+    """OpenFOAM images of docker and podman on this computer."""
+    found: list[Backend] = []
+    for engine in engines:
+        rc, out = _run([engine, "--version"])
+        if rc != 0:
+            continue
+        name = engine.capitalize()
+        rc, imgs = _run([engine, "images", "--format",
+                         "{{.Repository}}:{{.Tag}}"])
+        cands = sorted({ln.strip() for ln in imgs.splitlines()
+                        if "foam" in ln.lower() and "<none>" not in ln},
+                       key=lambda c: (_image_rank(c), c))
+        if rc != 0 or not cands:
+            found.append(Backend(
+                kind="docker", engine=engine, ready=False,
+                label=tr("{engine} (no OpenFOAM image)", engine=name),
+                detail=out.strip().splitlines()[0] if out.strip()
+                else engine))
+            continue
+        found += [Backend(kind="docker", engine=engine, image=c,
+                          label=f"{name} / {c}", detail=c) for c in cands]
+    return found
 
 
 # Server side: the OpenFOAM images of docker and podman, "engine|image".
@@ -800,17 +846,6 @@ INSTALL_SCRIPT = (
     'echo "Ставлю $PKG" && '
     'sudo apt-get install -y "$PKG"'
 )
-
-
-def install_command(distro: str = "Ubuntu") -> tuple[list[str], str]:
-    """argv, що відкриє консольне вікно WSL і поставить OpenFOAM.
-
-    Виконується інтерактивно, бо apt попросить пароль sudo — підставити його
-    з програми неможливо й не треба.
-    """
-    argv = ["cmd.exe", "/c", "start", "", "wsl.exe", "-d", distro, "-e",
-            "bash", "-lic", f"{INSTALL_SCRIPT}; echo; echo ГОТОВО; exec bash"]
-    return argv, INSTALL_SCRIPT
 
 
 # --------------------------------------------------------------------------

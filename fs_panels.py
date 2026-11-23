@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from html import escape as html_escape
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -4010,23 +4011,32 @@ class RunPanel(Panel):
 
         self.box_install = QtWidgets.QGroupBox("OpenFOAM not found")
         bi = QtWidgets.QVBoxLayout(self.box_install)
-        bi.addWidget(hint(
-            tr("OpenFOAM is not on this computer. The button installs it in "
-               "WSL by itself (also WSL and Ubuntu, if they are not there), "
-               "without a password. The command below is the same install, "
-               "for a console."), fold=False))
-        self.txt_install = QtWidgets.QPlainTextEdit()
-        self.txt_install.setReadOnly(True)
-        self.txt_install.setMaximumHeight(70)
-        self.txt_install.setStyleSheet("font-family: Consolas, monospace; font-size:11px;")
-        bi.addWidget(self.txt_install)
-        brow = QtWidgets.QHBoxLayout()
-        self.btn_install = QtWidgets.QPushButton("Install in WSL")
+        # One button, no console command: the window «Prepare OpenFOAM»
+        # does all steps (fs_setupfoam).
+        if os.name == "nt":
+            bi.addWidget(hint(
+                tr("OpenFOAM is not on this computer. The button installs "
+                   "it in WSL by itself (also WSL and Ubuntu, if they are "
+                   "not there), without a console and without a password."),
+                fold=False))
+            self.btn_install = QtWidgets.QPushButton("Install WSL / OpenFOAM")
+        elif sys.platform == "darwin":
+            bi.addWidget(hint(
+                tr("OpenFOAM is not on this computer. The button downloads "
+                   "it for Docker (Docker Desktop must be installed)."),
+                fold=False))
+            self.btn_install = QtWidgets.QPushButton("Install OpenFOAM")
+        else:
+            bi.addWidget(hint(
+                tr("OpenFOAM is not on this computer. The button installs "
+                   "it by itself: the package on Ubuntu and Debian, a "
+                   "container (podman or docker) on other systems. The "
+                   "system asks for your password."), fold=False))
+            self.btn_install = QtWidgets.QPushButton("Install OpenFOAM")
         self.btn_install.clicked.connect(self.install_requested)
-        self.btn_copy = QtWidgets.QPushButton("Copy Command")
-        self.btn_copy.clicked.connect(self._copy_install)
+        brow = QtWidgets.QHBoxLayout()
         brow.addWidget(self.btn_install)
-        brow.addWidget(self.btn_copy)
+        brow.addStretch(1)
         bi.addLayout(brow)
         self.v.addWidget(self.box_install)
         self.box_install.setVisible(False)
@@ -4385,18 +4395,14 @@ class RunPanel(Panel):
                 + t.reason for t in diagnosis.tips]))
         self.btn_fix_layers.setVisible(show)
 
-    def _copy_install(self):
-        QtWidgets.QApplication.clipboard().setText(self.txt_install.toPlainText())
-        self.lbl_status.setText("Command copied to the clipboard.")
-
     def set_backends(self, backends, install_script=""):
+        # install_script: not shown any more (one button since 0.2.7).
         self.cmb_backend.clear()
         for b in backends:
             mark = "" if b.ready else tr("  (not ready)")
             self.cmb_backend.addItem(f"{b.label}{mark}", b)
         if not backends:
             self.cmb_backend.addItem("nothing found", None)
-        self.txt_install.setPlainText(install_script)
         self.update_backend_label()
 
     def current_backend(self):

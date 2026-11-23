@@ -82,6 +82,73 @@ ROOT_SCRIPT = (
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# Linux and macOS -----------------------------------------------------------
+# Ubuntu / Debian: the package of openfoam.com (ROOT_SCRIPT) through pkexec
+# (the password window of the desktop, no console). Other Linux and macOS:
+# the image of OpenCFD in podman or docker. «default», not «run»: the run
+# image has no wmake, and the coded entries of the program (adaptErr) need
+# it. The image has amd64 and arm64 (Apple silicon).
+CONTAINER_IMAGE = "docker.io/opencfd/openfoam-default:2512"
+DOCKER_URL = "https://www.docker.com/products/docker-desktop/"
+# Install podman with the package manager of the system (pkexec).
+PODMAN_INSTALL = {
+    "dnf": ["dnf", "install", "-y", "podman"],
+    "zypper": ["zypper", "--non-interactive", "install", "podman"],
+    "pacman": ["pacman", "-S", "--noconfirm", "--needed", "podman"],
+}
+
+
+def os_release(text: str | None = None) -> dict:
+    """/etc/os-release as a dict (keys upper case, values without quotes)."""
+    if text is None:
+        try:
+            text = Path("/etc/os-release").read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+    out = {}
+    for ln in text.splitlines():
+        key, sep, val = ln.partition("=")
+        if sep:
+            out[key.strip().upper()] = val.strip().strip('"').strip("'")
+    return out
+
+
+def is_debian_like(osr: dict) -> bool:
+    words = (osr.get("ID", "") + " " + osr.get("ID_LIKE", "")).lower().split()
+    return any(w in ("debian", "ubuntu") for w in words)
+
+
+def unix_plan(system: str, osr: dict, which) -> tuple:
+    """(way, tool) for Linux / macOS:
+    ("apt", "")             Ubuntu / Debian: the package, pkexec
+    ("container", engine)   podman or docker is there: pull the image
+    ("podman", manager)     install podman first (pkexec), then the image
+    ("none", "")            nothing the program can do by itself."""
+    if system == "darwin":
+        order = ("docker", "podman")      # Docker Desktop is the usual one
+    else:
+        if which("apt-get") and which("pkexec") and is_debian_like(osr):
+            return ("apt", "")
+        order = ("podman", "docker")      # podman: rootless, no group
+    for engine in order:
+        if which(engine):
+            return ("container", engine)
+    if system != "darwin" and which("pkexec"):
+        for manager in PODMAN_INSTALL:
+            if which(manager):
+                return ("podman", manager)
+    return ("none", "")
+
+
+def system_name() -> str:
+    if os.name == "nt":
+        return "windows"
+    return "darwin" if sys.platform == "darwin" else "linux"
+
+
+def detect_unix() -> list:
+    return be.detect_native() + be.detect_docker()
+
 
 def _decode(raw: bytes) -> str:
     """wsl.exe writes its own messages in UTF-16; Linux programs in UTF-8."""
@@ -139,13 +206,51 @@ def wsl_progress(line: str):
     return v if 0.0 <= v <= 100.0 else None
 
 
-def wsl_distros(run=run_lines) -> list | None:
-    """The WSL distributions, or None when WSL is not installed."""
+def wsl_present() -> bool:
+    """WSL is a part of this Windows: its service is registered (LxssManager
+    of the Windows feature, WSLService of the WSL package). wsl.exe alone
+    tells nothing: Windows 10 and 11 have it also without WSL."""
+    if os.name != "nt":
+        return False
+    import winreg
+    for name in ("LxssManager", "WSLService"):
+        try:
+            winreg.CloseKey(winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Services" "\\" + name))
+            return True
+        except OSError:
+            pass
+    return False
+
+
+def wsl_distros(run=run_lines, present=wsl_present) -> list | None:
+    """The WSL distributions, or None when WSL is not installed.
+    `wsl -l -q` ends with -1 also when WSL is installed but has no
+    distribution (the state after `wsl --install` and the restart):
+    then the list is empty, not None."""
     lines: list = []
     rc = run(["wsl.exe", "-l", "-q"], lines.append)
     if rc != 0:
-        return None
+        return [] if present() else None
     return [ln.strip() for ln in lines if ln.strip()]
+
+
+def decode_log(raw: bytes) -> str:
+    """A log file of wsl.exe: UTF-16 (its own messages) or UTF-8."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or raw.count(b"\x00") > len(raw) // 4:
+        return raw.decode("utf-16", errors="replace").lstrip("﻿")
+    return _decode(raw)
+
+
+# Errors of `wsl --install` that need a change of the BIOS / UEFI settings.
+_VIRT_ERRORS = ("0x80370102", "0x80370114", "0x8007019e", "0x800701bc",
+                "HCS_E_HYPERV_NOT_INSTALLED")
+
+
+def needs_virtualization(log: str) -> bool:
+    low = log.lower()
+    return any(e.lower() in low for e in _VIRT_ERRORS)
 
 
 def apt_distro(distros) -> str:
@@ -174,11 +279,23 @@ def root_argv(distro: str, script: str) -> list:
     return ["wsl.exe", "-d", distro, "-u", "root", "-e", "bash", "-c", script]
 
 
-def install_wsl_argv() -> list:
-    """`wsl --install` with administrator rights; waits for the end."""
+def wsl_log_path() -> Path:
+    return fset.path().parent / "wsl-install.log"
+
+
+def install_wsl_argv(log: Path | None = None) -> list:
+    """`wsl --install` with administrator rights; waits for the end.
+    The exit code is the exit code of wsl.exe (-PassThru: without it,
+    powershell gives 0 also when wsl.exe failed, and the program said
+    «WSL is installed» after each try). The elevated process writes its
+    output to `log` (its console is not ours)."""
+    log = Path(log or wsl_log_path())
+    target = str(log).replace("'", "''")
     return ["powershell.exe", "-NoProfile", "-Command",
-            "Start-Process wsl.exe -Verb RunAs -Wait -ArgumentList "
-            f"'--install','-d','{DISTRO}'"]
+            "$p = Start-Process cmd.exe -Verb RunAs -Wait -PassThru "
+            "-WindowStyle Hidden -ArgumentList "
+            f"'/c wsl.exe --install -d {DISTRO} > \"{target}\" 2>&1'; "
+            "exit $p.ExitCode"]
 
 
 def install_distro_argv() -> list:
@@ -233,10 +350,16 @@ class Worker(QtCore.QObject):
     done = QtCore.Signal(str, str)      # result id ("ok", "restart",
     #                                     "failed"), text for the person
 
-    def __init__(self, run=run_lines, detect=None):
+    def __init__(self, run=run_lines, detect=None, present=wsl_present,
+                 system=None, which=shutil.which, osr=None):
         super().__init__()
+        self._system = system or system_name()
         self._run = run
-        self._detect = detect or be.detect_wsl
+        self._detect = detect or (be.detect_wsl if self._system == "windows"
+                                  else detect_unix)
+        self._present = present
+        self._which = which
+        self._osr = osr
 
     def _ready(self) -> list:
         return [b for b in self._detect() if b.ready]
@@ -263,15 +386,100 @@ class Worker(QtCore.QObject):
         except Exception as exc:                        # noqa: BLE001
             self.done.emit("failed", f"{type(exc).__name__}: {exc}")
 
+    def _ok_ready(self) -> bool:
+        ready = self._ready()
+        if ready:
+            self.done.emit("ok", tr("OpenFOAM is ready: {what}",
+                                    what=ready[0].label + " " + ready[0].version))
+        return bool(ready)
+
+    def _work_unix(self):
+        """Linux / macOS: the package (Ubuntu, Debian) or the container."""
+        emit = self.line.emit
+        self.status.emit(tr("Checking OpenFOAM…"))
+        if self._ok_ready():
+            return
+        osr = self._osr if self._osr is not None else os_release()
+        way, tool = unix_plan(self._system, osr, self._which)
+        if way == "apt":
+            self._step(tr("Installing OpenFOAM (about 1-2 GB, 10-30 min). "
+                          "The system asks for your password…"))
+            got = []
+
+            def emit_pkg(line):
+                m = re.match(r"OFS_PACKAGE=(openfoam[0-9]+-default)\s*$",
+                             line.strip())
+                if m:
+                    got.append(m.group(1))
+                pct, keep = apt_progress(line)
+                if pct is not None:
+                    self.progress.emit(int(pct))
+                if keep:
+                    emit(line)
+            rc = self._run(["pkexec", "bash", "-c", ROOT_SCRIPT], emit_pkg)
+            if got:
+                write_marker({"package": got[-1], "native": True})
+            if rc in (126, 127):
+                self.done.emit("failed", tr(
+                    "The password window was closed or the password was "
+                    "not accepted. Click the button again."))
+                return
+            if rc != 0:
+                self.done.emit("failed", tr(
+                    "The OpenFOAM install ended with code {rc}. The log "
+                    "above shows why.", rc=rc))
+                return
+        else:
+            if way == "podman":
+                self._step(tr("Installing podman (the system asks for your "
+                              "password)…"))
+                rc = self._run(["pkexec"] + PODMAN_INSTALL[tool], emit)
+                if rc != 0 or not self._which("podman"):
+                    self.done.emit("failed", tr(
+                        "podman was not installed (code {rc}). Install "
+                        "podman or docker with the packages of your system, "
+                        "then click the button again.", rc=rc))
+                    return
+                way, tool = "container", "podman"
+            if way == "none":
+                if self._system == "darwin":
+                    self.done.emit("failed", tr(
+                        "On macOS, OpenFOAM runs in Docker. Install Docker "
+                        "Desktop ({url}), start it, then click the button "
+                        "again.", url=DOCKER_URL))
+                else:
+                    self.done.emit("failed", tr(
+                        "Install podman or docker with the packages of your "
+                        "system, then click the button again."))
+                return
+            if self._run([tool, "info"], lambda _line: None) != 0:
+                self.done.emit("failed", tr(
+                    "{engine} does not answer. Start it (on macOS: start "
+                    "Docker Desktop), then click the button again.",
+                    engine=tool))
+                return
+            self._step(tr("Downloading OpenFOAM for {engine}: {image} "
+                          "(about 1-2 GB, 5-20 min)…",
+                          engine=tool, image=CONTAINER_IMAGE))
+            rc = self._run([tool, "pull", CONTAINER_IMAGE], emit)
+            if rc != 0:
+                self.done.emit("failed", tr(
+                    "The download of {image} ended with code {rc}. The log "
+                    "above shows why.", image=CONTAINER_IMAGE, rc=rc))
+                return
+            write_marker({"engine": tool, "image": CONTAINER_IMAGE})
+        self._step(tr("Checking OpenFOAM…"))
+        if not self._ok_ready():
+            self.done.emit("failed", tr(
+                "The install ended, but the program does not find OpenFOAM."))
+
     def _work(self):
         emit = self.line.emit
-        if os.name != "nt":
-            self.done.emit("failed", tr(
-                "WSL exists only on Windows. On this system, install "
-                "OpenFOAM with the packages of your Linux, or use a server."))
+        if self._system != "windows":
+            self._work_unix()
             return
         self.status.emit(tr("Checking WSL…"))
-        distros = wsl_distros(self._run)
+        distros = wsl_distros(self._run, self._present)
         ready = self._ready() if distros else []
         if ready:
             self.done.emit("ok", tr("OpenFOAM is ready: {what}",
@@ -279,19 +487,47 @@ class Worker(QtCore.QObject):
             return
         steps = plan(distros, False)
         if "wsl" in steps:
+            if fset.get(PENDING_KEY) and read_marker().get("wsl_installed"):
+                # The last start installed WSL and asked for the restart,
+                # but WSL is still not there: a new `wsl --install` gives
+                # the same result. Stop the loop and say what to do.
+                fset.set(PENDING_KEY, False)
+                self.done.emit("failed", tr(
+                    "WSL is still not installed after the restart. Open "
+                    "PowerShell as administrator, run “wsl --install” and "
+                    "read its message. Often virtualization (Intel VT-x / "
+                    "AMD SVM) is off in the BIOS or UEFI settings."))
+                return
             self._step(tr("Installing WSL and Ubuntu (Windows asks for "
                           "administrator rights)…"))
-            rc = self._run(install_wsl_argv(), self._wsl_emit)
-            fset.set(PENDING_KEY, True)
-            if rc == 0:
-                write_marker({"wsl_installed": True, "distro": DISTRO,
-                              "distro_installed": True})
-            if rc != 0:
+            log = wsl_log_path()
+            try:
+                log.parent.mkdir(parents=True, exist_ok=True)
+                log.unlink()
+            except OSError:
+                pass
+            rc = self._run(install_wsl_argv(log), self._wsl_emit)
+            try:
+                text = decode_log(log.read_bytes())
+            except OSError:
+                text = ""
+            for ln in text.splitlines():
+                if ln.strip():
+                    self._wsl_emit(ln.rstrip())
+            # 3010 / 1641: Windows must restart. A different code with the
+            # WSL service now registered: the restart finishes it too.
+            if rc not in (0, 3010, 1641) and not self._present():
+                hint = (tr(" Turn on virtualization (Intel VT-x / AMD SVM) "
+                           "in the BIOS or UEFI settings.")
+                        if needs_virtualization(text) else "")
                 self.done.emit("failed", tr(
                     "WSL was not installed (code {rc}). Install it by hand: "
                     "open PowerShell as administrator and run “wsl --install”.",
-                    rc=rc))
+                    rc=rc) + hint)
                 return
+            fset.set(PENDING_KEY, True)
+            write_marker({"wsl_installed": True, "distro": DISTRO,
+                          "distro_installed": True})
             self.done.emit("restart", tr(
                 "WSL is installed. Restart Windows, then start OpenFOAM "
                 "Studio again: it continues with OpenFOAM by itself."))
@@ -299,11 +535,19 @@ class Worker(QtCore.QObject):
         distro = apt_distro(distros)
         if "distro" in steps:
             self._step(tr("Installing {distro}…", distro=DISTRO))
-            rc = self._run(install_distro_argv(), self._wsl_emit)
+            log: list = []
+
+            def emit_distro(line):
+                log.append(line)
+                self._wsl_emit(line)
+            rc = self._run(install_distro_argv(), emit_distro)
             if rc != 0:
+                hint = (tr(" Turn on virtualization (Intel VT-x / AMD SVM) "
+                           "in the BIOS or UEFI settings.")
+                        if needs_virtualization("\n".join(log)) else "")
                 self.done.emit("failed", tr(
                     "{distro} was not installed (code {rc}).",
-                    distro=DISTRO, rc=rc))
+                    distro=DISTRO, rc=rc) + hint)
                 return
             for argv in register_argvs():
                 if self._run(argv, emit) == 0:
@@ -363,7 +607,8 @@ class RemoveWorker(Worker):
         emit = self.line.emit
         mark = read_marker()
         notes = []
-        distros = wsl_distros(self._run) if os.name == "nt" else None
+        distros = (wsl_distros(self._run, self._present) if os.name == "nt"
+                   else None)
         distro = mark.get("distro", "")
         if mark.get("distro_installed") and distros and distro in distros:
             self.status.emit(tr("Removing {distro} (the program installed "
