@@ -71,7 +71,11 @@ ROOT_SCRIPT = (
     "export DEBIAN_FRONTEND=noninteractive; "
     "apt-get update && "
     "(command -v curl >/dev/null || apt-get install -y curl ca-certificates) && "
-    + be.INSTALL_SCRIPT.replace("sudo ", "")
+    # APT::Status-Fd=1: apt writes «dlstatus:…:<percent>:…» and
+    # «pmstatus:…:<percent>:…» lines: the percent of the progress bar.
+    + be.INSTALL_SCRIPT.replace("sudo ", "").replace(
+        'apt-get install -y "$PKG"',
+        'apt-get install -y -o APT::Status-Fd=1 "$PKG"')
     # An ASCII line for the record of the installed package (MARKER).
     + ' && echo "OFS_PACKAGE=$PKG"'
 )
@@ -105,6 +109,34 @@ def run_lines(argv, on_line, timeout: float | None = None) -> int:
     except subprocess.TimeoutExpired:
         p.kill()
         return 124
+
+
+_PCT = re.compile(r"(\d{1,3}(?:[.,]\d+)?)\s*%")
+
+
+def apt_progress(line: str):
+    """(percent 0..100 or None, keep the line in the log). The download is
+    the first half of the bar, the install the second half."""
+    for head, base in (("dlstatus:", 0.0), ("pmstatus:", 50.0)):
+        if line.startswith(head):
+            parts = line.split(":")
+            try:
+                return base + float(parts[2]) / 2.0, False
+            except (IndexError, ValueError):
+                return None, False
+    return None, True
+
+
+def wsl_progress(line: str):
+    """The percent of a line of «wsl --install» (e.g. «[====  45.0%  ]»)."""
+    m = _PCT.search(line)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+    return v if 0.0 <= v <= 100.0 else None
 
 
 def wsl_distros(run=run_lines) -> list | None:
@@ -196,6 +228,8 @@ class Worker(QtCore.QObject):
 
     line = QtCore.Signal(str)
     status = QtCore.Signal(str)
+    # 0..100: the percent of the step; -1: the step has no percent (busy).
+    progress = QtCore.Signal(int)
     done = QtCore.Signal(str, str)      # result id ("ok", "restart",
     #                                     "failed"), text for the person
 
@@ -211,6 +245,16 @@ class Worker(QtCore.QObject):
         lines: list = []
         self._run(root_argv(distro, APT_FILES_SCRIPT), lines.append)
         return [ln.strip() for ln in lines if ln.strip().startswith("/")]
+
+    def _step(self, text) -> None:
+        self.progress.emit(-1)
+        self.status.emit(text)
+
+    def _wsl_emit(self, line: str) -> None:
+        v = wsl_progress(line)
+        if v is not None:
+            self.progress.emit(int(v))
+        self.line.emit(line)
 
     @QtCore.Slot()
     def work(self):
@@ -235,9 +279,9 @@ class Worker(QtCore.QObject):
             return
         steps = plan(distros, False)
         if "wsl" in steps:
-            self.status.emit(tr("Installing WSL and Ubuntu (Windows asks for "
-                                "administrator rights)…"))
-            rc = self._run(install_wsl_argv(), emit)
+            self._step(tr("Installing WSL and Ubuntu (Windows asks for "
+                          "administrator rights)…"))
+            rc = self._run(install_wsl_argv(), self._wsl_emit)
             fset.set(PENDING_KEY, True)
             if rc == 0:
                 write_marker({"wsl_installed": True, "distro": DISTRO,
@@ -254,8 +298,8 @@ class Worker(QtCore.QObject):
             return
         distro = apt_distro(distros)
         if "distro" in steps:
-            self.status.emit(tr("Installing {distro}…", distro=DISTRO))
-            rc = self._run(install_distro_argv(), emit)
+            self._step(tr("Installing {distro}…", distro=DISTRO))
+            rc = self._run(install_distro_argv(), self._wsl_emit)
             if rc != 0:
                 self.done.emit("failed", tr(
                     "{distro} was not installed (code {rc}).",
@@ -268,8 +312,8 @@ class Worker(QtCore.QObject):
             mark = read_marker()
             mark.update(distro=distro, distro_installed=True)
             write_marker(mark)
-        self.status.emit(tr("Installing OpenFOAM in {distro} (about 1-2 GB, "
-                            "10-30 min)…", distro=distro))
+        self._step(tr("Installing OpenFOAM in {distro} (about 1-2 GB, "
+                      "10-30 min)…", distro=distro))
         before = self._apt_files(distro)
         got = []
 
@@ -278,7 +322,11 @@ class Worker(QtCore.QObject):
                          line.strip())
             if m:
                 got.append(m.group(1))
-            emit(line)
+            pct, keep = apt_progress(line)
+            if pct is not None:
+                self.progress.emit(int(pct))
+            if keep:
+                emit(line)
         rc = self._run(root_argv(distro, ROOT_SCRIPT), emit_pkg)
         if got:
             mark = read_marker()
@@ -292,7 +340,7 @@ class Worker(QtCore.QObject):
                 "The OpenFOAM install in {distro} ended with code {rc}. The "
                 "log above shows why.", distro=distro, rc=rc))
             return
-        self.status.emit(tr("Checking OpenFOAM…"))
+        self._step(tr("Checking OpenFOAM…"))
         ready = self._ready()
         if not ready:
             self.done.emit("failed", tr(
@@ -413,8 +461,16 @@ class PrepareDialog(QtWidgets.QDialog):
         self._thread.started.connect(self._worker.work)
         self._worker.line.connect(self.log.appendPlainText)
         self._worker.status.connect(self._status)
+        self._worker.progress.connect(self._progress)
         self._worker.done.connect(self._done)
         self._thread.start()
+
+    def _progress(self, value: int):
+        if value < 0:
+            self.bar.setRange(0, 0)
+        else:
+            self.bar.setRange(0, 100)
+            self.bar.setValue(value)
 
     def _status(self, text: str):
         self.lbl.setText(text)

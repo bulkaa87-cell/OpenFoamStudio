@@ -3572,25 +3572,120 @@ class Runner:
 SYNC_INPUTS = ("system", "constant", "0.orig", "Allrun", "Allclean")
 
 
+# --------------------------------------------------------------------------
+# The progress of a transfer (rule: each load and download shows a progress
+# bar, CLAUDE.md «Progress bars»)
+# --------------------------------------------------------------------------
+#
+# A transfer function does not know the window. The window (or the worker
+# thread that runs the transfer) sets a hook for ITS thread with
+# set_progress(); _pipe and the WSL copy call report_progress(done, total)
+# about 3 times a second. total 0: the size is not known (a compressed
+# stream): the bar then shows the bytes and the speed, without a percent.
+
+_progress = threading.local()
+
+
+def set_progress(fn) -> None:
+    """fn(done_bytes, total_bytes) for the transfers of THIS thread; None
+    switches it off."""
+    _progress.fn = fn
+
+
+def report_progress(done: int, total: int) -> None:
+    fn = getattr(_progress, "fn", None)
+    if fn is not None:
+        try:
+            fn(int(done), int(total))
+        except Exception:                                   # noqa: BLE001
+            pass
+
+
+def progress_text(done: int, total: int, seconds: float):
+    """«120 of 480 MB · 2.1 MB/s» (or without the total when it is 0)."""
+    mb = 1024 * 1024
+    speed = done / mb / seconds if seconds > 0.5 else 0.0
+    if total > 0:
+        return tr("{done:.0f} of {total:.0f} MB · {speed:.1f} MB/s",
+                  done=done / mb, total=total / mb, speed=speed)
+    return tr("{done:.0f} MB · {speed:.1f} MB/s", done=done / mb, speed=speed)
+
+
 def _pipe(argv: list[str], stdin_path=None, stdout_path=None,
-          timeout: int = 1800) -> tuple[int, str]:
-    """subprocess із файлом на вході або виході — для тару через ssh."""
+          timeout: int = 1800, total: int = 0) -> tuple[int, str]:
+    """subprocess із файлом на вході або виході — для тару через ssh.
+
+    The progress (report_progress): an upload reads the position of the
+    input file (the child shares it), a download the size of the output
+    file. total: the expected bytes of a download (0: not known); an
+    upload takes the size of its file.
+    """
     fin = open(stdin_path, "rb") if stdin_path else None
     fout = open(stdout_path, "wb") if stdout_path else None
+    errf = tempfile.TemporaryFile()
+    if fin is not None and not total:
+        total = os.path.getsize(stdin_path)
+
+    def done() -> int:
+        try:
+            if stdout_path:
+                return os.path.getsize(stdout_path)
+            if fin is not None:
+                return os.lseek(fin.fileno(), 0, os.SEEK_CUR)
+        except OSError:
+            pass
+        return 0
     try:
-        p = subprocess.run(argv, stdin=fin,
-                           stdout=fout or subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=timeout,
-                           creationflags=CREATE_NO_WINDOW)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return (1, str(exc))
+        try:
+            p = subprocess.Popen(argv, stdin=fin,
+                                 stdout=fout or subprocess.DEVNULL,
+                                 stderr=errf, creationflags=CREATE_NO_WINDOW)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return (1, str(exc))
+        t0 = time.monotonic()
+        report_progress(0, total)
+        while True:
+            try:
+                rc = p.wait(timeout=0.3)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() - t0 > timeout:
+                p.kill()
+                p.wait()
+                return (1, tr("timeout after {sec} s", sec=timeout))
+            report_progress(done(), total)
+        report_progress(done(), total)
+        errf.seek(0)
+        err = errf.read().decode("utf-8", "replace")
+        return (rc, err)
     finally:
         if fin:
             fin.close()
         if fout:
             fout.close()
-    err = (p.stderr or b"").decode("utf-8", "replace")
-    return (p.returncode, err)
+        errf.close()
+
+
+def _run_lines(argv: list[str], on_line, timeout: int = 900) -> int:
+    """Run argv, give each output line (stdout and stderr) to on_line."""
+    try:
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL,
+                             creationflags=CREATE_NO_WINDOW)
+    except OSError as exc:
+        on_line(str(exc))
+        return 127
+    timer = threading.Timer(timeout, p.kill)
+    timer.start()
+    try:
+        assert p.stdout is not None
+        for raw in iter(p.stdout.readline, b""):
+            on_line(raw.decode("utf-8", "replace").replace("\x00", "").rstrip())
+        return p.wait()
+    finally:
+        timer.cancel()
 
 
 def remote_dir_for(name: str) -> str:
@@ -3712,7 +3807,20 @@ def sync_from_ssh(backend: Backend, remote_dir: str, case_dir: str) -> None:
         + '[ -z "$out" ] && exit 3; '
         "tar cf - --exclude='postProcessing/studioLive*' $out"
     )
-    rc, err = _pipe(ssh_argv(backend.host, listing), stdout_path=tmp)
+    # The size first (for the progress bar): the same list, du instead of
+    # tar. No answer: the bar shows the bytes without a percent.
+    size_cmd = listing.replace(
+        "tar cf - --exclude='postProcessing/studioLive*' $out",
+        "du -cb --exclude='postProcessing/studioLive*' $out | tail -1")
+    total = 0
+    src, out_ = _run(ssh_argv(backend.host, size_cmd), timeout=60)
+    if src == 0:
+        try:
+            total = int(out_.split()[0])
+        except (ValueError, IndexError):
+            total = 0
+    rc, err = _pipe(ssh_argv(backend.host, listing), stdout_path=tmp,
+                    total=total)
     try:
         if rc == 3:
             raise RuntimeError(tr("no results on the server: the run did "
@@ -3816,10 +3924,36 @@ def sync_from_wsl(backend: Backend, native_dir: str, case_dir: str) -> None:
         f'for d in [0-9]*/; do n=${{d%/}}; '
         f'case "$n" in ""|*[!0-9.]*) continue;; esac; rm -rf "$d"; done; '
         f'rm -rf processor* postProcessing constant/polyMesh; '
-        f'cp -r "{native_dir}/." "{dst}/" && '
+        # The size, then tar with a checkpoint line every 100 records
+        # (100 x 10240 bytes): the progress bar of the copy.
+        f'echo "OFS_TOTAL=$(du -sb "{native_dir}" | cut -f1)"; '
+        f'set -o pipefail; '
+        f'tar cf - -C "{native_dir}" --checkpoint=100 '
+        f'--checkpoint-action=echo="OFS_CK=%u" . | tar xf - -C "{dst}" && '
         # T43: the results are here now (mark_fetched, in one command).
         f'mkdir -p "{native_dir}/{STUDIO}" && touch "{native_dir}/{guard.FETCHED}"')
-    rc, out = _run(wsl_argv(backend.distro, cmd), timeout=900)
+    lines: list = []
+    total = [0]
+
+    def line(text: str) -> None:
+        if text.startswith("OFS_TOTAL="):
+            try:
+                total[0] = int(text[10:].strip() or 0)
+            except ValueError:
+                pass
+            report_progress(0, total[0])
+        elif "OFS_CK=" in text:
+            try:
+                n = int(text.rsplit("OFS_CK=", 1)[1].strip())
+            except ValueError:
+                return
+            report_progress(min(n * 10240, total[0] or n * 10240), total[0])
+        elif text:
+            lines.append(text)
+    rc = _run_lines(wsl_argv(backend.distro, cmd), line, timeout=1800)
+    out = "\n".join(lines)
+    if rc == 0:
+        report_progress(total[0], total[0])
     if rc != 0:
         # Раніше помилки тут глушилися через 2>/dev/null, і провалена копія
         # виглядала як успішна: людина дивилася на результати попереднього

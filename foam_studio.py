@@ -1208,6 +1208,9 @@ class BusyWorker(QtCore.QObject):
     """
 
     done = QtCore.Signal(object, object)    # результат, виняток
+    # (done bytes, total bytes) of a transfer in the job (fs_backend
+    # report_progress): the progress window shows the percent.
+    progress = QtCore.Signal(object, object)
 
     def __init__(self, job):
         super().__init__()
@@ -1215,12 +1218,36 @@ class BusyWorker(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self):
+        be.set_progress(lambda d, t: self.progress.emit(d, t))
         try:
             result = self.job()
         except Exception as exc:            # noqa: BLE001
             self.done.emit(None, exc)
             return
+        finally:
+            be.set_progress(None)
         self.done.emit(result, None)
+
+
+class _ProgressBox(QtCore.QObject):
+    """Shows the bytes of a transfer in a QProgressDialog (window thread):
+    a percent when the size is known, else the bytes and the speed."""
+
+    def __init__(self, box, text):
+        super().__init__()
+        self.box = box
+        self.text = text
+        self.t0 = time.monotonic()
+
+    @QtCore.Slot(object, object)
+    def update(self, done, total):
+        box = self.box
+        if total > 0:
+            if box.maximum() != 1000:
+                box.setRange(0, 1000)
+            box.setValue(min(1000, int(done * 1000 / total)))
+        box.setLabelText(str(self.text) + "\n" + str(be.progress_text(
+            done, total, time.monotonic() - self.t0)))
 
 
 class _BusyReceiver(QtCore.QObject):
@@ -1291,6 +1318,9 @@ class RunWorker(QtCore.QObject):
     # (name, value): "detached" (the run lives on the server), "fetch"
     # (results are copied back). The window does not match log texts.
     event = QtCore.Signal(str, str)
+    # (done bytes, total bytes) of the copy of the results (the bar of the
+    # «Run» panel).
+    transfer = QtCore.Signal(object, object)
 
     def __init__(self, backend, case_dir, steps, native_dir=None,
                  sync_back=False, name="", stop_on_bad_mesh=True,
@@ -1378,6 +1408,7 @@ class RunWorker(QtCore.QObject):
             # notification «Run finished» (T44).
             self.event.emit("fetch", "ok" if ok else "fail")
             self.fetched = False
+            be.set_progress(lambda d, t: self.transfer.emit(d, t))
             try:
                 if self.backend.kind == "ssh":
                     be.sync_from_ssh(self.backend, self.native_dir,
@@ -1388,6 +1419,8 @@ class RunWorker(QtCore.QObject):
                 self.fetched = True
             except Exception as exc:
                 self.line.emit(tr("could not copy back: {exc}", exc=exc))
+            finally:
+                be.set_progress(None)
         self.done.emit(ok, msg)
 
     def stop(self):
@@ -1423,6 +1456,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # окрема нитка, а чіпати вікно з чужої нитки в Qt не можна.
     sessions_seen = QtCore.Signal(object)
     mesh_fetched = QtCore.Signal(str, str)      # ключ, помилка ("" — вийшло)
+    mesh_progress = QtCore.Signal(object, object)   # bytes done, total
 
     def __init__(self):
         # Налаштування програми (fs_settings, T22): один файл на людину.
@@ -1617,6 +1651,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.sessions_seen.connect(self._say_sessions)
         self.mesh_fetched.connect(self._mesh_fetched)
+        self.mesh_progress.connect(self._mesh_progress)
         # T44: notifications about the runs, and the window connects to its
         # server runs again by itself (start, after a sleep, a new network).
         self.run_guard = fs_recover.RunGuard(self)
@@ -2480,17 +2515,27 @@ class MainWindow(QtWidgets.QMainWindow):
             key=key, host=backend.host or backend.label))
 
         def job():
+            be.set_progress(lambda d, t: self.mesh_progress.emit(d, t))
             try:
                 err = be.fetch_mesh(backend, key)
             except Exception as exc:                       # noqa: BLE001
                 err = str(exc)
+            finally:
+                be.set_progress(None)
             try:
                 self.mesh_fetched.emit(key, err)
             except RuntimeError:
                 pass
         threading.Thread(target=job, daemon=True).start()
 
+    def _mesh_progress(self, done, total) -> None:
+        self.on_transfer(done, total, tr("Downloading the mesh"))
+
     def _mesh_fetched(self, key: str, err: str) -> None:
+        bar = self.panel_run.progress
+        bar.setMaximum(1)
+        bar.setValue(1)
+        bar.setFormat(tr("error") if err else tr("done"))
         if err:
             self.log.push(fs_i18n.tr("The mesh {key} was not copied: {err}", key=key, err=err))
         else:
@@ -3992,6 +4037,8 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setCancelButton(None)
         box.setWindowModality(QtCore.Qt.WindowModal)
         box.setMinimumDuration(400)
+        shown = _ProgressBox(box, text)
+        worker.progress.connect(shown.update)
         thread.start()
         try:
             loop.exec()
@@ -5332,6 +5379,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # to get its results) goes from here to the download (T49).
         self._laptop(self.attach_laptop_state(session))
         self.worker.step.connect(self.on_step)
+        self.worker.transfer.connect(self.on_transfer)
         self.worker.done.connect(self.on_done)
         self.thread.start()
         self.timer.start()
@@ -7589,6 +7637,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.line.connect(self._run_line)
         self.worker.event.connect(self._run_event)
         self.worker.step.connect(self.on_step)
+        self.worker.transfer.connect(self.on_transfer)
         self.worker.done.connect(self.on_done)
         if self.panel_run.laptop_state() != "upload":
             self._laptop("")
@@ -7732,6 +7781,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_run.progress.setFormat(
             f"{lead}{title}  ({index + 1}/{total})")
         self.panel_run.lbl_status.setText(tr("Running: {name}", name=title))
+
+    @QtCore.Slot(object, object)
+    def on_transfer(self, done, total, what=None):
+        """The bar of the «Run» panel during a download (results after a
+        run, a mesh): percent, MB and speed."""
+        bar = self.panel_run.progress
+        if done == 0 or not hasattr(self, "_transfer_t0"):
+            self._transfer_t0 = time.monotonic()
+        if total > 0:
+            bar.setMaximum(1000)
+            bar.setValue(min(1000, int(done * 1000 / total)))
+        else:
+            bar.setMaximum(0)
+        head = what or tr("Copying the results")
+        bar.setFormat(str(head) + ": " + str(be.progress_text(
+            done, total, time.monotonic() - self._transfer_t0)).replace("%", "%%"))
 
     @QtCore.Slot(bool, str)
     def on_done(self, ok: bool, msg: str):
@@ -8611,7 +8676,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._anim_play(False)
         # All frames first (the loader of the player can still be busy:
         # wait for it with the busy dialog).
-        progress = QtWidgets.QProgressDialog("Loading frames…", "", 0, 0, self)
+        progress = QtWidgets.QProgressDialog(
+            "Loading frames…", "", 0, max(1, len(self._tl_times)), self)
         progress.setCancelButton(None)
         progress.setWindowModality(QtCore.Qt.WindowModal)
         while (self._frames_ld is None or len(self._frames_ld.done)
@@ -8619,6 +8685,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._frames_plan is None:
                 _drop_progress(progress)
                 return
+            # A determinate bar: the frames that are loaded (rule
+            # «Progress bars»).
+            progress.setValue(len(self._frames_ld.done)
+                              if self._frames_ld is not None else 0)
             self._frames_want()
             QtWidgets.QApplication.processEvents(
                 QtCore.QEventLoop.AllEvents, 100)
