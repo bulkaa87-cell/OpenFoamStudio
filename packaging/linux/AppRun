@@ -1,4 +1,6 @@
 #!/bin/sh
-# The start script of the AppImage: run the PyInstaller program.
+# The start script of the AppImage: check the system libraries (and offer
+# to install the missing ones), then run the PyInstaller program.
 HERE="$(dirname "$(readlink -f "$0")")"
+sh "$HERE/check_deps.sh" "$HERE/usr/lib/openfoam-studio"
 exec "$HERE/usr/lib/openfoam-studio/OpenFOAM Studio" "$@"

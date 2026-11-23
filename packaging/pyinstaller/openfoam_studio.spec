@@ -86,6 +86,20 @@ a = Analysis(
     excludes=excludes,
     noarchive=False,
 )
+if sys.platform.startswith("linux"):
+    # The libraries of the system (packaging/linux/host_libs.txt): an old
+    # copy from the build system stops the graphics driver of a newer
+    # system (Fedora 44: no OpenGL, no Vulkan). Only top-level files: the
+    # libraries of the wheels have hashed names in their own folders.
+    with open(os.path.join(ROOT, "packaging", "linux", "host_libs.txt"),
+              encoding="utf-8") as fh:
+        HOST_LIBS = tuple(ln.strip() for ln in fh
+                          if ln.strip() and not ln.startswith("#"))
+    dropped = [b[0] for b in a.binaries
+               if "/" not in b[0] and b[0].startswith(HOST_LIBS)]
+    a.binaries = [b for b in a.binaries if b[0] not in dropped]
+    print(f"host libraries left out ({len(dropped)}): {' '.join(sorted(dropped))}")
+
 pyz = PYZ(a.pure)
 
 # The icon of the exe (Explorer, shortcuts): the logo of T33 in icons/.

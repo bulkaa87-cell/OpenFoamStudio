@@ -83,6 +83,12 @@ en.FoamTask=Prepare OpenFOAM in WSL (also WSL and Ubuntu if they are missing; ab
 uk.FoamTask=Підготувати OpenFOAM у WSL (і WSL з Ubuntu, якщо їх немає; близько 1-2 ГБ)
 en.FoamGroup=Calculations on this computer:
 uk.FoamGroup=Розрахунки на цьому компʼютері:
+en.VCTitle=Microsoft Visual C++ Runtime
+uk.VCTitle=Середовище Microsoft Visual C++
+en.VCDesc=The program needs it. The installer downloads it from Microsoft (about 25 MB) and installs it (Windows asks for administrator rights).
+uk.VCDesc=Програмі воно потрібне. Інсталятор завантажить його з сайту Microsoft (близько 25 МБ) і встановить (Windows попросить права адміністратора).
+en.VCFailed=The Microsoft Visual C++ Runtime was not installed (%1). The program may not start. Install it by hand:%n%n%2
+uk.VCFailed=Середовище Microsoft Visual C++ не встановлено (%1). Програма може не запуститися. Встановіть його вручну:%n%n%2
 en.AskResults=Also delete the results of the simulations?%n%nThe folders cases, projects, session and meshes in:%n%1%nand ~/openfoam-studio in WSL.%n%nThe settings stay. Servers are not changed.
 uk.AskResults=Видалити також результати симуляцій?%n%nТеки cases, projects, session і meshes у:%n%1%nі ~/openfoam-studio у WSL.%n%nНалаштування лишаються. Сервери не змінюються.
 
@@ -257,4 +263,104 @@ end;
 function RelaunchWanted(): Boolean;
 begin
   Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
+{ ---- Dependency: the Microsoft Visual C++ Runtime (2015-2022, x64). ----
+  Python, VTK and numpy of the program link to the system copy of
+  vcruntime140.dll / msvcp140.dll (only PySide6 has its own). A fresh
+  Windows can be without it, or have a copy older than 14.40 (the newer
+  modules then crash). If it is missing or old, the installer downloads
+  vc_redist.x64.exe from Microsoft with a progress bar and installs it. }
+const
+  VCUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
+  VCKey = 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64';
+
+var
+  DownloadPage: TDownloadWizardPage;
+
+function VCRuntimeNeeded(): Boolean;
+var
+  Installed, Major, Minor: Cardinal;
+begin
+  Result := True;
+  if not RegQueryDWordValue(HKLM64, VCKey, 'Installed', Installed) then
+    Exit;
+  if (Installed <> 1)
+     or not RegQueryDWordValue(HKLM64, VCKey, 'Major', Major)
+     or not RegQueryDWordValue(HKLM64, VCKey, 'Minor', Minor) then
+    Exit;
+  Result := (Major < 14) or ((Major = 14) and (Minor < 40));
+  Log(Format('Visual C++ Runtime %d.%d, needed: %d', [Major, Minor, Ord(Result)]));
+end;
+
+function InstallVCRuntime(const Exe: String): String;
+var
+  Code: Integer;
+begin
+  Result := '';
+  { 'runas': the runtime goes into System32, also for an install of this
+    user only. /passive: its own progress bar, no questions. 3010 = done,
+    restart later. 1638 = a newer version is there. }
+  if not ShellExec('runas', Exe, '/install /passive /norestart', '',
+                   SW_SHOW, ewWaitUntilTerminated, Code) then
+    Result := SysErrorMessage(Code)
+  else if (Code <> 0) and (Code <> 3010) and (Code <> 1638) then
+    Result := 'code ' + IntToStr(Code);
+end;
+
+procedure InitializeWizard();
+begin
+  DownloadPage := CreateDownloadPage(CustomMessage('VCTitle'),
+                                     CustomMessage('VCDesc'), nil);
+end;
+
+procedure VCFailed(const Why: String);
+begin
+  Log('Visual C++ Runtime: ' + Why);
+  SuppressibleMsgBox(FmtMessage(CustomMessage('VCFailed'), [Why, VCUrl]),
+                     mbError, MB_OK, IDOK);
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Why: String;
+begin
+  Result := True;
+  if (CurPageID <> wpReady) or WizardSilent() or not VCRuntimeNeeded() then
+    Exit;
+  DownloadPage.Clear;
+  DownloadPage.Add(VCUrl, 'vc_redist.x64.exe', '');
+  DownloadPage.Show;
+  try
+    try
+      DownloadPage.Download;
+      Why := InstallVCRuntime(ExpandConstant('{tmp}\vc_redist.x64.exe'));
+      if Why <> '' then
+        VCFailed(Why);
+    except
+      if not DownloadPage.AbortedByUser then
+        VCFailed(GetExceptionMessage);
+    end;
+  finally
+    DownloadPage.Hide;
+  end;
+end;
+
+{ A silent install (the update from the program) shows no pages: the same
+  check, the download without the page. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Why: String;
+begin
+  Result := '';
+  if not WizardSilent() or not VCRuntimeNeeded() then
+    Exit;
+  try
+    DownloadTemporaryFile(VCUrl, 'vc_redist.x64.exe', '', nil);
+    Why := InstallVCRuntime(ExpandConstant('{tmp}\vc_redist.x64.exe'));
+    if Why <> '' then
+      Log('Visual C++ Runtime: ' + Why);
+  except
+    Log('Visual C++ Runtime: ' + GetExceptionMessage);
+  end;
 end;

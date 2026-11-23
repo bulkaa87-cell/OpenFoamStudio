@@ -2096,6 +2096,8 @@ class MeshPanel(Panel):
     # The y+ check asks for another turbulence model or wall treatment
     # (FlowPanel owns both).
     model_fix_requested = QtCore.Signal(str)
+    # The row of the refinement box table (-1: none): highlight it in 3D.
+    box_selected = QtCore.Signal(int)
     treatment_fix_requested = QtCore.Signal(str)
 
     def __init__(self, cfg, parent=None):
@@ -2229,6 +2231,10 @@ class MeshPanel(Panel):
             QtWidgets.QAbstractItemView.SelectRows)
         self.boxes.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.boxes.setMaximumHeight(170)
+        # The selected row is highlighted in the 3D view (orange frame).
+        self.boxes.itemSelectionChanged.connect(
+            lambda: self.box_selected.emit(
+                self.boxes.currentRow() if self.boxes.selectedItems() else -1))
         hh = self.boxes.horizontalHeader()
         hh.setStretchLastSection(False)
         hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)

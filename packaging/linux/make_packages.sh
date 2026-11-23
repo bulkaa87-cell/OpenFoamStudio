@@ -29,6 +29,21 @@ SUMMARY="External aerodynamics with OpenFOAM: geometry, mesh, run, results"
 URL="https://github.com/bulkaa87-cell/OpenFoamStudio"
 test -d "$SRC"
 
+# The libraries that the program takes from the system (host_libs.txt; the
+# same list as check_deps.sh of the AppImage). The package managers
+# download the missing ones with the program.
+SONAMES="libstdc++.so.6 libgcc_s.so.1 libexpat.so.1 libz.so.1 libX11.so.6
+libX11-xcb.so.1 libxcb.so.1 libxkbcommon.so.0 libxkbcommon-x11.so.0 libGL.so.1
+libEGL.so.1 libfontconfig.so.1 libfreetype.so.6 libdbus-1.so.3
+libglib-2.0.so.0 libXrender.so.1 libXext.so.6 libXi.so.6"
+DEB_DEPENDS="libc6 (>= 2.35), libstdc++6, libgcc-s1, libexpat1, zlib1g, libx11-6, libx11-xcb1, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libgl1, libegl1, libfontconfig1, libfreetype6, libdbus-1-3, libglib2.0-0t64 | libglib2.0-0, libxrender1, libxext6, libxi6"
+DEB_RECOMMENDS="libvulkan1, mesa-vulkan-drivers, libgl1-mesa-dri, libxcb-cursor0"
+RPM_REQUIRES=""
+for so in $SONAMES; do
+    RPM_REQUIRES="${RPM_REQUIRES}Requires:       $so()(64bit)
+"
+done
+
 # The files of both packages, at their install paths.
 rm -rf "$ROOT"
 mkdir -p "$ROOT/opt" "$ROOT/usr/bin" "$ROOT/usr/share/applications"
@@ -64,7 +79,8 @@ Version: $VERSION
 Architecture: amd64
 Maintainer: OpenFOAM Studio <bulkaa87-cell@users.noreply.github.com>
 Installed-Size: $SIZE
-Depends: libc6 (>= 2.35)
+Depends: $DEB_DEPENDS
+Recommends: $DEB_RECOMMENDS
 Section: science
 Priority: optional
 Homepage: $URL
@@ -100,7 +116,11 @@ ExclusiveArch:  x86_64
 # The libraries are in the program (PyInstaller): no automatic requires.
 AutoReqProv:    no
 Requires:       glibc >= 2.35
+$RPM_REQUIRES
 Recommends:     podman
+Recommends:     mesa-dri-drivers
+Recommends:     mesa-vulkan-drivers
+Recommends:     libvulkan.so.1()(64bit)
 
 %description
 A desktop program for external aerodynamics: it checks and repairs the

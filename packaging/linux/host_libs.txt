@@ -1,0 +1,88 @@
+# Libraries that the Linux program takes from the system, not from its own
+# folder. PyInstaller copies them from the build system (Ubuntu 22.04), and
+# an old copy shadows the newer one of the system: then the graphics
+# driver of the system does not load. Measured 2026-11-23 on Fedora 44:
+# the old libstdc++ (GLIBCXX_3.4.30) stopped Mesa (needs 3.4.32), VTK found
+# no OpenGL, tried OSMesa («libOSMesa not found») and crashed, and foamview
+# found no Vulkan adapter. Without these files: VTK OpenGL and Vulkan on the
+# Intel GPU.
+#
+# The spec (packaging/pyinstaller/openfoam_studio.spec) removes each
+# top-level library whose name starts with a line of this file. All are on
+# each Linux desktop. The .deb and .rpm require them (make_packages.sh),
+# and the AppImage start script checks them (AppRun, check_deps.sh).
+#
+# One prefix per line. Graphics, C++ runtime, X11 / xcb core:
+libstdc++.so
+libgcc_s.so
+libexpat.so
+libz.so.1
+libX11.so
+libX11-xcb.so
+libxcb.so.1
+libXau.so
+libXdmcp.so
+libXext.so
+libXrender.so
+libXfixes.so
+libXi.so
+libXrandr.so
+libXcursor.so
+libXinerama.so
+libXcomposite.so
+libXdamage.so
+libxkbcommon.so
+libxkbcommon-x11.so
+libGL
+libEGL
+libGLX
+libGLdispatch
+libOpenGL
+libdrm
+libgbm
+libglapi
+libvulkan
+libwayland-
+# Fonts and the session bus:
+libfontconfig.so
+libfreetype.so
+libharfbuzz.so
+libdbus-1.so
+# GLib and GTK 3 (the GTK theme plugin of Qt; it loads the modules of the
+# system, which need the GLib of the system):
+libglib-2.0
+libgobject-2.0
+libgio-2.0
+libgmodule-2.0
+libgthread-2.0
+libgtk-3
+libgdk-3
+libgdk_pixbuf
+libatk-1.0
+libatk-bridge
+libatspi
+libcairo
+libpango
+libepoxy
+libpixman
+libthai
+libdatrie
+libfribidi
+libgraphite2
+# Base system libraries that came with GLib and systemd:
+libsystemd.so
+libselinux.so
+libmount.so
+libblkid.so
+libuuid.so
+libcap.so
+libgcrypt.so
+libgpg-error.so
+liblz4.so
+liblzma.so
+libzstd.so
+libffi.so
+libpcre.so
+libpcre2-8.so
+libbsd.so
+libmd.so

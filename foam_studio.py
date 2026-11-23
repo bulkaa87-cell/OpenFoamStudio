@@ -125,6 +125,9 @@ COL_DEGEN = "#5ef08a"     # вироджені трикутники
 COL_SPOT = "#00e5ff"      # куди підлетіла камера
 COL_COP = "#ff17c4"       # центр тиску в результатах
 COL_ROTOR_AXIS = "#a855f7"  # вісь обертання вибраного гвинта
+COL_SELECTED = "#ff9500"    # the selected model / refinement box
+# A highlight layer follows the check box of its layer («Model», «Refinement»).
+LINKED_LAYERS = {"body": "selected", "box": "box_sel"}
 
 # Шари проблемної геометрії: ключ -> (підпис, колір, що з цим робити).
 # Підпис у смузі під вʼюпортом фарбується в колір самого шару — щоб не
@@ -746,6 +749,8 @@ class Viewport(QtWidgets.QWidget):
             del self.actors[key]
 
     def set_visible(self, key: str, visible: bool):
+        if key in LINKED_LAYERS:
+            self.set_visible(LINKED_LAYERS[key], visible)
         item = self.actors.get(key)
         if item is None:
             return
@@ -1038,6 +1043,41 @@ class Viewport(QtWidgets.QWidget):
             merged, style="wireframe", color=COL_BOX, line_width=2, name="box",
             reset_camera=False)
         self.set_visible("box", self.chk["box"].isChecked())
+        # The highlight follows the boxes (a size or a level changed).
+        self.select_box(getattr(self, "_sel_box", -1), cfg)
+
+    def select_box(self, index: int, cfg: fc.CaseCfg | None = None) -> None:
+        """Highlight the refinement box of this row of the table (-1: none):
+        a thick orange frame over the amber one."""
+        self._sel_box = index
+        self._drop("box_sel")
+        boxes = list(cfg.mesh.boxes) if cfg is not None else []
+        if 0 <= index < len(boxes):
+            b = boxes[index]
+            blk = pv.Box(bounds=(b.min[0], b.max[0], b.min[1], b.max[1],
+                                 b.min[2], b.max[2]))
+            self.actors["box_sel"] = self.plotter.add_mesh(
+                blk, style="wireframe", color=COL_SELECTED, line_width=4,
+                name="box_sel", reset_camera=False)
+            self.set_visible("box_sel", self.chk["box"].isChecked())
+        self.plotter.render()
+
+    def show_selected(self, mesh) -> None:
+        """Highlight the selected model: an orange, half-transparent copy a
+        little outside its surface (along the normals). Outside, not on the
+        surface: two layers on the same triangles flicker (z-fighting).
+        None: no highlight."""
+        self._drop("selected")
+        if mesh is not None and mesh.n_points:
+            m = geo.display_mesh(mesh) if "Normals" not in mesh.point_data else mesh.copy()
+            normals = m.point_data.get("Normals")
+            if normals is not None:
+                m.points = m.points + normals * (0.002 * max(m.length, 1e-9))
+            self.actors["selected"] = self.plotter.add_mesh(
+                m, color=COL_SELECTED, opacity=0.6, smooth_shading=False,
+                show_edges=False, name="selected", reset_camera=False)
+            self.set_visible("selected", self.chk["body"].isChecked())
+        self.plotter.render()
 
     def show_point(self, cfg: fc.CaseCfg):
         self._drop("point")
@@ -2194,6 +2234,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel_geo.disk_requested.connect(self.make_disk)
         self.panel_geo.part_moved.connect(self.part_move)
         self.panel_geo.part_role_query.connect(self.show_part_role)
+        self.panel_mesh.box_selected.connect(
+            lambda row: self.viewport.select_box(row, self.cfg))
         self.panel_geo.propeller_requested.connect(self.make_propeller)
         self.panel_geo.part_hinge.connect(self.part_hinge_set)
         self.panel_geo.hinge_guess.connect(self.guess_hinge)
@@ -3617,6 +3659,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hole_edges = None
             self.viewport.clear_problems()
             self.viewport.show_body(None)
+            self.viewport.show_selected(None)
             self.panel_geo.show_diagnosis([], [])
             self.panel_geo.show_parts(self._part_rows(), self._scene_line())
             self.cfg.bodies = []
@@ -3672,6 +3715,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewport.show_body(self.mesh_display, reset=reset)
         self.viewport.show_ghosts(ghosts)
         self.panel_geo.show_parts(self._part_rows(), self._scene_line())
+        self.show_selected_part()
 
     def _sync_bodies(self, live: list[Part]) -> None:
         """Перезбирає список патчів під поточну сцену.
@@ -4936,6 +4980,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self._busy(tr("⏳ Reading cores and memory: {v}…", v=b.host or b.label))
         self._show_resources(clamp=True)
         self.update_status()
+        self._offer_openfoam_once()
+
+    # The setting: the question «Install OpenFOAM?» was asked once.
+    OPENFOAM_OFFERED = "openfoam_install_offered"
+
+    def _offer_openfoam_once(self) -> None:
+        """Linux and macOS: OpenFOAM is a dependency that no package can
+        bring (it is not in the repositories of the systems). At the first
+        start without it, the program offers the install once (Windows:
+        the installer task «Prepare OpenFOAM in WSL» does this)."""
+        if os.name == "nt" or os.environ.get("FS_NO_OPENFOAM_OFFER"):
+            return
+        if any(b.ready for b in self.backends) or fset.get(self.OPENFOAM_OFFERED):
+            return
+        fset.set(self.OPENFOAM_OFFERED, True)
+        QtCore.QTimer.singleShot(400, self.install_openfoam)
 
     def _show_resources(self, clamp: bool = False) -> None:
         """Показати ядра й памʼять ТОГО бекенда, який вибрано.
@@ -4986,8 +5046,22 @@ class MainWindow(QtWidgets.QMainWindow):
         попереднього вибору."""
         b = b if b is not None else self.panel_run.current_backend()
         if b is None:
-            return (0, 0, 0.0)
-        return self._res_cache.get(self._res_key(b), (0, 0, 0.0))
+            # No OpenFOAM yet: the run will be on this computer (after
+            # «Install OpenFOAM»). Check against its memory, not «not known»
+            # (2026-11-23: «memory of the backend not known yet» on a new
+            # Linux computer). WSL 2 gets half of the memory by default.
+            n = os.cpu_count() or 4
+            ram = be.local_ram_gb()
+            if os.name == "nt":
+                ram /= 2
+            return (max(1, n // 2), n, ram)
+        key = self._res_key(b)
+        if key not in self._res_cache and b.kind in ("docker", "bluecfd",
+                                                      "native"):
+            # Local: no question to ask, the numbers are here at once.
+            n = os.cpu_count() or 4
+            self._res_cache[key] = (max(1, n // 2), n, be.local_ram_gb())
+        return self._res_cache.get(key, (0, 0, 0.0))
 
     def _backend_cores(self) -> int:
         return self._backend_resources()[0] or os.cpu_count() or 6
@@ -5006,7 +5080,10 @@ class MainWindow(QtWidgets.QMainWindow):
         b = pr.current_backend()
         ram = self._backend_resources(b)[2]
         if b is None:
-            name, kind = "the backend", "ssh"
+            # The run goes to this computer after the install (see
+            # _backend_resources): WSL on Windows, the system elsewhere.
+            name = tr("this computer{v}", v=" (WSL)" if os.name == "nt" else "")
+            kind = "wsl" if os.name == "nt" else "native"
         elif b.kind == "ssh":
             name, kind = b.host, "ssh"
         else:
@@ -6306,8 +6383,21 @@ class MainWindow(QtWidgets.QMainWindow):
                    "speed at the cap {v_intakes:.0f} m/s (M = "
                    "{mach_intakes:.2f}).{missing}", name=e.name, mdot_intakes=pt.mdot_intakes[i], v_intakes=pt.v_intakes[i], mach_intakes=pt.mach_intakes[i], missing=missing))
 
+    def show_selected_part(self, index: int | None = None) -> None:
+        """Highlight in 3D the model that is selected in the list. Only with
+        two models or more: with one model there is nothing to tell apart."""
+        if index is None:
+            index = self.panel_geo.parts.currentRow()
+        live = self.enabled_parts()
+        part = self.parts[index] if 0 <= index < len(self.parts) else None
+        if part is None or part not in live or len(live) < 2:
+            self.viewport.show_selected(None)
+            return
+        self.viewport.show_selected(part.posed(self.channels))
+
     def show_part_role(self, index: int):
         """Показати в панелі роль саме цієї моделі."""
+        self.show_selected_part(index)
         if not (0 <= index < len(self.parts)):
             self.panel_geo.show_part_role("", "body", 0.0)
             self.viewport.show_rotor_axis(None, (1.0, 0.0, 0.0), 1.0, 0.0)
@@ -10007,6 +10097,8 @@ def main():
     win.show()
     args = sys.argv[1:]
     if SMOKE_FLAG in args:
+        # No modal questions in the check of a build (CI has no OpenFOAM).
+        os.environ["FS_NO_OPENFOAM_OFFER"] = "1"
         i = args.index(SMOKE_FLAG)
         rest = args[i + 1:]
         QtCore.QTimer.singleShot(500, lambda: _smoke_test(
