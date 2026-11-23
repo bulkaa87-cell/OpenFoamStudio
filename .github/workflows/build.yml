@@ -1,0 +1,212 @@
+# Build OpenFOAM Studio for Linux and macOS and add the files to a release.
+#
+# The Windows installer is built on Windows by the maintainer and published
+# first (with SHA256SUMS.txt). Then this workflow runs:
+# - by itself when a release is published (event «release»);
+# - by hand (Actions > build > Run workflow) for a tag that has a release.
+# It builds from the tag: the Rust module foamrs, the Linux binary foamdist,
+# the PyInstaller program, a smoke test of the built program (it opens the
+# window, reads a cube and writes smoke.json), the AppImage and the disk
+# images. Then it adds the files to the release and their lines to
+# SHA256SUMS.txt.
+
+name: build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag of the release (for example v0.2.5)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  foamdist:
+    name: foamdist (Linux binary for the servers)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: musl tools
+        run: sudo apt-get update -o Acquire::Retries=3 && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build
+        working-directory: rust/foamdist
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=ofs
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foamdist
+          path: rust/foamdist/target/x86_64-unknown-linux-musl/release/foamdist
+          if-no-files-found: error
+          retention-days: 3
+
+  build:
+    name: ${{ matrix.name }}
+    needs: foamdist
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-22.04
+            target: linux
+            arch: x86_64
+          - name: macOS arm64
+            os: macos-15
+            target: macos
+            arch: arm64
+          - name: macOS x86_64
+            os: macos-15-intel
+            target: macos
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Linux packages (Qt xcb, Mesa, Xvfb)
+        if: matrix.target == 'linux'
+        # PyInstaller copies these libraries into the program: then the
+        # AppImage starts also where they are missing.
+        timeout-minutes: 25
+        run: |
+          PKGS="libegl1 libgl1 libgl1-mesa-dri libxkbcommon0 libxkbcommon-x11-0
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+            libxcb-util1 libfontconfig1 libdbus-1-3 libxrender1 libxi6 libsm6 xvfb
+            fonts-dejavu-core"
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=20"
+          sudo apt-get $APT update
+          sudo apt-get install -y --no-install-recommends $APT $PKGS
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: foamrs (Rust module)
+        working-directory: rust/foamrs
+        run: |
+          FLAGS="--remap-path-prefix=${{ github.workspace }}=ofs"
+          if [ "${{ matrix.target }}" = "macos" ]; then
+            # A Python extension on macOS: the symbols of Python come from
+            # the interpreter at run time.
+            FLAGS="$FLAGS -C link-arg=-undefined -C link-arg=dynamic_lookup"
+          fi
+          export PYO3_PYTHON="$(command -v python)"
+          RUSTFLAGS="$FLAGS" cargo build --release
+          if [ "${{ matrix.target }}" = "macos" ]; then
+            cp target/release/libfoamrs.dylib ../../foamrs.so
+          else
+            cp target/release/libfoamrs.so ../../foamrs.so
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: foamdist
+          path: rust/foamdist/target/x86_64-unknown-linux-musl/release
+
+      - name: Python packages
+        run: |
+          chmod +x rust/foamdist/target/x86_64-unknown-linux-musl/release/foamdist
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: PyInstaller program
+        run: python -m PyInstaller --noconfirm --distpath dist --workpath build/pyi packaging/pyinstaller/openfoam_studio.spec
+
+      - name: Smoke test of the built program
+        env:
+          NO_UPDATE_CHECK: "1"
+        run: |
+          export FS_SETTINGS_DIR="$RUNNER_TEMP/ofs-settings" FS_DATA_DIR="$RUNNER_TEMP/ofs-data"
+          python packaging/make_cube_stl.py "$RUNNER_TEMP/cube.stl"
+          if [ "${{ matrix.target }}" = "macos" ]; then
+            EXE="dist/OpenFOAM Studio.app/Contents/MacOS/OpenFOAM Studio"
+            QT_QPA_PLATFORM=offscreen timeout 600 "$EXE" --smoke-test "$RUNNER_TEMP/smoke.json" "$RUNNER_TEMP/cube.stl" || echo "exit $?"
+          else
+            EXE="dist/OpenFOAM Studio/OpenFOAM Studio"
+            QT_QPA_PLATFORM=xcb timeout 600 xvfb-run -a "$EXE" --smoke-test "$RUNNER_TEMP/smoke.json" "$RUNNER_TEMP/cube.stl" || echo "exit $?"
+          fi
+          cat "$FS_SETTINGS_DIR/crash.log" || true
+          python - "$RUNNER_TEMP/smoke.json" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1], encoding="utf-8"))
+          print(json.dumps(r, indent=1))
+          bad = [k for k in ("ok", "foamrs", "foamdist", "frozen") if r.get(k) is not True]
+          if r.get("cells") != 12:
+              bad.append("cells")
+          if bad:
+              sys.exit("smoke test failed: " + ", ".join(bad))
+          EOF
+
+      - name: Version
+        id: version
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: AppImage
+        if: matrix.target == 'linux'
+        run: sh packaging/linux/make_appimage.sh "${{ steps.version.outputs.version }}"
+
+      - name: Disk image
+        if: matrix.target == 'macos'
+        run: sh packaging/macos/make_dmg.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: program-${{ matrix.target }}-${{ matrix.arch }}
+          path: |
+            dist/*.AppImage
+            dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Add the files to the release
+    if: ${{ !cancelled() }}
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: program-*
+          path: artifacts
+      - name: Upload the files and the checksums
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.dmg' -o -name '*.AppImage' \) -exec cp {} release/ \;
+          ls -l release
+          if [ -z "$(ls release)" ]; then echo "no files"; exit 1; fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS.txt --dir old || true
+          touch old/SHA256SUMS.txt
+          (cd release && sha256sum *) > new.txt
+          # Keep the lines of the other files (the Windows installer).
+          grep -v -F -f <(awk '{print $2}' new.txt) old/SHA256SUMS.txt > SHA256SUMS.txt || true
+          cat new.txt >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber release/* SHA256SUMS.txt

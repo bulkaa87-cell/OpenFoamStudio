@@ -17,6 +17,9 @@
 !/.github/
 /.github/*
 !/.github/pull_request_template.md
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/build.yml
 !/.github/ISSUE_TEMPLATE/
 /.github/ISSUE_TEMPLATE/*
 !/.github/ISSUE_TEMPLATE/bug_report.yml
