@@ -236,13 +236,6 @@ def wsl_distros(run=run_lines, present=wsl_present) -> list | None:
     return [ln.strip() for ln in lines if ln.strip()]
 
 
-def decode_log(raw: bytes) -> str:
-    """A log file of wsl.exe: UTF-16 (its own messages) or UTF-8."""
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or raw.count(b"\x00") > len(raw) // 4:
-        return raw.decode("utf-16", errors="replace").lstrip("﻿")
-    return _decode(raw)
-
-
 # Errors of `wsl --install` that need a change of the BIOS / UEFI settings.
 _VIRT_ERRORS = ("0x80370102", "0x80370114", "0x8007019e", "0x800701bc",
                 "HCS_E_HYPERV_NOT_INSTALLED")
@@ -279,23 +272,51 @@ def root_argv(distro: str, script: str) -> list:
     return ["wsl.exe", "-d", distro, "-u", "root", "-e", "bash", "-c", script]
 
 
-def wsl_log_path() -> Path:
-    return fset.path().parent / "wsl-install.log"
+def wsl_script_path() -> Path:
+    return fset.path().parent / "install-wsl.cmd"
 
 
-def install_wsl_argv(log: Path | None = None) -> list:
-    """`wsl --install` with administrator rights; waits for the end.
-    The exit code is the exit code of wsl.exe (-PassThru: without it,
-    powershell gives 0 also when wsl.exe failed, and the program said
-    «WSL is installed» after each try). The elevated process writes its
-    output to `log` (its console is not ours)."""
-    log = Path(log or wsl_log_path())
-    target = str(log).replace("'", "''")
+def write_wsl_script(path: Path) -> Path:
+    """The .cmd file that the visible console runs: `wsl --install` with
+    its own output (the person reads it and answers the questions of
+    Ubuntu, e.g. the user name), the exit code, a key to close. The exit
+    code of the file is the exit code of wsl.exe."""
+    lines = [
+        "@echo off",
+        "chcp 65001 >nul",
+        "title OpenFOAM Studio - WSL",
+        "echo " + str(tr("OpenFOAM Studio installs WSL and Ubuntu. Read the "
+                         "messages below. If Ubuntu asks for a user name "
+                         "and a password, enter them.")),
+        "echo.",
+        f"echo ^> wsl --install -d {DISTRO}",
+        "echo.",
+        f"wsl.exe --install -d {DISTRO}",
+        "set OFS_RC=%ERRORLEVEL%",
+        "echo.",
+        "echo " + str(tr("wsl --install ended with code")) + " %OFS_RC%",
+        "echo " + str(tr("Press a key to close this window and go back to "
+                         "OpenFOAM Studio.")),
+        "pause >nul",
+        "exit /b %OFS_RC%",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-8"))
+    return path
+
+
+def install_wsl_argv(script: Path | None = None) -> list:
+    """A VISIBLE console (cmd) as administrator runs `wsl --install`
+    (write_wsl_script); the program waits for it. The person sees the
+    output, as in a terminal (2026-11-23: the hidden run told nothing,
+    `wsl --install` in a terminal worked). The exit code is the exit code
+    of wsl.exe (-PassThru: without it, powershell gives 0 also when
+    wsl.exe failed)."""
+    script = Path(script or wsl_script_path())
+    target = str(script).replace("'", "''")
     return ["powershell.exe", "-NoProfile", "-Command",
             "$p = Start-Process cmd.exe -Verb RunAs -Wait -PassThru "
-            "-WindowStyle Hidden -ArgumentList "
-            f"'/c wsl.exe --install -d {DISTRO} > \"{target}\" 2>&1'; "
-            "exit $p.ExitCode"]
+            f"-ArgumentList '/c \"{target}\"'; exit $p.ExitCode"]
 
 
 def install_distro_argv() -> list:
@@ -498,40 +519,36 @@ class Worker(QtCore.QObject):
                     "read its message. Often virtualization (Intel VT-x / "
                     "AMD SVM) is off in the BIOS or UEFI settings."))
                 return
-            self._step(tr("Installing WSL and Ubuntu (Windows asks for "
-                          "administrator rights)…"))
-            log = wsl_log_path()
-            try:
-                log.parent.mkdir(parents=True, exist_ok=True)
-                log.unlink()
-            except OSError:
-                pass
-            rc = self._run(install_wsl_argv(log), self._wsl_emit)
-            try:
-                text = decode_log(log.read_bytes())
-            except OSError:
-                text = ""
-            for ln in text.splitlines():
-                if ln.strip():
-                    self._wsl_emit(ln.rstrip())
-            # 3010 / 1641: Windows must restart. A different code with the
-            # WSL service now registered: the restart finishes it too.
-            if rc not in (0, 3010, 1641) and not self._present():
-                hint = (tr(" Turn on virtualization (Intel VT-x / AMD SVM) "
-                           "in the BIOS or UEFI settings.")
-                        if needs_virtualization(text) else "")
+            self._step(tr("Installing WSL and Ubuntu in a console window "
+                          "(Windows asks for administrator rights)…"))
+            rc = self._run(install_wsl_argv(write_wsl_script(wsl_script_path())),
+                           self._wsl_emit)
+            self.line.emit(tr("wsl --install ended with code {rc}.", rc=rc))
+            after = wsl_distros(self._run, self._present)
+            if apt_distro(after):
+                # Ubuntu is there already (WSL was on, only the
+                # distribution was missing): no restart, go on.
+                distros, steps = after, plan(after, False)
+                mark = read_marker()
+                mark.update(wsl_installed=True, distro=apt_distro(after),
+                            distro_installed=True)
+                write_marker(mark)
+            elif rc not in (0, 3010, 1641) and not self._present():
                 self.done.emit("failed", tr(
-                    "WSL was not installed (code {rc}). Install it by hand: "
-                    "open PowerShell as administrator and run “wsl --install”.",
-                    rc=rc) + hint)
+                    "WSL was not installed (code {rc}). The console window "
+                    "showed why. Often virtualization (Intel VT-x / AMD SVM) "
+                    "is off in the BIOS or UEFI settings. To try by hand: open "
+                    "PowerShell as administrator and run “wsl --install”.",
+                    rc=rc))
                 return
-            fset.set(PENDING_KEY, True)
-            write_marker({"wsl_installed": True, "distro": DISTRO,
-                          "distro_installed": True})
-            self.done.emit("restart", tr(
-                "WSL is installed. Restart Windows, then start OpenFOAM "
-                "Studio again: it continues with OpenFOAM by itself."))
-            return
+            else:
+                fset.set(PENDING_KEY, True)
+                write_marker({"wsl_installed": True, "distro": DISTRO,
+                              "distro_installed": True})
+                self.done.emit("restart", tr(
+                    "WSL is installed. Restart Windows, then start OpenFOAM "
+                    "Studio again: it continues with OpenFOAM by itself."))
+                return
         distro = apt_distro(distros)
         if "distro" in steps:
             self._step(tr("Installing {distro}…", distro=DISTRO))
