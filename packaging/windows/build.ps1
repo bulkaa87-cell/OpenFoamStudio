@@ -2,7 +2,7 @@
 #
 #   powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 `
 #       -Python C:\path\to\venv\Scripts\python.exe -Out X:\some\build `
-#       [-Version 0.2.4] [-Iscc C:\path\to\ISCC.exe] [-CargoTarget X:\some\target] `
+#       [-Version 0.2.5] [-Iscc C:\path\to\ISCC.exe] [-CargoTarget X:\some\target] `
 #       [-SkipRust] [-SkipInstaller]
 #
 # Steps:
@@ -22,7 +22,7 @@
 param(
     [string]$Python = "",
     [string]$Out = "",
-    [string]$Version = "0.2.4",
+    [string]$Version = "",
     [string]$Iscc = "",
     [string]$CargoTarget = "",
     [switch]$SkipRust,
@@ -34,6 +34,13 @@ $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $Python) { $Python = Join-Path $root ".venv\Scripts\python.exe" }
 if (-not $Out) { $Out = Join-Path $root "build" }
 if (-not (Test-Path $Python)) { throw "Python not found: $Python" }
+# The version is VERSION of fs_version.py (the update badge compares it with
+# the latest release). -Version must be the same.
+$m = Select-String -Path (Join-Path $root "fs_version.py") -Pattern '^VERSION = "([^"]+)"'
+if (-not $m) { throw "no VERSION in fs_version.py" }
+$fileVersion = $m.Matches[0].Groups[1].Value
+if (-not $Version) { $Version = $fileVersion }
+if ($Version -ne $fileVersion) { throw "-Version $Version is not VERSION $fileVersion of fs_version.py" }
 New-Item -ItemType Directory -Force $Out | Out-Null
 
 # --- 1. Rust ---------------------------------------------------------------

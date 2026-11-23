@@ -1,6 +1,6 @@
 ﻿; Inno Setup script of the Windows installer of OpenFOAM Studio.
 ;
-;   ISCC.exe /DAppVersion=0.2.4 /DSrcDir=<dist>\OpenFOAM Studio /DOutDir=<out> ^
+;   ISCC.exe /DAppVersion=0.2.5 /DSrcDir=<dist>\OpenFOAM Studio /DOutDir=<out> ^
 ;            packaging\windows\openfoam_studio.iss
 ;
 ; Input: the PyInstaller folder (packaging\pyinstaller\openfoam_studio.spec).
@@ -25,7 +25,7 @@
 ;   "OpenFOAM Studio (installed)", and the uninstaller removes only that one.
 
 #ifndef AppVersion
-  #define AppVersion "0.2.4"
+  #define AppVersion "0.2.5"
 #endif
 #ifndef SrcDir
   #define SrcDir "..\..\build\dist\OpenFOAM Studio"
@@ -109,6 +109,11 @@ Name: "{autodesktop}\{#AppName} ({cm:InstalledCopy})"; Filename: "{app}\{#AppExe
 ; belongs to the user, not to the administrator of an install for all users.
 Filename: "{app}\{#AppExe}"; Parameters: "{code:LaunchArgs}"; Tasks: prepareopenfoam; Flags: nowait skipifsilent runasoriginaluser
 Filename: "{app}\{#AppExe}"; Parameters: "{code:LaunchArgs}"; Description: "{cm:LaunchProgram,{#AppName}}"; Tasks: not prepareopenfoam; Flags: nowait postinstall skipifsilent
+
+; The update from the program (update.py of the program): /RELAUNCH=1
+; starts the program again after a silent install. runasoriginaluser: not
+; as the administrator of an install for all users.
+Filename: "{app}\{#AppExe}"; Check: RelaunchWanted; Flags: nowait runasoriginaluser
 
 [Code]
 { The target of a .lnk file ('' when it cannot be read). }
@@ -219,4 +224,37 @@ begin
     flag. }
   if WizardIsTaskSelected('prepareopenfoam') then
     Result := Trim(Result + ' --prepare-openfoam');
+end;
+
+{ ---- The update from the program (update.py of the program). ----
+  The program starts this installer with /SILENT /WAITPID=<its process>
+  /RELAUNCH=1 and then closes. The installer waits until that process has
+  ended (at most 5 min): only then can the old version go. After the
+  install, [Run] starts the program again. }
+function OpenProcess(Access: Cardinal; Inherit: Boolean; Pid: Cardinal): Cardinal;
+  external 'OpenProcess@kernel32.dll stdcall';
+function WaitForSingleObject(Handle: Cardinal; Ms: Cardinal): Cardinal;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function CloseHandle(Handle: Cardinal): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+function InitializeSetup(): Boolean;
+var
+  Pid, Handle: Cardinal;
+begin
+  Result := True;
+  Pid := StrToIntDef(ExpandConstant('{param:WAITPID|0}'), 0);
+  if Pid = 0 then
+    Exit;
+  Handle := OpenProcess($00100000 { SYNCHRONIZE }, False, Pid);
+  if Handle = 0 then
+    Exit;
+  Log('Waiting for the program to close (process ' + IntToStr(Pid) + ')');
+  WaitForSingleObject(Handle, 300000);
+  CloseHandle(Handle);
+end;
+
+function RelaunchWanted(): Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
 end;

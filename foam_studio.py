@@ -47,6 +47,8 @@ import fs_crashlog as crashlog
 import fs_geometry as geo
 import fs_i18n
 import fs_icons
+import fs_update
+import fs_version
 import fs_library as lib
 import fs_memfit as memfit
 import fs_meshlock as meshlock
@@ -1819,6 +1821,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.split)
 
         bar = self.menuBar()
+        # The version and «Update to X» in the corner of the menu bar
+        # (fs_update.py): one click downloads and installs the new version.
+        self.update_badge = fs_update.add_badge(
+            self, app_name="OpenFOAM Studio", version=fs_version.VERSION,
+            repo=fs_version.REPO, frozen=fs_paths.FROZEN)
         file_menu = bar.addMenu("File")
 
         act = QtGui.QAction("Open Geometry…", self)

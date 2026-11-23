@@ -41,7 +41,7 @@ binaries = []
 hidden = ["pyvistaqt", "vtkmodules.util.numpy_support",
           "vtkmodules.qt.QVTKRenderWindowInteractor",
           # Imported inside functions (main(), prepare_openfoam).
-          "fs_setupfoam"]
+          "fs_setupfoam", "fs_update", "fs_version"]
 # The shared packages of MeshFix Studio: their modules (the aliases fs_meshfix,
 # fs_repair, fs_winfix, fs_i18n import them by name), the native modules
 # meshfix._native and foamview._native, and their catalogues.
