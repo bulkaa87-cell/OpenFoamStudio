@@ -7,8 +7,9 @@
 # It builds from the tag: the Rust module foamrs, the Linux binary foamdist,
 # the PyInstaller program, a smoke test of the built program (it opens the
 # window, reads a cube and writes smoke.json), the AppImage and the disk
-# images. Then it adds the files to the release and their lines to
-# SHA256SUMS.txt.
+# images, the .deb and .rpm packages (a test installs each one and runs
+# the smoke test again: .deb on the runner, .rpm in a Fedora container).
+# Then it adds the files to the release and their lines to SHA256SUMS.txt.
 
 name: build
 
@@ -94,7 +95,7 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
             libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
             libxcb-util1 libfontconfig1 libdbus-1-3 libxrender1 libxi6 libsm6 xvfb
-            fonts-dejavu-core"
+            fonts-dejavu-core rpm"
           APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=20"
           sudo apt-get $APT update
           sudo apt-get install -y --no-install-recommends $APT $PKGS
@@ -170,6 +171,51 @@ jobs:
         if: matrix.target == 'linux'
         run: sh packaging/linux/make_appimage.sh "${{ steps.version.outputs.version }}"
 
+      - name: Packages (.deb, .rpm)
+        if: matrix.target == 'linux'
+        run: sh packaging/linux/make_packages.sh "${{ steps.version.outputs.version }}"
+
+      - name: Test the packages (install, then the smoke test)
+        if: matrix.target == 'linux'
+        timeout-minutes: 30
+        env:
+          NO_UPDATE_CHECK: "1"
+        run: |
+          cat > "$RUNNER_TEMP/check.py" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1], encoding="utf-8"))
+          print(json.dumps(r, indent=1))
+          bad = [k for k in ("ok", "frozen") if r.get(k) is not True]
+          if r.get("cells") != 12:
+              bad.append("cells")
+          if bad:
+              sys.exit(sys.argv[2] + " smoke test failed: " + ", ".join(bad))
+          EOF
+          # .deb on this runner (Ubuntu 22.04: the oldest supported system).
+          sudo apt-get install -y ./dist/*.deb
+          test -f /usr/share/applications/openfoam-studio.desktop
+          export FS_SETTINGS_DIR="$RUNNER_TEMP/deb-settings" FS_DATA_DIR="$RUNNER_TEMP/deb-data"
+          QT_QPA_PLATFORM=xcb timeout 600 xvfb-run -a openfoam-studio --smoke-test "$RUNNER_TEMP/deb.json" "$RUNNER_TEMP/cube.stl" || echo "exit $?"
+          python "$RUNNER_TEMP/check.py" "$RUNNER_TEMP/deb.json" deb
+          sudo apt-get remove -y openfoam-studio
+          test ! -e /opt/openfoam-studio
+          # .rpm in Fedora, with the libraries of a desktop (the container
+          # has no desktop).
+          cp "$RUNNER_TEMP/cube.stl" "$RUNNER_TEMP/check.py" dist/
+          docker run --rm -v "$PWD/dist:/d" -e NO_UPDATE_CHECK=1 fedora:latest bash -c '
+            set -e
+            dnf -y -q install /d/*.rpm xorg-x11-server-Xvfb mesa-libGL mesa-libEGL               mesa-dri-drivers libxkbcommon-x11 xcb-util-cursor xcb-util-wm               xcb-util-image xcb-util-keysyms xcb-util-renderutil fontconfig               dejavu-sans-fonts dbus-libs python3 >/dev/null
+            test -f /usr/share/applications/openfoam-studio.desktop
+            Xvfb :99 -screen 0 1280x1024x24 & sleep 3
+            export DISPLAY=:99 QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1
+            export FS_SETTINGS_DIR=/tmp/s FS_DATA_DIR=/tmp/d
+            timeout 600 openfoam-studio --smoke-test /tmp/rpm.json /d/cube.stl || echo "exit $?"
+            cat /tmp/s/crash.log 2>/dev/null || true
+            python3 /d/check.py /tmp/rpm.json rpm
+            dnf -y -q remove openfoam-studio >/dev/null
+            test ! -e /opt/openfoam-studio'
+          rm -f dist/cube.stl dist/check.py
+
       - name: Disk image
         if: matrix.target == 'macos'
         run: sh packaging/macos/make_dmg.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}"
@@ -179,6 +225,8 @@ jobs:
           name: program-${{ matrix.target }}-${{ matrix.arch }}
           path: |
             dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
             dist/*.dmg
           if-no-files-found: error
           retention-days: 14
@@ -200,7 +248,7 @@ jobs:
       - name: Upload the files and the checksums
         run: |
           mkdir -p release
-          find artifacts -type f \( -name '*.dmg' -o -name '*.AppImage' \) -exec cp {} release/ \;
+          find artifacts -type f \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release/ \;
           ls -l release
           if [ -z "$(ls release)" ]; then echo "no files"; exit 1; fi
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS.txt --dir old || true
